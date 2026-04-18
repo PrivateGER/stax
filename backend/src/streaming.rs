@@ -148,6 +148,34 @@ pub(crate) async fn stream_subtitle_response(
     Ok(response)
 }
 
+pub(crate) async fn stream_hls_file_response(
+    asset_path: &Path,
+    content_type: &'static str,
+) -> Result<Response<Body>, StreamMediaError> {
+    // Stream the file rather than read-into-memory-then-ship. Init segments
+    // and fmp4 media segments can be multiple MB; buffering the whole file
+    // before the first byte goes out adds unnecessary latency and, under
+    // concurrent segment fetches, unnecessary peak RSS. The ReaderStream
+    // adapter hands chunks to axum as they come off the disk.
+    let file = File::open(asset_path).await.map_err(map_file_error)?;
+    let metadata = file.metadata().await.map_err(map_file_error)?;
+
+    if !metadata.is_file() {
+        return Err(StreamMediaError::NotFound);
+    }
+
+    let file_len = metadata.len();
+    let mut response = Response::new(Body::from_stream(ReaderStream::new(file)));
+    let headers = response.headers_mut();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
+    headers.insert(ACCEPT_RANGES, HeaderValue::from_static("none"));
+    headers.insert(
+        CONTENT_LENGTH,
+        HeaderValue::from_str(&file_len.to_string()).expect("content length should be valid"),
+    );
+    Ok(response)
+}
+
 pub(crate) fn unsatisfiable_range_response(file_len: u64) -> Response<Body> {
     let mut response = Response::new(Body::from("Requested range is not satisfiable."));
     *response.status_mut() = StatusCode::RANGE_NOT_SATISFIABLE;

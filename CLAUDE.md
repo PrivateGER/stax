@@ -43,6 +43,8 @@ Backend reads from env vars (see `main.rs` and `library.rs`):
 - `SYNCPLAY_FFMPEG_BIN` — override the `ffmpeg` binary used for thumbnail generation (empty string disables)
 - `SYNCPLAY_THUMBNAIL_DIR` — cache directory for generated thumbnails (default `syncplay-thumbnails`)
 - `SYNCPLAY_FRONTEND_ORIGIN` — tightens CORS to a specific origin (default: Any)
+- `SYNCPLAY_HLS_HW_ACCEL` — hardware accelerator for the HLS full-transcode tier; one of `none` (default), `nvenc`, `vaapi`, `qsv`, `videotoolbox`. Unknown values warn and fall back to `none`. Only the `HlsFullTranscode` tier is affected — `HlsRemux` and `HlsAudioTranscode` always use `-c:v copy`.
+- `SYNCPLAY_HLS_VAAPI_DEVICE` — DRM render node for VAAPI (default `/dev/dri/renderD128`).
 
 ## Architecture Notes
 

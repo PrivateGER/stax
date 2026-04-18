@@ -28,12 +28,14 @@ use uuid::Uuid;
 
 pub mod clock;
 pub mod library;
+pub mod muxing;
 pub mod persistence;
 pub mod protocol;
 pub mod streaming;
 
 use clock::{AuthoritativePlaybackClock, format_timestamp, round_to};
 use library::{LibraryConfig, LibraryService};
+use muxing::{BrowserHint, HlsConfig, HlsError, HlsSessionManager};
 use persistence::{Persistence, PersistenceError};
 use protocol::{
     ClientSocketMessage, CreateRoomRequest, HealthResponse, LibraryResponse, LibraryScanResponse,
@@ -54,6 +56,15 @@ pub struct AppState {
     rooms: SharedRooms,
     library: LibraryService,
     persistence: Persistence,
+    hls: HlsSessionManager,
+}
+
+impl AppState {
+    /// Test/observability hook: returns a clone of the HLS session manager so
+    /// callers can inspect session state (e.g., active session count).
+    pub fn hls(&self) -> HlsSessionManager {
+        self.hls.clone()
+    }
 }
 
 #[derive(Debug)]
@@ -248,6 +259,22 @@ pub async fn load_state_with_library(
     persistence: Persistence,
     library_config: LibraryConfig,
 ) -> Result<AppState, PersistenceError> {
+    let ffmpeg_command = library_config
+        .ffmpeg_command()
+        .map(|path| path.to_path_buf());
+    load_state_with_library_and_hls(
+        persistence,
+        library_config,
+        HlsConfig::from_env(ffmpeg_command),
+    )
+    .await
+}
+
+pub async fn load_state_with_library_and_hls(
+    persistence: Persistence,
+    library_config: LibraryConfig,
+    hls_config: HlsConfig,
+) -> Result<AppState, PersistenceError> {
     let library = LibraryService::new(persistence.clone(), library_config);
     library.sync_config().await?;
     let mut room_records = persistence.load_rooms().await?;
@@ -264,10 +291,13 @@ pub async fn load_state_with_library(
         .map(|room| (room.id, Arc::new(RoomHub::new(room, persistence.clone()))))
         .collect();
 
+    let hls = HlsSessionManager::new(hls_config);
+
     Ok(AppState {
         library,
         rooms: Arc::new(RwLock::new(rooms)),
         persistence,
+        hls,
     })
 }
 
@@ -292,6 +322,7 @@ pub fn build_app(state: AppState) -> Router {
             get(stream_subtitle),
         )
         .route("/api/media/{media_id}/thumbnail", get(stream_thumbnail))
+        .route("/api/media/{media_id}/hls/{filename}", get(stream_hls_asset))
         .route("/api/rooms", get(list_rooms).post(create_room))
         .route("/api/rooms/{room_id}/ws", get(connect_room_socket))
         .with_state(state)
@@ -469,6 +500,90 @@ async fn stream_thumbnail(
         }
         Err(StreamMediaError::MalformedRange(_) | StreamMediaError::UnsatisfiableRange { .. }) => {
             ApiError::internal("Failed to stream thumbnail.").into_response()
+        }
+    }
+}
+
+async fn stream_hls_asset(
+    State(state): State<AppState>,
+    Path((media_id, filename)): Path<(Uuid, String)>,
+    headers: HeaderMap,
+) -> Response {
+    let media_item = match state.library.media_item(media_id).await {
+        Ok(Some(media_item)) => media_item,
+        Ok(None) => return ApiError::not_found("Media not found.").into_response(),
+        Err(error) => {
+            warn!(%error, %media_id, "failed to load media item for HLS");
+            return ApiError::internal("Failed to load media.").into_response();
+        }
+    };
+
+    if matches!(
+        media_item.playback_mode,
+        protocol::PlaybackMode::Unsupported
+    ) {
+        return ApiError::with_status(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "This media is not supported for browser playback.",
+        )
+        .into_response();
+    }
+    if matches!(media_item.playback_mode, protocol::PlaybackMode::Direct) {
+        return ApiError::with_status(
+            StatusCode::CONFLICT,
+            "This media is direct-playable; use the streaming endpoint instead.",
+        )
+        .into_response();
+    }
+
+    let user_agent = headers
+        .get("user-agent")
+        .and_then(|value| value.to_str().ok());
+    let browser = BrowserHint::from_user_agent(user_agent);
+
+    let serve_result = match state.hls.serve(&media_item, &filename, browser).await {
+        Ok(result) => result,
+        Err(HlsError::UnsupportedMode) => {
+            return ApiError::with_status(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "This media is not eligible for HLS playback.",
+            )
+            .into_response();
+        }
+        Err(HlsError::InvalidFilename) => {
+            return ApiError::bad_request("Invalid HLS asset name.").into_response();
+        }
+        Err(HlsError::NotFound) => {
+            return ApiError::not_found("HLS asset not found.").into_response();
+        }
+        Err(HlsError::NotReady) => {
+            return ApiError::with_status(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "HLS session did not become ready in time.",
+            )
+            .into_response();
+        }
+        Err(HlsError::SpawnFailed(message)) => {
+            warn!(%message, %media_id, "ffmpeg HLS session failed");
+            return ApiError::internal("Failed to start HLS session.").into_response();
+        }
+        Err(HlsError::Io(error)) => {
+            warn!(%error, %media_id, "HLS IO error");
+            return ApiError::internal("Failed to serve HLS asset.").into_response();
+        }
+    };
+
+    match streaming::stream_hls_file_response(&serve_result.path, serve_result.content_type).await {
+        Ok(response) => response,
+        Err(StreamMediaError::NotFound) => {
+            ApiError::not_found("HLS asset not found.").into_response()
+        }
+        Err(StreamMediaError::Io(error)) => {
+            warn!(%error, %media_id, "failed to stream HLS asset");
+            ApiError::internal("Failed to stream HLS asset.").into_response()
+        }
+        Err(StreamMediaError::MalformedRange(_) | StreamMediaError::UnsatisfiableRange { .. }) => {
+            ApiError::internal("Failed to stream HLS asset.").into_response()
         }
     }
 }
@@ -779,6 +894,13 @@ impl ApiError {
     fn internal(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: message.into(),
+        }
+    }
+
+    fn with_status(status: StatusCode, message: impl Into<String>) -> Self {
+        Self {
+            status,
             message: message.into(),
         }
     }

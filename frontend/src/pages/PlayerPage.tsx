@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { api, streamUrl, subtitleUrl } from "../api";
+import { api, subtitleUrl } from "../api";
 import {
   displayMediaTitle,
   formatSignedDelta,
@@ -13,6 +13,7 @@ import {
   monotonicNow,
   useRoomSocket,
 } from "../useRoomSocket";
+import { usePlayerSource } from "../usePlayerSource";
 
 type Props = {
   item: MediaItem | null;
@@ -65,6 +66,13 @@ export function PlayerPage({
 
   const socket = useRoomSocket(roomId, clientName);
   const live = socket.connectionState === "live";
+  const { fatalError: sourceError } = usePlayerSource(videoRef, item);
+
+  useEffect(() => {
+    if (sourceError) {
+      setPlayerError(sourceError.message);
+    }
+  }, [sourceError]);
 
   useEffect(() => {
     setShowSessionPanel(Boolean(roomId));
@@ -504,7 +512,6 @@ export function PlayerPage({
             playsInline
             preload="metadata"
             ref={videoRef}
-            src={streamUrl(item.id)}
           >
             {item.subtitleTracks.map((track, index) => (
               <track

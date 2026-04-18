@@ -14,7 +14,10 @@ use uuid::Uuid;
 use crate::{
     clock::{format_timestamp, round_to},
     persistence::{LibrarySnapshot, Persistence, PersistenceError},
-    protocol::{LibraryResponse, LibraryScanResponse, MediaItem, SubtitleTrack},
+    protocol::{
+        AudioStream, LibraryResponse, LibraryScanResponse, MediaItem, PlaybackMode, SubtitleStream,
+        SubtitleTrack,
+    },
 };
 
 const SUPPORTED_MEDIA_EXTENSIONS: &[&str] = &[
@@ -60,6 +63,13 @@ pub(crate) struct ScannedMediaItem {
     pub subtitle_tracks: Vec<SubtitleTrack>,
     pub thumbnail_generated_at: Option<String>,
     pub thumbnail_error: Option<String>,
+    pub playback_mode: PlaybackMode,
+    pub video_profile: Option<String>,
+    pub video_level: Option<u32>,
+    pub video_pix_fmt: Option<String>,
+    pub video_bit_depth: Option<u8>,
+    pub audio_streams: Vec<AudioStream>,
+    pub subtitle_streams: Vec<SubtitleStream>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -68,7 +78,7 @@ struct ThumbnailOutcome {
     error: Option<String>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 struct ProbeMetadata {
     duration_seconds: Option<f64>,
     container_name: Option<String>,
@@ -78,6 +88,35 @@ struct ProbeMetadata {
     height: Option<u32>,
     probed_at: Option<String>,
     probe_error: Option<String>,
+    playback_mode: PlaybackMode,
+    video_profile: Option<String>,
+    video_level: Option<u32>,
+    video_pix_fmt: Option<String>,
+    video_bit_depth: Option<u8>,
+    audio_streams: Vec<AudioStream>,
+    subtitle_streams: Vec<SubtitleStream>,
+}
+
+impl Default for ProbeMetadata {
+    fn default() -> Self {
+        Self {
+            duration_seconds: None,
+            container_name: None,
+            video_codec: None,
+            audio_codec: None,
+            width: None,
+            height: None,
+            probed_at: None,
+            probe_error: None,
+            playback_mode: PlaybackMode::Direct,
+            video_profile: None,
+            video_level: None,
+            video_pix_fmt: None,
+            video_bit_depth: None,
+            audio_streams: Vec::new(),
+            subtitle_streams: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -89,10 +128,23 @@ struct FfprobeOutput {
 
 #[derive(Debug, Deserialize)]
 struct FfprobeStream {
+    #[serde(default)]
+    index: Option<u32>,
     codec_type: Option<String>,
     codec_name: Option<String>,
+    profile: Option<String>,
+    #[serde(default)]
+    level: Option<i32>,
+    pix_fmt: Option<String>,
+    bits_per_raw_sample: Option<serde_json::Value>,
     width: Option<u32>,
     height: Option<u32>,
+    channels: Option<u32>,
+    channel_layout: Option<String>,
+    #[serde(default)]
+    tags: HashMap<String, String>,
+    #[serde(default)]
+    disposition: HashMap<String, u8>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -416,7 +468,7 @@ fn collect_media_items(
             .map(|value| value.to_string_lossy().to_string())
             .unwrap_or_else(|| relative_path.clone());
         let extension = normalized_extension(&path);
-        let probe_metadata = probe_media_metadata(&path, probe_command);
+        let probe_metadata = probe_media_metadata(&path, extension.as_deref(), probe_command);
         let subtitle_tracks = discover_sidecar_subtitles(root_path, &path);
         let media_id = existing_ids
             .get(&relative_path)
@@ -456,6 +508,13 @@ fn collect_media_items(
             subtitle_tracks,
             thumbnail_generated_at: thumbnail.generated_at,
             thumbnail_error: thumbnail.error,
+            playback_mode: probe_metadata.playback_mode,
+            video_profile: probe_metadata.video_profile,
+            video_level: probe_metadata.video_level,
+            video_pix_fmt: probe_metadata.video_pix_fmt,
+            video_bit_depth: probe_metadata.video_bit_depth,
+            audio_streams: probe_metadata.audio_streams,
+            subtitle_streams: probe_metadata.subtitle_streams,
         });
     }
 }
@@ -615,7 +674,11 @@ fn infer_language_code(token: &str) -> Option<&str> {
     None
 }
 
-fn probe_media_metadata(path: &Path, probe_command: Option<&Path>) -> ProbeMetadata {
+fn probe_media_metadata(
+    path: &Path,
+    file_extension: Option<&str>,
+    probe_command: Option<&Path>,
+) -> ProbeMetadata {
     let Some(probe_command) = probe_command else {
         return ProbeMetadata::default();
     };
@@ -625,7 +688,10 @@ fn probe_media_metadata(path: &Path, probe_command: Option<&Path>) -> ProbeMetad
         .arg("-v")
         .arg("error")
         .arg("-show_entries")
-        .arg("format=format_name,duration:stream=codec_type,codec_name,width,height")
+        .arg(
+            "format=format_name,duration:stream=index,codec_type,codec_name,profile,level,\
+             pix_fmt,bits_per_raw_sample,width,height,channels,channel_layout,tags,disposition",
+        )
         .arg("-of")
         .arg("json")
         .arg(path)
@@ -633,7 +699,7 @@ fn probe_media_metadata(path: &Path, probe_command: Option<&Path>) -> ProbeMetad
 
     match output {
         Ok(output) if output.status.success() => {
-            match parse_probe_output(&output.stdout, probed_at.clone()) {
+            match parse_probe_output(&output.stdout, file_extension, probed_at.clone()) {
                 Ok(metadata) => metadata,
                 Err(error) => ProbeMetadata {
                     probed_at: Some(probed_at),
@@ -664,17 +730,98 @@ fn probe_media_metadata(path: &Path, probe_command: Option<&Path>) -> ProbeMetad
     }
 }
 
-fn parse_probe_output(output: &[u8], probed_at: String) -> Result<ProbeMetadata, String> {
+fn parse_probe_output(
+    output: &[u8],
+    file_extension: Option<&str>,
+    probed_at: String,
+) -> Result<ProbeMetadata, String> {
     let parsed: FfprobeOutput = serde_json::from_slice(output)
         .map_err(|error| format!("ffprobe returned invalid JSON: {error}"))?;
+
     let video_stream = parsed
         .streams
         .iter()
         .find(|stream| stream.codec_type.as_deref() == Some("video"));
-    let audio_stream = parsed
+
+    let mut audio_streams: Vec<AudioStream> = parsed
         .streams
         .iter()
-        .find(|stream| stream.codec_type.as_deref() == Some("audio"));
+        .filter(|stream| stream.codec_type.as_deref() == Some("audio"))
+        .enumerate()
+        .map(|(fallback_index, stream)| AudioStream {
+            index: stream.index.unwrap_or(fallback_index as u32),
+            codec: stream.codec_name.clone(),
+            channels: stream.channels,
+            channel_layout: stream.channel_layout.clone(),
+            language: lookup_tag(&stream.tags, "language"),
+            title: lookup_tag(&stream.tags, "title"),
+            default: stream
+                .disposition
+                .get("default")
+                .copied()
+                .unwrap_or(0)
+                != 0,
+        })
+        .collect();
+
+    if !audio_streams.iter().any(|stream| stream.default) {
+        if let Some(first) = audio_streams.first_mut() {
+            first.default = true;
+        }
+    }
+
+    let subtitle_streams: Vec<SubtitleStream> = parsed
+        .streams
+        .iter()
+        .filter(|stream| stream.codec_type.as_deref() == Some("subtitle"))
+        .enumerate()
+        .map(|(fallback_index, stream)| SubtitleStream {
+            index: stream.index.unwrap_or(fallback_index as u32),
+            codec: stream.codec_name.clone(),
+            language: lookup_tag(&stream.tags, "language"),
+            title: lookup_tag(&stream.tags, "title"),
+            default: stream
+                .disposition
+                .get("default")
+                .copied()
+                .unwrap_or(0)
+                != 0,
+            forced: stream
+                .disposition
+                .get("forced")
+                .copied()
+                .unwrap_or(0)
+                != 0,
+        })
+        .collect();
+
+    let container_name = parsed
+        .format
+        .as_ref()
+        .and_then(|format| format.format_name.clone());
+    let video_profile = video_stream.and_then(|stream| stream.profile.clone());
+    let video_level = video_stream
+        .and_then(|stream| stream.level)
+        .filter(|value| *value > 0)
+        .map(|value| value as u32);
+    let video_pix_fmt = video_stream.and_then(|stream| stream.pix_fmt.clone());
+    let video_bit_depth = video_stream.and_then(|stream| {
+        stream
+            .bits_per_raw_sample
+            .as_ref()
+            .and_then(parse_json_u8_like)
+    });
+
+    let playback_mode = classify_playback_mode(
+        container_name.as_deref(),
+        file_extension,
+        video_stream.and_then(|stream| stream.codec_name.as_deref()),
+        video_profile.as_deref(),
+        video_pix_fmt.as_deref(),
+        video_level,
+        video_bit_depth,
+        &audio_streams,
+    );
 
     Ok(ProbeMetadata {
         duration_seconds: parsed
@@ -683,17 +830,202 @@ fn parse_probe_output(output: &[u8], probed_at: String) -> Result<ProbeMetadata,
             .and_then(|format| format.duration.as_deref())
             .and_then(|duration| duration.parse::<f64>().ok())
             .map(|duration| round_to(duration, 3)),
-        container_name: parsed
-            .format
-            .as_ref()
-            .and_then(|format| format.format_name.clone()),
+        container_name,
         video_codec: video_stream.and_then(|stream| stream.codec_name.clone()),
-        audio_codec: audio_stream.and_then(|stream| stream.codec_name.clone()),
+        audio_codec: audio_streams.first().and_then(|stream| stream.codec.clone()),
         width: video_stream.and_then(|stream| stream.width),
         height: video_stream.and_then(|stream| stream.height),
         probed_at: Some(probed_at),
         probe_error: None,
+        playback_mode,
+        video_profile,
+        video_level,
+        video_pix_fmt,
+        video_bit_depth,
+        audio_streams,
+        subtitle_streams,
     })
+}
+
+fn lookup_tag(tags: &HashMap<String, String>, key: &str) -> Option<String> {
+    for (tag_key, tag_value) in tags {
+        if tag_key.eq_ignore_ascii_case(key) && !tag_value.trim().is_empty() {
+            return Some(tag_value.clone());
+        }
+    }
+    None
+}
+
+fn parse_json_u8_like(value: &serde_json::Value) -> Option<u8> {
+    match value {
+        serde_json::Value::Number(number) => number.as_u64().and_then(|v| u8::try_from(v).ok()),
+        serde_json::Value::String(text) => text.parse::<u8>().ok(),
+        _ => None,
+    }
+}
+
+pub(crate) fn classify_playback_mode(
+    container: Option<&str>,
+    file_extension: Option<&str>,
+    video_codec: Option<&str>,
+    video_profile: Option<&str>,
+    video_pix_fmt: Option<&str>,
+    video_level: Option<u32>,
+    video_bit_depth: Option<u8>,
+    audio_streams: &[AudioStream],
+) -> PlaybackMode {
+    let container_ok = container
+        .map(|value| is_browser_safe_container(value, file_extension))
+        .unwrap_or(false);
+    let has_any_stream = video_codec.is_some() || !audio_streams.is_empty();
+
+    if !has_any_stream {
+        return PlaybackMode::Unsupported;
+    }
+
+    let audio_ok = audio_streams.is_empty()
+        || audio_streams.iter().all(|stream| {
+            stream
+                .codec
+                .as_deref()
+                .map(is_browser_safe_audio_codec)
+                .unwrap_or(false)
+        });
+
+    let audio_remuxable = audio_streams.is_empty()
+        || audio_streams.iter().all(|stream| {
+            stream
+                .codec
+                .as_deref()
+                .map(is_browser_safe_audio_codec)
+                .unwrap_or(false)
+        });
+
+    let audio_transcodable = audio_streams.iter().all(|stream| {
+        stream
+            .codec
+            .as_deref()
+            .map(|codec| is_browser_safe_audio_codec(codec) || is_transcodable_audio_codec(codec))
+            .unwrap_or(false)
+    });
+
+    let video_browser_safe = match video_codec {
+        None => true,
+        Some(codec) => is_browser_safe_video_codec(
+            codec,
+            video_profile,
+            video_pix_fmt,
+            video_level,
+            video_bit_depth,
+        ),
+    };
+
+    if video_browser_safe && audio_ok && container_ok {
+        return PlaybackMode::Direct;
+    }
+
+    if video_browser_safe && audio_remuxable {
+        return PlaybackMode::HlsRemux;
+    }
+
+    if video_browser_safe && audio_transcodable {
+        return PlaybackMode::HlsAudioTranscode;
+    }
+
+    if !audio_transcodable {
+        return PlaybackMode::Unsupported;
+    }
+
+    PlaybackMode::HlsFullTranscode
+}
+
+fn is_browser_safe_container(container: &str, file_extension: Option<&str>) -> bool {
+    // ffprobe's format_name is a comma-separated list of equivalent demuxer tags.
+    // Critically, "matroska,webm" applies to BOTH .mkv and .webm files — the extension
+    // is the only way to distinguish. When ambiguous, trust the extension.
+    let normalized_extension = file_extension.map(|value| value.to_ascii_lowercase());
+    let tokens = container
+        .split(',')
+        .map(|token| token.trim().to_ascii_lowercase())
+        .collect::<Vec<_>>();
+
+    // If the container list includes "matroska", only webm via explicit extension is safe.
+    if tokens.iter().any(|token| token == "matroska") {
+        return normalized_extension.as_deref() == Some("webm");
+    }
+
+    tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "mov"
+                | "mp4"
+                | "m4a"
+                | "m4v"
+                | "3gp"
+                | "3g2"
+                | "mj2"
+                | "webm"
+                | "mp3"
+                | "ogg"
+                | "flac"
+                | "wav"
+        )
+    })
+}
+
+fn is_browser_safe_video_codec(
+    codec: &str,
+    profile: Option<&str>,
+    pix_fmt: Option<&str>,
+    level: Option<u32>,
+    bit_depth: Option<u8>,
+) -> bool {
+    let codec = codec.to_ascii_lowercase();
+    match codec.as_str() {
+        "h264" | "avc" | "avc1" => {
+            let profile_ok = profile
+                .map(|value| {
+                    let value = value.to_ascii_lowercase();
+                    value.contains("baseline") || value.contains("main") || value.contains("high")
+                })
+                .unwrap_or(true);
+            let pix_fmt_ok = pix_fmt
+                .map(|value| {
+                    matches!(value.to_ascii_lowercase().as_str(), "yuv420p" | "yuvj420p")
+                })
+                .unwrap_or(true);
+            let level_ok = level.map(|value| value <= 51).unwrap_or(true);
+            let bit_depth_ok = bit_depth.map(|value| value <= 8).unwrap_or(true);
+            profile_ok && pix_fmt_ok && level_ok && bit_depth_ok
+        }
+        "vp9" | "av1" => {
+            let pix_fmt_ok = pix_fmt
+                .map(|value| {
+                    matches!(
+                        value.to_ascii_lowercase().as_str(),
+                        "yuv420p" | "yuvj420p" | "yuv420p10le"
+                    )
+                })
+                .unwrap_or(true);
+            pix_fmt_ok
+        }
+        "vp8" => true,
+        _ => false,
+    }
+}
+
+fn is_browser_safe_audio_codec(codec: &str) -> bool {
+    matches!(
+        codec.to_ascii_lowercase().as_str(),
+        "aac" | "opus" | "mp3" | "flac" | "vorbis"
+    )
+}
+
+fn is_transcodable_audio_codec(codec: &str) -> bool {
+    matches!(
+        codec.to_ascii_lowercase().as_str(),
+        "ac3" | "eac3" | "dts" | "truehd" | "pcm_s16le" | "pcm_s24le" | "pcm_s32le" | "pcm_f32le"
+    )
 }
 
 fn default_probe_command() -> Option<PathBuf> {
@@ -1040,6 +1372,7 @@ mod tests {
                     {"codec_type": "audio", "codec_name": "aac"}
                 ]
             }"#,
+            Some("mkv"),
             "2026-01-01T00:00:00Z".to_string(),
         )
         .unwrap();
@@ -1055,10 +1388,278 @@ mod tests {
 
     #[test]
     fn parse_probe_output_returns_error_for_invalid_json() {
-        let error =
-            parse_probe_output(b"{ definitely-not-json", "2026-01-01T00:00:00Z".to_string())
-                .unwrap_err();
+        let error = parse_probe_output(
+            b"{ definitely-not-json",
+            Some("mp4"),
+            "2026-01-01T00:00:00Z".to_string(),
+        )
+        .unwrap_err();
 
         assert!(error.starts_with("ffprobe returned invalid JSON:"));
+    }
+
+    fn audio_stream(codec: &str) -> AudioStream {
+        AudioStream {
+            index: 0,
+            codec: Some(codec.to_string()),
+            channels: Some(2),
+            channel_layout: Some("stereo".to_string()),
+            language: None,
+            title: None,
+            default: true,
+        }
+    }
+
+    #[test]
+    fn classifier_marks_h264_aac_mp4_as_direct() {
+        let mode = classify_playback_mode(
+            Some("mov,mp4,m4a,3gp,3g2,mj2"),
+            Some("mp4"),
+            Some("h264"),
+            Some("High"),
+            Some("yuv420p"),
+            Some(40),
+            Some(8),
+            &[audio_stream("aac")],
+        );
+
+        assert_eq!(mode, PlaybackMode::Direct);
+    }
+
+    #[test]
+    fn classifier_marks_mkv_with_safe_codecs_as_remux() {
+        let mode = classify_playback_mode(
+            Some("matroska,webm"),
+            Some("mkv"),
+            Some("h264"),
+            Some("High"),
+            Some("yuv420p"),
+            Some(40),
+            Some(8),
+            &[audio_stream("aac")],
+        );
+
+        assert_eq!(mode, PlaybackMode::HlsRemux);
+    }
+
+    #[test]
+    fn classifier_marks_webm_as_direct() {
+        let mode = classify_playback_mode(
+            Some("matroska,webm"),
+            Some("webm"),
+            Some("vp9"),
+            None,
+            Some("yuv420p"),
+            None,
+            None,
+            &[audio_stream("opus")],
+        );
+
+        assert_eq!(mode, PlaybackMode::Direct);
+    }
+
+    #[test]
+    fn classifier_marks_mkv_with_ac3_as_audio_transcode() {
+        let mode = classify_playback_mode(
+            Some("matroska,webm"),
+            Some("mkv"),
+            Some("h264"),
+            Some("High"),
+            Some("yuv420p"),
+            Some(40),
+            Some(8),
+            &[audio_stream("ac3")],
+        );
+
+        assert_eq!(mode, PlaybackMode::HlsAudioTranscode);
+    }
+
+    #[test]
+    fn classifier_marks_dts_as_audio_transcode() {
+        let mode = classify_playback_mode(
+            Some("matroska,webm"),
+            Some("mkv"),
+            Some("h264"),
+            Some("High"),
+            Some("yuv420p"),
+            Some(40),
+            Some(8),
+            &[audio_stream("dts")],
+        );
+
+        assert_eq!(mode, PlaybackMode::HlsAudioTranscode);
+    }
+
+    #[test]
+    fn classifier_marks_hevc_as_full_transcode() {
+        let mode = classify_playback_mode(
+            Some("matroska,webm"),
+            Some("mkv"),
+            Some("hevc"),
+            Some("Main"),
+            Some("yuv420p"),
+            Some(120),
+            Some(8),
+            &[audio_stream("aac")],
+        );
+
+        assert_eq!(mode, PlaybackMode::HlsFullTranscode);
+    }
+
+    #[test]
+    fn classifier_marks_avi_mpeg4_as_full_transcode() {
+        let mode = classify_playback_mode(
+            Some("avi"),
+            Some("avi"),
+            Some("mpeg4"),
+            Some("Simple Profile"),
+            Some("yuv420p"),
+            Some(5),
+            Some(8),
+            &[audio_stream("mp3")],
+        );
+
+        assert_eq!(mode, PlaybackMode::HlsFullTranscode);
+    }
+
+    #[test]
+    fn classifier_marks_10_bit_h264_as_full_transcode() {
+        let mode = classify_playback_mode(
+            Some("matroska,webm"),
+            Some("mkv"),
+            Some("h264"),
+            Some("High 10"),
+            Some("yuv420p10le"),
+            Some(40),
+            Some(10),
+            &[audio_stream("aac")],
+        );
+
+        assert_eq!(mode, PlaybackMode::HlsFullTranscode);
+    }
+
+    #[test]
+    fn classifier_marks_multi_audio_mixed_as_audio_transcode() {
+        let english = audio_stream("aac");
+        let japanese = AudioStream {
+            index: 1,
+            codec: Some("ac3".into()),
+            channels: Some(6),
+            channel_layout: Some("5.1".into()),
+            language: Some("jpn".into()),
+            title: Some("Japanese".into()),
+            default: false,
+        };
+
+        let mode = classify_playback_mode(
+            Some("matroska,webm"),
+            Some("mkv"),
+            Some("h264"),
+            Some("High"),
+            Some("yuv420p"),
+            Some(40),
+            Some(8),
+            &[english, japanese],
+        );
+
+        assert_eq!(mode, PlaybackMode::HlsAudioTranscode);
+    }
+
+    #[test]
+    fn classifier_marks_no_streams_as_unsupported() {
+        let mode = classify_playback_mode(
+            Some("matroska,webm"),
+            Some("mkv"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+        );
+
+        assert_eq!(mode, PlaybackMode::Unsupported);
+    }
+
+    #[test]
+    fn classifier_marks_audio_only_mp3_as_direct() {
+        let mode = classify_playback_mode(
+            Some("mp3"),
+            Some("mp3"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[audio_stream("mp3")],
+        );
+
+        assert_eq!(mode, PlaybackMode::Direct);
+    }
+
+    #[test]
+    fn parse_probe_output_populates_audio_and_subtitle_streams() {
+        let metadata = parse_probe_output(
+            br#"{
+                "format": {
+                    "format_name": "matroska,webm",
+                    "duration": "120.0"
+                },
+                "streams": [
+                    {
+                        "index": 0,
+                        "codec_type": "video",
+                        "codec_name": "h264",
+                        "profile": "High",
+                        "level": 40,
+                        "pix_fmt": "yuv420p",
+                        "bits_per_raw_sample": "8",
+                        "width": 1920,
+                        "height": 1080
+                    },
+                    {
+                        "index": 1,
+                        "codec_type": "audio",
+                        "codec_name": "ac3",
+                        "channels": 6,
+                        "channel_layout": "5.1",
+                        "tags": {"language": "eng", "title": "English"},
+                        "disposition": {"default": 1}
+                    },
+                    {
+                        "index": 2,
+                        "codec_type": "audio",
+                        "codec_name": "aac",
+                        "channels": 2,
+                        "tags": {"language": "jpn"}
+                    },
+                    {
+                        "index": 3,
+                        "codec_type": "subtitle",
+                        "codec_name": "subrip",
+                        "tags": {"language": "eng"},
+                        "disposition": {"forced": 1}
+                    }
+                ]
+            }"#,
+            Some("mkv"),
+            "2026-01-01T00:00:00Z".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(metadata.video_profile.as_deref(), Some("High"));
+        assert_eq!(metadata.video_level, Some(40));
+        assert_eq!(metadata.video_pix_fmt.as_deref(), Some("yuv420p"));
+        assert_eq!(metadata.video_bit_depth, Some(8));
+        assert_eq!(metadata.audio_streams.len(), 2);
+        assert_eq!(metadata.audio_streams[0].codec.as_deref(), Some("ac3"));
+        assert_eq!(metadata.audio_streams[0].language.as_deref(), Some("eng"));
+        assert_eq!(metadata.audio_streams[0].title.as_deref(), Some("English"));
+        assert!(metadata.audio_streams[0].default);
+        assert_eq!(metadata.audio_streams[1].codec.as_deref(), Some("aac"));
+        assert!(!metadata.audio_streams[1].default);
+        assert_eq!(metadata.subtitle_streams.len(), 1);
+        assert!(metadata.subtitle_streams[0].forced);
+        assert_eq!(metadata.playback_mode, PlaybackMode::HlsAudioTranscode);
     }
 }

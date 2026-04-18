@@ -11,7 +11,10 @@ use crate::{
     RoomRecord,
     clock::{AuthoritativePlaybackClock, PlaybackClockCheckpoint, format_timestamp},
     library::ScannedMediaItem,
-    protocol::{LibraryRoot, MediaItem, PlaybackStatus, SubtitleTrack},
+    protocol::{
+        AudioStream, LibraryRoot, MediaItem, PlaybackMode, PlaybackStatus, SubtitleStream,
+        SubtitleTrack,
+    },
 };
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
@@ -184,7 +187,14 @@ impl Persistence {
                 probe_error,
                 subtitle_tracks_json,
                 thumbnail_generated_at,
-                thumbnail_error
+                thumbnail_error,
+                playback_mode,
+                video_profile,
+                video_level,
+                video_pix_fmt,
+                video_bit_depth,
+                audio_streams_json,
+                subtitle_streams_json
             FROM media_items
             ORDER BY root_path ASC, relative_path ASC
             "#,
@@ -230,7 +240,14 @@ impl Persistence {
                 probe_error,
                 subtitle_tracks_json,
                 thumbnail_generated_at,
-                thumbnail_error
+                thumbnail_error,
+                playback_mode,
+                video_profile,
+                video_level,
+                video_pix_fmt,
+                video_bit_depth,
+                audio_streams_json,
+                subtitle_streams_json
             FROM media_items
             WHERE id = ?1
             "#,
@@ -385,9 +402,16 @@ impl Persistence {
                     probe_error,
                     subtitle_tracks_json,
                     thumbnail_generated_at,
-                    thumbnail_error
+                    thumbnail_error,
+                    playback_mode,
+                    video_profile,
+                    video_level,
+                    video_pix_fmt,
+                    video_bit_depth,
+                    audio_streams_json,
+                    subtitle_streams_json
                 )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)
                 ON CONFLICT(root_path, relative_path) DO UPDATE SET
                     file_name = excluded.file_name,
                     extension = excluded.extension,
@@ -405,7 +429,14 @@ impl Persistence {
                     probe_error = excluded.probe_error,
                     subtitle_tracks_json = excluded.subtitle_tracks_json,
                     thumbnail_generated_at = excluded.thumbnail_generated_at,
-                    thumbnail_error = excluded.thumbnail_error
+                    thumbnail_error = excluded.thumbnail_error,
+                    playback_mode = excluded.playback_mode,
+                    video_profile = excluded.video_profile,
+                    video_level = excluded.video_level,
+                    video_pix_fmt = excluded.video_pix_fmt,
+                    video_bit_depth = excluded.video_bit_depth,
+                    audio_streams_json = excluded.audio_streams_json,
+                    subtitle_streams_json = excluded.subtitle_streams_json
                 "#,
             )
             .bind(item.id.to_string())
@@ -428,6 +459,13 @@ impl Persistence {
             .bind(serialize_subtitle_tracks(&item.subtitle_tracks)?)
             .bind(&item.thumbnail_generated_at)
             .bind(&item.thumbnail_error)
+            .bind(item.playback_mode.as_str())
+            .bind(&item.video_profile)
+            .bind(item.video_level.map(i64::from))
+            .bind(&item.video_pix_fmt)
+            .bind(item.video_bit_depth.map(i64::from))
+            .bind(serialize_audio_streams(&item.audio_streams)?)
+            .bind(serialize_subtitle_streams(&item.subtitle_streams)?)
             .execute(&mut *transaction)
             .await?;
         }
@@ -569,6 +607,22 @@ fn map_row_to_media_item(row: sqlx::sqlite::SqliteRow) -> Result<MediaItem, Pers
     let id = row.try_get::<String, _>("id")?;
     let size_bytes = row.try_get::<i64, _>("size_bytes")?;
     let subtitle_tracks_json = row.try_get::<String, _>("subtitle_tracks_json")?;
+    let audio_streams_json = row.try_get::<String, _>("audio_streams_json")?;
+    let subtitle_streams_json = row.try_get::<String, _>("subtitle_streams_json")?;
+    let playback_mode_raw = row.try_get::<String, _>("playback_mode")?;
+    let playback_mode = PlaybackMode::from_str_opt(&playback_mode_raw).ok_or_else(|| {
+        PersistenceError::InvalidData(format!(
+            "invalid stored playback_mode '{playback_mode_raw}'"
+        ))
+    })?;
+    let media_uuid = Uuid::parse_str(&id).map_err(|error| {
+        PersistenceError::InvalidData(format!("invalid stored media id '{id}': {error}"))
+    })?;
+    let hls_master_url = if playback_mode.is_hls() {
+        Some(format!("/api/media/{media_uuid}/hls/master.m3u8"))
+    } else {
+        None
+    };
 
     if size_bytes < 0 {
         return Err(PersistenceError::InvalidData(format!(
@@ -577,9 +631,7 @@ fn map_row_to_media_item(row: sqlx::sqlite::SqliteRow) -> Result<MediaItem, Pers
     }
 
     Ok(MediaItem {
-        id: Uuid::parse_str(&id).map_err(|error| {
-            PersistenceError::InvalidData(format!("invalid stored media id '{id}': {error}"))
-        })?,
+        id: media_uuid,
         root_path: row.try_get("root_path")?,
         relative_path: row.try_get("relative_path")?,
         file_name: row.try_get("file_name")?,
@@ -599,7 +651,56 @@ fn map_row_to_media_item(row: sqlx::sqlite::SqliteRow) -> Result<MediaItem, Pers
         subtitle_tracks: deserialize_subtitle_tracks(&subtitle_tracks_json)?,
         thumbnail_generated_at: row.try_get("thumbnail_generated_at")?,
         thumbnail_error: row.try_get("thumbnail_error")?,
+        playback_mode,
+        video_profile: row.try_get("video_profile")?,
+        video_level: parse_optional_u32(&row, "video_level")?,
+        video_pix_fmt: row.try_get("video_pix_fmt")?,
+        video_bit_depth: parse_optional_u8(&row, "video_bit_depth")?,
+        audio_streams: deserialize_audio_streams(&audio_streams_json)?,
+        subtitle_streams: deserialize_subtitle_streams(&subtitle_streams_json)?,
+        hls_master_url,
     })
+}
+
+fn serialize_audio_streams(streams: &[AudioStream]) -> Result<String, PersistenceError> {
+    serde_json::to_string(streams).map_err(|error| {
+        PersistenceError::InvalidData(format!("failed to serialize audio streams: {error}"))
+    })
+}
+
+fn deserialize_audio_streams(value: &str) -> Result<Vec<AudioStream>, PersistenceError> {
+    serde_json::from_str(value).map_err(|error| {
+        PersistenceError::InvalidData(format!("invalid stored audio stream JSON: {error}"))
+    })
+}
+
+fn serialize_subtitle_streams(streams: &[SubtitleStream]) -> Result<String, PersistenceError> {
+    serde_json::to_string(streams).map_err(|error| {
+        PersistenceError::InvalidData(format!("failed to serialize subtitle streams: {error}"))
+    })
+}
+
+fn deserialize_subtitle_streams(value: &str) -> Result<Vec<SubtitleStream>, PersistenceError> {
+    serde_json::from_str(value).map_err(|error| {
+        PersistenceError::InvalidData(format!("invalid stored subtitle stream JSON: {error}"))
+    })
+}
+
+fn parse_optional_u8(
+    row: &sqlx::sqlite::SqliteRow,
+    column: &str,
+) -> Result<Option<u8>, PersistenceError> {
+    let value = row.try_get::<Option<i64>, _>(column)?;
+
+    match value {
+        Some(value) if value < 0 => Err(PersistenceError::InvalidData(format!(
+            "invalid stored {column} '{value}'"
+        ))),
+        Some(value) => u8::try_from(value).map(Some).map_err(|error| {
+            PersistenceError::InvalidData(format!("invalid stored {column} '{value}': {error}"))
+        }),
+        None => Ok(None),
+    }
 }
 
 fn serialize_subtitle_tracks(tracks: &[SubtitleTrack]) -> Result<String, PersistenceError> {

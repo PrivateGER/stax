@@ -30,6 +30,32 @@ export type SubtitleTrack = {
   language: string | null;
 };
 
+export type PlaybackMode =
+  | "direct"
+  | "hlsRemux"
+  | "hlsAudioTranscode"
+  | "hlsFullTranscode"
+  | "unsupported";
+
+export type AudioStream = {
+  index: number;
+  codec: string | null;
+  channels: number | null;
+  channelLayout: string | null;
+  language: string | null;
+  title: string | null;
+  default: boolean;
+};
+
+export type SubtitleStream = {
+  index: number;
+  codec: string | null;
+  language: string | null;
+  title: string | null;
+  default: boolean;
+  forced: boolean;
+};
+
 export type MediaItem = {
   id: string;
   rootPath: string;
@@ -51,6 +77,14 @@ export type MediaItem = {
   subtitleTracks: SubtitleTrack[];
   thumbnailGeneratedAt: string | null;
   thumbnailError: string | null;
+  playbackMode: PlaybackMode;
+  videoProfile: string | null;
+  videoLevel: number | null;
+  videoPixFmt: string | null;
+  videoBitDepth: number | null;
+  audioStreams: AudioStream[];
+  subtitleStreams: SubtitleStream[];
+  hlsMasterUrl: string | null;
 };
 
 export type LibraryRoot = {

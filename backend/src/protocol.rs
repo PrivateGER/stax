@@ -145,6 +145,71 @@ pub struct SubtitleTrack {
     pub language: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum PlaybackMode {
+    Direct,
+    HlsRemux,
+    HlsAudioTranscode,
+    HlsFullTranscode,
+    Unsupported,
+}
+
+impl PlaybackMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PlaybackMode::Direct => "direct",
+            PlaybackMode::HlsRemux => "hlsRemux",
+            PlaybackMode::HlsAudioTranscode => "hlsAudioTranscode",
+            PlaybackMode::HlsFullTranscode => "hlsFullTranscode",
+            PlaybackMode::Unsupported => "unsupported",
+        }
+    }
+
+    pub fn from_str_opt(value: &str) -> Option<Self> {
+        match value {
+            "direct" => Some(PlaybackMode::Direct),
+            "hlsRemux" => Some(PlaybackMode::HlsRemux),
+            "hlsAudioTranscode" => Some(PlaybackMode::HlsAudioTranscode),
+            "hlsFullTranscode" => Some(PlaybackMode::HlsFullTranscode),
+            "unsupported" => Some(PlaybackMode::Unsupported),
+            _ => None,
+        }
+    }
+
+    pub fn is_hls(self) -> bool {
+        matches!(
+            self,
+            PlaybackMode::HlsRemux
+                | PlaybackMode::HlsAudioTranscode
+                | PlaybackMode::HlsFullTranscode
+        )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioStream {
+    pub index: u32,
+    pub codec: Option<String>,
+    pub channels: Option<u32>,
+    pub channel_layout: Option<String>,
+    pub language: Option<String>,
+    pub title: Option<String>,
+    pub default: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SubtitleStream {
+    pub index: u32,
+    pub codec: Option<String>,
+    pub language: Option<String>,
+    pub title: Option<String>,
+    pub default: bool,
+    pub forced: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct MediaItem {
@@ -168,6 +233,14 @@ pub struct MediaItem {
     pub subtitle_tracks: Vec<SubtitleTrack>,
     pub thumbnail_generated_at: Option<String>,
     pub thumbnail_error: Option<String>,
+    pub playback_mode: PlaybackMode,
+    pub video_profile: Option<String>,
+    pub video_level: Option<u32>,
+    pub video_pix_fmt: Option<String>,
+    pub video_bit_depth: Option<u8>,
+    pub audio_streams: Vec<AudioStream>,
+    pub subtitle_streams: Vec<SubtitleStream>,
+    pub hls_master_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
