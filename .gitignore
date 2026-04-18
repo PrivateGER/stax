@@ -1,0 +1,37 @@
+# OS and editor files
+.DS_Store
+.idea/
+.vscode/
+.claude/
+.codex
+
+# Environment files
+.env
+.env.local
+.env.*.local
+backend/.env
+backend/.env.local
+frontend/.env
+frontend/.env.local
+
+# Frontend dependencies and build output
+node_modules/
+dist/
+coverage/
+frontend/node_modules/
+frontend/dist/
+frontend/coverage/
+
+# TypeScript and generated config artifacts
+*.tsbuildinfo
+frontend/vite.config.js
+frontend/vite.config.d.ts
+
+# Rust build output
+target/
+backend/target/
+
+# Local backend runtime data
+backend/*.db
+backend/*.db-*
+backend/syncplay-thumbnails/

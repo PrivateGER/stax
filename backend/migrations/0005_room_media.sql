@@ -1,0 +1,2 @@
+ALTER TABLE rooms
+    ADD COLUMN media_id TEXT REFERENCES media_items(id) ON DELETE SET NULL;
