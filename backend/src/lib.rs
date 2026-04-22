@@ -13,9 +13,9 @@ use axum::{
         Path, Query, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    http::{HeaderMap, HeaderValue, Method, StatusCode, header, header::RANGE},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, header::RANGE},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use time::OffsetDateTime;
 use tokio::sync::{RwLock, broadcast};
@@ -28,26 +28,28 @@ use uuid::Uuid;
 
 pub mod clock;
 pub mod library;
-pub mod muxing;
 pub mod persistence;
 pub mod probes;
 pub mod protocol;
 pub mod scan_gate;
+pub mod stream_copies;
 pub mod streaming;
 pub mod thumbnails;
 
 use clock::{AuthoritativePlaybackClock, format_timestamp, round_to};
 use library::{LibraryConfig, LibraryService};
-use muxing::{BrowserHint, HlsConfig, HlsError, HlsServeBody, HlsServeResult, HlsSessionManager};
-use persistence::{Persistence, PersistenceError};
+use persistence::{Persistence, PersistenceError, StreamCopyRecord, StreamCopyRequestRecord};
 use probes::{ProbeConfig, ProbeJob, ProbeWorkerPool};
 use protocol::{
-    ClientSocketMessage, CreateRoomRequest, HealthResponse, LibraryResponse, LibraryScanResponse,
-    PlaybackAction, Room, RoomSocketQuery, RoomsResponse, ServerEvent,
+    ClientSocketMessage, CreateRoomRequest, CreateStreamCopyRequest, HealthResponse,
+    LibraryResponse, LibraryScanResponse, PlaybackAction, PlaybackMode, Room, RoomSocketQuery,
+    RoomsResponse, ServerEvent, StreamCopyStatus, StreamCopySummary, SubtitleMode,
+    SubtitleSourceKind,
 };
+use stream_copies::{StreamCopyConfig, StreamCopyJob, StreamCopyWorkerPool};
 use streaming::{
-    StreamMediaError, stream_media_response, stream_subtitle_response, stream_thumbnail_response,
-    unsatisfiable_range_response,
+    StreamMediaError, stream_file_response, stream_media_response, stream_subtitle_response,
+    stream_thumbnail_response, stream_webvtt_file_response, unsatisfiable_range_response,
 };
 use thumbnails::{ThumbnailConfig, ThumbnailJob, ThumbnailWorkerPool};
 
@@ -61,16 +63,14 @@ pub struct AppState {
     rooms: SharedRooms,
     library: LibraryService,
     persistence: Persistence,
-    hls: HlsSessionManager,
+    stream_copies: StreamCopyWorkerPool,
     thumbnails: ThumbnailWorkerPool,
     probes: ProbeWorkerPool,
 }
 
 impl AppState {
-    /// Test/observability hook: returns a clone of the HLS session manager so
-    /// callers can inspect session state (e.g., active session count).
-    pub fn hls(&self) -> HlsSessionManager {
-        self.hls.clone()
+    pub fn stream_copies(&self) -> StreamCopyWorkerPool {
+        self.stream_copies.clone()
     }
 
     pub fn thumbnails(&self) -> ThumbnailWorkerPool {
@@ -274,22 +274,16 @@ pub async fn load_state_with_library(
     persistence: Persistence,
     library_config: LibraryConfig,
 ) -> Result<AppState, PersistenceError> {
-    let ffmpeg_command = library_config
-        .ffmpeg_command()
-        .map(|path| path.to_path_buf());
-    load_state_with_library_and_hls(
-        persistence,
-        library_config,
-        HlsConfig::from_env(ffmpeg_command),
-    )
-    .await
-}
-
-pub async fn load_state_with_library_and_hls(
-    persistence: Persistence,
-    library_config: LibraryConfig,
-    hls_config: HlsConfig,
-) -> Result<AppState, PersistenceError> {
+    let stream_copy_config = StreamCopyConfig {
+        cache_dir: library_config
+            .stream_copy_cache_dir()
+            .map(std::path::Path::to_path_buf),
+        ffmpeg_command: library_config
+            .ffmpeg_command()
+            .map(std::path::Path::to_path_buf),
+        ..StreamCopyConfig::default()
+    }
+    .with_env_overrides();
     let thumbnail_config = ThumbnailConfig {
         cache_dir: library_config
             .thumbnail_cache_dir()
@@ -300,10 +294,9 @@ pub async fn load_state_with_library_and_hls(
         ..ThumbnailConfig::default()
     }
     .with_env_overrides();
-    // Shared across HLS sessions and the background scan pools so background
-    // probe/thumbnail work pauses for the duration of any foreground HLS
-    // session. See `crate::scan_gate` for the rationale — probes and
-    // playback compete for the same (often network-backed) library mount.
+    // Shared across the background scan pools. The gate lets the project
+    // pause new probe/thumbnail work around any future foreground work that
+    // needs the same library mount.
     let scan_gate = crate::scan_gate::ScanGate::new();
     let thumbnails =
         ThumbnailWorkerPool::spawn(thumbnail_config, persistence.clone(), scan_gate.clone());
@@ -323,6 +316,8 @@ pub async fn load_state_with_library_and_hls(
 
     let library = LibraryService::new(persistence.clone(), library_config);
     library.sync_config().await?;
+    let stream_copies =
+        StreamCopyWorkerPool::spawn(stream_copy_config, persistence.clone(), library.clone());
 
     // Drain the persisted backlogs: any items that were pending when the
     // process last exited (or never finished) need to be re-enqueued so
@@ -345,6 +340,14 @@ pub async fn load_state_with_library_and_hls(
         );
         thumbnails.enqueue_pending(pending);
     }
+    let pending_stream_copies = persistence.list_pending_stream_copies().await?;
+    if !pending_stream_copies.is_empty() {
+        tracing::info!(
+            count = pending_stream_copies.len(),
+            "enqueueing pending stream copy jobs from previous session"
+        );
+        stream_copies.enqueue_pending(pending_stream_copies);
+    }
 
     let mut room_records = persistence.load_rooms().await?;
 
@@ -360,17 +363,11 @@ pub async fn load_state_with_library_and_hls(
         .map(|room| (room.id, Arc::new(RoomHub::new(room, persistence.clone()))))
         .collect();
 
-    let hls = HlsSessionManager::with_scan_gate_and_persistence(
-        hls_config,
-        scan_gate,
-        Some(persistence.clone()),
-    );
-
     Ok(AppState {
         library,
         rooms: Arc::new(RwLock::new(rooms)),
         persistence,
-        hls,
+        stream_copies,
         thumbnails,
         probes,
     })
@@ -390,17 +387,21 @@ pub fn build_app(state: AppState) -> Router {
     Router::new()
         .route("/api/health", get(health))
         .route("/api/library", get(list_library))
-        .route("/api/library/scan", axum::routing::post(scan_library))
+        .route("/api/library/scan", post(scan_library))
         .route("/api/media/{media_id}/stream", get(stream_media))
+        .route(
+            "/api/media/{media_id}/stream-copy",
+            get(get_stream_copy).post(create_stream_copy),
+        )
+        .route(
+            "/api/media/{media_id}/stream-copy/subtitle",
+            get(stream_prepared_subtitle),
+        )
         .route(
             "/api/media/{media_id}/subtitles/{track_index}",
             get(stream_subtitle),
         )
         .route("/api/media/{media_id}/thumbnail", get(stream_thumbnail))
-        .route(
-            "/api/media/{media_id}/hls/{filename}",
-            get(stream_hls_asset),
-        )
         .route("/api/rooms", get(list_rooms).post(create_room))
         .route("/api/rooms/{room_id}/ws", get(connect_room_socket))
         .with_state(state)
@@ -573,7 +574,48 @@ async fn stream_media(
         }
     };
 
-    match stream_media_response(&media_item, range_header).await {
+    let stream_result = match media_item.playback_mode {
+        PlaybackMode::Direct => stream_media_response(&media_item, range_header).await,
+        PlaybackMode::NeedsPreparation => {
+            let Some(record) = load_current_stream_copy_record(&state, &media_item).await else {
+                return ApiError::with_status(
+                    StatusCode::CONFLICT,
+                    playback_unavailable_message(&media_item),
+                )
+                .into_response();
+            };
+            if record.status != StreamCopyStatus::Ready {
+                return ApiError::with_status(
+                    StatusCode::CONFLICT,
+                    playback_unavailable_message(&media_item),
+                )
+                .into_response();
+            }
+            let Some(output_path) = record.output_path.as_deref() else {
+                return ApiError::internal("Prepared stream copy is missing an output file.")
+                    .into_response();
+            };
+            let content_type = record
+                .output_content_type
+                .as_deref()
+                .unwrap_or("application/octet-stream");
+            stream_file_response(
+                std::path::Path::new(output_path),
+                content_type,
+                range_header,
+            )
+            .await
+        }
+        PlaybackMode::Unsupported => {
+            return ApiError::with_status(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "This media is not supported for browser playback.",
+            )
+            .into_response();
+        }
+    };
+
+    match stream_result {
         Ok(response) => response,
         Err(StreamMediaError::NotFound) => {
             ApiError::not_found("Media file not found.").into_response()
@@ -624,137 +666,282 @@ async fn stream_thumbnail(State(state): State<AppState>, Path(media_id): Path<Uu
     }
 }
 
-async fn stream_hls_asset(
+async fn get_stream_copy(
     State(state): State<AppState>,
-    Path((media_id, filename)): Path<(Uuid, String)>,
-    headers: HeaderMap,
+    Path(media_id): Path<Uuid>,
+) -> Result<Json<StreamCopySummary>, ApiError> {
+    let media_item = match state.library.media_item(media_id).await {
+        Ok(Some(media_item)) => media_item,
+        Ok(None) => return Err(ApiError::not_found("Media not found.")),
+        Err(error) => {
+            warn!(%error, %media_id, "failed to load media item for stream copy");
+            return Err(ApiError::internal("Failed to load media."));
+        }
+    };
+
+    media_item
+        .stream_copy
+        .map(Json)
+        .ok_or_else(|| ApiError::not_found("No current stream copy exists for this media."))
+}
+
+async fn create_stream_copy(
+    State(state): State<AppState>,
+    Path(media_id): Path<Uuid>,
+    Json(request): Json<CreateStreamCopyRequest>,
+) -> Result<Json<StreamCopySummary>, ApiError> {
+    let media_item = match state.library.media_item(media_id).await {
+        Ok(Some(media_item)) => media_item,
+        Ok(None) => return Err(ApiError::not_found("Media not found.")),
+        Err(error) => {
+            warn!(%error, %media_id, "failed to load media item for stream copy request");
+            return Err(ApiError::internal("Failed to load media."));
+        }
+    };
+
+    if media_item.playback_mode == PlaybackMode::Direct {
+        return Err(ApiError::with_status(
+            StatusCode::CONFLICT,
+            "This media is already browser-playable and does not need a stream copy.",
+        ));
+    }
+    if media_item.playback_mode == PlaybackMode::Unsupported {
+        return Err(ApiError::with_status(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "This media is not supported for browser playback.",
+        ));
+    }
+
+    validate_stream_copy_request(&media_item, &request)?;
+
+    if let Some(existing) = load_current_stream_copy_record(&state, &media_item).await {
+        let same_request = stream_copy_request_matches(&existing, &request);
+        if same_request
+            && matches!(
+                existing.status,
+                StreamCopyStatus::Queued | StreamCopyStatus::Running | StreamCopyStatus::Ready
+            )
+        {
+            if let Some(summary) = media_item.stream_copy {
+                return Ok(Json(summary));
+            }
+        }
+        if !same_request
+            && matches!(
+                existing.status,
+                StreamCopyStatus::Queued | StreamCopyStatus::Running
+            )
+        {
+            return Err(ApiError::with_status(
+                StatusCode::CONFLICT,
+                "A different stream copy request is already in progress for this media.",
+            ));
+        }
+    }
+
+    let now = format_timestamp(OffsetDateTime::now_utc());
+    let subtitle_kind = request.subtitle.as_ref().map(|subtitle| subtitle.kind);
+    let subtitle_index = request.subtitle.as_ref().map(|subtitle| subtitle.index);
+    state
+        .persistence
+        .upsert_stream_copy_request(&StreamCopyRequestRecord {
+            media_id,
+            source_size_bytes: media_item.size_bytes,
+            source_modified_at: media_item.modified_at.clone(),
+            audio_stream_index: request.audio_stream_index,
+            subtitle_mode: request.subtitle_mode,
+            subtitle_kind,
+            subtitle_index,
+            updated_at: now,
+        })
+        .await
+        .map_err(|error| {
+            warn!(%error, %media_id, "failed to persist stream copy request");
+            ApiError::internal("Failed to create stream copy.")
+        })?;
+    state.stream_copies.enqueue(StreamCopyJob { media_id });
+
+    let refreshed = state.library.media_item(media_id).await.map_err(|error| {
+        warn!(%error, %media_id, "failed to reload media item after stream copy request");
+        ApiError::internal("Failed to load stream copy state.")
+    })?;
+    let Some(summary) = refreshed.and_then(|item| item.stream_copy) else {
+        return Err(ApiError::internal(
+            "Failed to load the queued stream copy state.",
+        ));
+    };
+
+    Ok(Json(summary))
+}
+
+async fn stream_prepared_subtitle(
+    State(state): State<AppState>,
+    Path(media_id): Path<Uuid>,
 ) -> Response {
     let media_item = match state.library.media_item(media_id).await {
         Ok(Some(media_item)) => media_item,
         Ok(None) => return ApiError::not_found("Media not found.").into_response(),
         Err(error) => {
-            warn!(%error, %media_id, "failed to load media item for HLS");
+            warn!(%error, %media_id, "failed to load media item for prepared subtitle");
             return ApiError::internal("Failed to load media.").into_response();
         }
     };
-
-    if matches!(
-        media_item.playback_mode,
-        protocol::PlaybackMode::Unsupported
-    ) {
-        return ApiError::with_status(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "This media is not supported for browser playback.",
-        )
-        .into_response();
-    }
-    if matches!(media_item.playback_mode, protocol::PlaybackMode::Direct) {
+    let Some(record) = load_current_stream_copy_record(&state, &media_item).await else {
+        return ApiError::not_found("Prepared subtitle not found.").into_response();
+    };
+    if record.status != StreamCopyStatus::Ready {
         return ApiError::with_status(
             StatusCode::CONFLICT,
-            "This media is direct-playable; use the streaming endpoint instead.",
+            playback_unavailable_message(&media_item),
         )
         .into_response();
     }
-
-    let user_agent = headers
-        .get("user-agent")
-        .and_then(|value| value.to_str().ok());
-    let browser = BrowserHint::from_user_agent(user_agent);
-
-    let serve_result = match state.hls.serve(&media_item, &filename, browser).await {
-        Ok(result) => result,
-        Err(HlsError::UnsupportedMode) => {
-            return ApiError::with_status(
-                StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                "This media is not eligible for HLS playback.",
-            )
-            .into_response();
-        }
-        Err(HlsError::InvalidFilename) => {
-            return ApiError::bad_request("Invalid HLS asset name.").into_response();
-        }
-        Err(HlsError::NotFound) => {
-            return ApiError::not_found("HLS asset not found.").into_response();
-        }
-        Err(HlsError::NotReady) => {
-            return ApiError::with_status(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "HLS session did not become ready in time.",
-            )
-            .into_response();
-        }
-        Err(HlsError::SpawnFailed(message)) => {
-            warn!(%message, %media_id, "ffmpeg HLS session failed");
-            return ApiError::internal("Failed to start HLS session.").into_response();
-        }
-        Err(HlsError::RespawnThrottled {
-            retry_after_secs,
-            reason,
-        }) => {
-            warn!(
-                %media_id,
-                retry_after_secs,
-                reason,
-                "throttling seek-triggered HLS respawn"
-            );
-            let mut response = ApiError::with_status(
-                StatusCode::TOO_MANY_REQUESTS,
-                "Too many rapid seek requests. Please retry shortly.",
-            )
-            .into_response();
-            let retry_after_value = HeaderValue::from_str(&retry_after_secs.to_string())
-                .unwrap_or_else(|_| HeaderValue::from_static("1"));
-            response
-                .headers_mut()
-                .insert(header::RETRY_AFTER, retry_after_value);
-            return response;
-        }
-        Err(HlsError::Io(error)) => {
-            warn!(%error, %media_id, "HLS IO error");
-            return ApiError::internal("Failed to serve HLS asset.").into_response();
-        }
+    let Some(subtitle_path) = record.subtitle_path.as_deref() else {
+        return ApiError::not_found("Prepared subtitle not found.").into_response();
     };
 
-    let HlsServeResult {
-        body,
-        content_type,
-        _guard,
-    } = serve_result;
-
-    match body {
-        HlsServeBody::File(path) => {
-            match streaming::stream_hls_file_response(&path, content_type).await {
-                Ok(mut response) => {
-                    // Keep the in-flight guard alive until the response is dropped.
-                    response.extensions_mut().insert(_guard);
-                    response
-                }
-                Err(StreamMediaError::NotFound) => {
-                    ApiError::not_found("HLS asset not found.").into_response()
-                }
-                Err(StreamMediaError::Io(error)) => {
-                    warn!(%error, %media_id, "failed to stream HLS asset");
-                    ApiError::internal("Failed to stream HLS asset.").into_response()
-                }
-                Err(
-                    StreamMediaError::MalformedRange(_)
-                    | StreamMediaError::UnsatisfiableRange { .. },
-                ) => ApiError::internal("Failed to stream HLS asset.").into_response(),
-            }
+    match stream_webvtt_file_response(std::path::Path::new(subtitle_path)).await {
+        Ok(response) => response,
+        Err(StreamMediaError::NotFound) => {
+            ApiError::not_found("Prepared subtitle not found.").into_response()
         }
-        HlsServeBody::Inline(bytes) => {
-            // Synthesized variant playlist — return the body directly. No
-            // range support needed; hls.js never issues ranged requests for
-            // playlists, only for media segments.
-            let mut response = bytes.into_response();
-            response
-                .headers_mut()
-                .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
-            // Keep the in-flight guard alive until the response is dropped.
-            response.extensions_mut().insert(_guard);
-            response
+        Err(StreamMediaError::Io(error)) => {
+            warn!(%error, media_id = %media_item.id, "failed to stream prepared subtitle");
+            ApiError::internal("Failed to stream prepared subtitle.").into_response()
+        }
+        Err(StreamMediaError::MalformedRange(_) | StreamMediaError::UnsatisfiableRange { .. }) => {
+            ApiError::internal("Failed to stream prepared subtitle.").into_response()
         }
     }
+}
+
+async fn load_current_stream_copy_record(
+    state: &AppState,
+    media_item: &protocol::MediaItem,
+) -> Option<StreamCopyRecord> {
+    let record = match state.persistence.find_stream_copy(media_item.id).await {
+        Ok(record) => record,
+        Err(error) => {
+            warn!(%error, media_id = %media_item.id, "failed to load stream copy record");
+            None
+        }
+    }?;
+
+    (record.source_size_bytes == media_item.size_bytes
+        && record.source_modified_at == media_item.modified_at)
+        .then_some(record)
+}
+
+fn playback_unavailable_message(media_item: &protocol::MediaItem) -> &'static str {
+    match media_item.preparation_state {
+        protocol::PreparationState::Preparing => {
+            "A stream copy is still being prepared for this media."
+        }
+        protocol::PreparationState::Failed => {
+            "The last stream copy attempt failed. Create a new stream copy to play this media."
+        }
+        _ => "This media needs a stream copy before it can be played in the browser.",
+    }
+}
+
+fn stream_copy_request_matches(
+    record: &StreamCopyRecord,
+    request: &CreateStreamCopyRequest,
+) -> bool {
+    record.audio_stream_index == request.audio_stream_index
+        && record.subtitle_mode == request.subtitle_mode
+        && record.subtitle_kind == request.subtitle.as_ref().map(|subtitle| subtitle.kind)
+        && record.subtitle_index == request.subtitle.as_ref().map(|subtitle| subtitle.index)
+}
+
+fn validate_stream_copy_request(
+    media_item: &protocol::MediaItem,
+    request: &CreateStreamCopyRequest,
+) -> Result<(), ApiError> {
+    if let Some(audio_stream_index) = request.audio_stream_index {
+        if !media_item
+            .audio_streams
+            .iter()
+            .any(|stream| stream.index == audio_stream_index)
+        {
+            return Err(ApiError::bad_request(
+                "Selected audio stream does not exist for this media.",
+            ));
+        }
+    }
+
+    match request.subtitle_mode {
+        SubtitleMode::Off => {
+            if request.subtitle.is_some() {
+                return Err(ApiError::bad_request(
+                    "Do not provide a subtitle source when subtitle mode is 'off'.",
+                ));
+            }
+        }
+        SubtitleMode::Sidecar | SubtitleMode::Burned => {
+            let Some(selection) = request.subtitle.as_ref() else {
+                return Err(ApiError::bad_request(
+                    "A subtitle source is required for the selected subtitle mode.",
+                ));
+            };
+            match selection.kind {
+                SubtitleSourceKind::Sidecar => {
+                    let Some(track) = media_item.subtitle_tracks.get(selection.index as usize)
+                    else {
+                        return Err(ApiError::bad_request(
+                            "Selected sidecar subtitle track does not exist.",
+                        ));
+                    };
+                    let extension = track.extension.to_ascii_lowercase();
+                    if request.subtitle_mode == SubtitleMode::Sidecar
+                        && !matches!(extension.as_str(), "vtt" | "srt")
+                    {
+                        return Err(ApiError::bad_request(
+                            "Only VTT and SRT sidecar subtitles can be prepared as sidecar WebVTT.",
+                        ));
+                    }
+                    if request.subtitle_mode == SubtitleMode::Burned
+                        && !matches!(extension.as_str(), "vtt" | "srt" | "ass" | "ssa")
+                    {
+                        return Err(ApiError::bad_request(
+                            "Only text-based sidecar subtitles can be burned into a stream copy.",
+                        ));
+                    }
+                }
+                SubtitleSourceKind::Embedded => {
+                    let Some(stream) = media_item
+                        .subtitle_streams
+                        .iter()
+                        .find(|stream| stream.index == selection.index)
+                    else {
+                        return Err(ApiError::bad_request(
+                            "Selected embedded subtitle stream does not exist.",
+                        ));
+                    };
+                    if !is_text_subtitle_codec(stream.codec.as_deref()) {
+                        return Err(ApiError::bad_request(match request.subtitle_mode {
+                            SubtitleMode::Sidecar => {
+                                "Selected embedded subtitle stream cannot be converted to sidecar WebVTT."
+                            }
+                            SubtitleMode::Burned => {
+                                "Selected embedded subtitle stream cannot be burned into a stream copy."
+                            }
+                            SubtitleMode::Off => unreachable!(),
+                        }));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn is_text_subtitle_codec(codec: Option<&str>) -> bool {
+    matches!(
+        codec.unwrap_or_default().to_ascii_lowercase().as_str(),
+        "ass" | "ssa" | "subrip" | "srt" | "webvtt" | "mov_text" | "text"
+    )
 }
 
 async fn stream_subtitle(

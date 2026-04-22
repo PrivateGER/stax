@@ -48,6 +48,7 @@ pub struct LibraryConfig {
     probe_command: Option<PathBuf>,
     ffmpeg_command: Option<PathBuf>,
     thumbnail_cache_dir: Option<PathBuf>,
+    stream_copy_cache_dir: Option<PathBuf>,
     probe_workers: usize,
     walk_workers: usize,
 }
@@ -110,6 +111,7 @@ impl Default for LibraryConfig {
             probe_command: default_probe_command(),
             ffmpeg_command: default_ffmpeg_command(),
             thumbnail_cache_dir: Some(default_thumbnail_cache_dir()),
+            stream_copy_cache_dir: Some(default_stream_copy_cache_dir()),
             probe_workers: DEFAULT_PROBE_WORKERS,
             walk_workers: DEFAULT_WALK_WORKERS,
         }
@@ -125,6 +127,7 @@ impl LibraryConfig {
         config.probe_command = probe_command_from_env();
         config.ffmpeg_command = ffmpeg_command_from_env();
         config.thumbnail_cache_dir = thumbnail_cache_dir_from_env();
+        config.stream_copy_cache_dir = stream_copy_cache_dir_from_env();
         config.probe_workers = probe_workers_from_env();
         config.walk_workers = walk_workers_from_env();
         config
@@ -144,6 +147,7 @@ impl LibraryConfig {
             probe_command: default_probe_command(),
             ffmpeg_command: default_ffmpeg_command(),
             thumbnail_cache_dir: Some(default_thumbnail_cache_dir()),
+            stream_copy_cache_dir: Some(default_stream_copy_cache_dir()),
             probe_workers: DEFAULT_PROBE_WORKERS,
             walk_workers: DEFAULT_WALK_WORKERS,
         }
@@ -188,6 +192,15 @@ impl LibraryConfig {
 
     pub fn thumbnail_cache_dir(&self) -> Option<&Path> {
         self.thumbnail_cache_dir.as_deref()
+    }
+
+    pub fn with_stream_copy_cache_dir(mut self, path: impl Into<PathBuf>) -> Self {
+        self.stream_copy_cache_dir = Some(path.into());
+        self
+    }
+
+    pub fn stream_copy_cache_dir(&self) -> Option<&Path> {
+        self.stream_copy_cache_dir.as_deref()
     }
 
     pub fn with_probe_workers(mut self, probe_workers: usize) -> Self {
@@ -870,6 +883,7 @@ pub(crate) async fn probe_media_metadata(
 /// ffprobe failure is surfaced as `Err(String)` so the probe pool can log
 /// it; the main probe outcome is already persisted independently, so a
 /// keyframe-probe failure does not poison the row.
+#[allow(dead_code)]
 pub(crate) async fn probe_video_keyframes(
     path: &Path,
     probe_command: Option<&Path>,
@@ -915,6 +929,7 @@ pub(crate) async fn probe_video_keyframes(
 /// Parse ffprobe's `-of csv=p=0 -show_entries packet=pts_time,flags` stdout
 /// into a sorted list of keyframe PTS offsets (seconds). Split out for unit
 /// testing — `probe_video_keyframes` is the I/O wrapper.
+#[allow(dead_code)]
 fn parse_keyframe_csv(stdout: &[u8]) -> Result<Vec<f64>, String> {
     let text = std::str::from_utf8(stdout)
         .map_err(|error| format!("ffprobe returned non-UTF-8 output: {error}"))?;
@@ -1124,15 +1139,6 @@ pub(crate) fn classify_playback_mode(
                 .unwrap_or(false)
         });
 
-    let audio_remuxable = audio_streams.is_empty()
-        || audio_streams.iter().all(|stream| {
-            stream
-                .codec
-                .as_deref()
-                .map(is_browser_safe_audio_codec)
-                .unwrap_or(false)
-        });
-
     let audio_transcodable = audio_streams.iter().all(|stream| {
         stream
             .codec
@@ -1156,22 +1162,14 @@ pub(crate) fn classify_playback_mode(
         return PlaybackMode::Direct;
     }
 
-    if video_browser_safe && audio_remuxable {
-        return PlaybackMode::HlsRemux;
-    }
-
-    if video_browser_safe && audio_transcodable {
-        return PlaybackMode::HlsAudioTranscode;
-    }
-
     if !audio_transcodable {
         return PlaybackMode::Unsupported;
     }
 
-    PlaybackMode::HlsFullTranscode
+    PlaybackMode::NeedsPreparation
 }
 
-fn is_browser_safe_container(container: &str, file_extension: Option<&str>) -> bool {
+pub(crate) fn is_browser_safe_container(container: &str, file_extension: Option<&str>) -> bool {
     // ffprobe's format_name is a comma-separated list of equivalent demuxer tags.
     // Critically, "matroska,webm" applies to BOTH .mkv and .webm files — the extension
     // is the only way to distinguish. When ambiguous, trust the extension.
@@ -1205,7 +1203,7 @@ fn is_browser_safe_container(container: &str, file_extension: Option<&str>) -> b
     })
 }
 
-fn is_browser_safe_video_codec(
+pub(crate) fn is_browser_safe_video_codec(
     codec: &str,
     profile: Option<&str>,
     pix_fmt: Option<&str>,
@@ -1244,14 +1242,14 @@ fn is_browser_safe_video_codec(
     }
 }
 
-fn is_browser_safe_audio_codec(codec: &str) -> bool {
+pub(crate) fn is_browser_safe_audio_codec(codec: &str) -> bool {
     matches!(
         codec.to_ascii_lowercase().as_str(),
         "aac" | "opus" | "mp3" | "flac" | "vorbis"
     )
 }
 
-fn is_transcodable_audio_codec(codec: &str) -> bool {
+pub(crate) fn is_transcodable_audio_codec(codec: &str) -> bool {
     matches!(
         codec.to_ascii_lowercase().as_str(),
         "ac3" | "eac3" | "dts" | "truehd" | "pcm_s16le" | "pcm_s24le" | "pcm_s32le" | "pcm_f32le"
@@ -1267,6 +1265,18 @@ fn probe_command_from_env() -> Option<PathBuf> {
         Some(value) if value.is_empty() => None,
         Some(value) => Some(PathBuf::from(value)),
         None => default_probe_command(),
+    }
+}
+
+fn default_stream_copy_cache_dir() -> PathBuf {
+    PathBuf::from("syncplay-stream-copies")
+}
+
+fn stream_copy_cache_dir_from_env() -> Option<PathBuf> {
+    match env::var_os("SYNCPLAY_STREAM_COPY_DIR") {
+        Some(value) if value.is_empty() => None,
+        Some(value) => Some(PathBuf::from(value)),
+        None => Some(default_stream_copy_cache_dir()),
     }
 }
 
@@ -1583,7 +1593,7 @@ mod tests {
     }
 
     #[test]
-    fn classifier_marks_mkv_with_safe_codecs_as_remux() {
+    fn classifier_marks_mkv_with_safe_codecs_as_needs_preparation() {
         let mode = classify_playback_mode(
             Some("matroska,webm"),
             Some("mkv"),
@@ -1595,7 +1605,7 @@ mod tests {
             &[audio_stream("aac")],
         );
 
-        assert_eq!(mode, PlaybackMode::HlsRemux);
+        assert_eq!(mode, PlaybackMode::NeedsPreparation);
     }
 
     #[test]
@@ -1615,7 +1625,7 @@ mod tests {
     }
 
     #[test]
-    fn classifier_marks_mkv_with_ac3_as_audio_transcode() {
+    fn classifier_marks_mkv_with_ac3_as_needs_preparation() {
         let mode = classify_playback_mode(
             Some("matroska,webm"),
             Some("mkv"),
@@ -1627,11 +1637,11 @@ mod tests {
             &[audio_stream("ac3")],
         );
 
-        assert_eq!(mode, PlaybackMode::HlsAudioTranscode);
+        assert_eq!(mode, PlaybackMode::NeedsPreparation);
     }
 
     #[test]
-    fn classifier_marks_dts_as_audio_transcode() {
+    fn classifier_marks_dts_as_needs_preparation() {
         let mode = classify_playback_mode(
             Some("matroska,webm"),
             Some("mkv"),
@@ -1643,11 +1653,11 @@ mod tests {
             &[audio_stream("dts")],
         );
 
-        assert_eq!(mode, PlaybackMode::HlsAudioTranscode);
+        assert_eq!(mode, PlaybackMode::NeedsPreparation);
     }
 
     #[test]
-    fn classifier_marks_hevc_as_full_transcode() {
+    fn classifier_marks_hevc_as_needs_preparation() {
         let mode = classify_playback_mode(
             Some("matroska,webm"),
             Some("mkv"),
@@ -1659,11 +1669,11 @@ mod tests {
             &[audio_stream("aac")],
         );
 
-        assert_eq!(mode, PlaybackMode::HlsFullTranscode);
+        assert_eq!(mode, PlaybackMode::NeedsPreparation);
     }
 
     #[test]
-    fn classifier_marks_avi_mpeg4_as_full_transcode() {
+    fn classifier_marks_avi_mpeg4_as_needs_preparation() {
         let mode = classify_playback_mode(
             Some("avi"),
             Some("avi"),
@@ -1675,11 +1685,11 @@ mod tests {
             &[audio_stream("mp3")],
         );
 
-        assert_eq!(mode, PlaybackMode::HlsFullTranscode);
+        assert_eq!(mode, PlaybackMode::NeedsPreparation);
     }
 
     #[test]
-    fn classifier_marks_10_bit_h264_as_full_transcode() {
+    fn classifier_marks_10_bit_h264_as_needs_preparation() {
         let mode = classify_playback_mode(
             Some("matroska,webm"),
             Some("mkv"),
@@ -1691,11 +1701,11 @@ mod tests {
             &[audio_stream("aac")],
         );
 
-        assert_eq!(mode, PlaybackMode::HlsFullTranscode);
+        assert_eq!(mode, PlaybackMode::NeedsPreparation);
     }
 
     #[test]
-    fn classifier_marks_multi_audio_mixed_as_audio_transcode() {
+    fn classifier_marks_multi_audio_mixed_as_needs_preparation() {
         let english = audio_stream("aac");
         let japanese = AudioStream {
             index: 1,
@@ -1718,7 +1728,7 @@ mod tests {
             &[english, japanese],
         );
 
-        assert_eq!(mode, PlaybackMode::HlsAudioTranscode);
+        assert_eq!(mode, PlaybackMode::NeedsPreparation);
     }
 
     #[test]
@@ -1816,6 +1826,6 @@ mod tests {
         assert!(!metadata.audio_streams[1].default);
         assert_eq!(metadata.subtitle_streams.len(), 1);
         assert!(metadata.subtitle_streams[0].forced);
-        assert_eq!(metadata.playback_mode, PlaybackMode::HlsAudioTranscode);
+        assert_eq!(metadata.playback_mode, PlaybackMode::NeedsPreparation);
     }
 }

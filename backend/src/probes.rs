@@ -18,7 +18,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::{
-    library::{probe_media_metadata, probe_video_keyframes},
+    library::probe_media_metadata,
     persistence::{PendingProbe, Persistence},
     scan_gate::ScanGate,
     thumbnails::{ThumbnailJob, ThumbnailWorkerPool},
@@ -97,13 +97,8 @@ impl ProbeWorkerPool {
                     media_path = %job.media_path.display(),
                     "probe job dequeued; awaiting worker permit"
                 );
-                // Pause new probe work while any foreground HLS session is
-                // active. Probes and playback share the same mount (often a
-                // high-latency network share) and competing with the
-                // user-facing ffmpeg for read bandwidth manifests as stalled
-                // playback. See `scan_gate` for the full rationale. We gate
-                // BEFORE taking the semaphore permit so paused jobs don't
-                // hog a worker slot they aren't using.
+                // Background probe work uses the shared scan gate so future
+                // foreground work can pause it before taking a worker slot.
                 scan_gate.wait_idle().await;
                 let permit = match Arc::clone(&semaphore).acquire_owned().await {
                     Ok(permit) => permit,
@@ -181,49 +176,6 @@ async fn process_job(
     if let Err(error) = persistence.update_probe_metadata(media_id, &outcome).await {
         warn!(%error, %media_id, "failed to persist probe outcome");
         return;
-    }
-
-    // Keyframe index, phase 2 of the probe. Only useful for titles that
-    // will be served over HLS — direct-play and unsupported media never
-    // enter the segment-plan code path, so indexing their keyframes would
-    // just be I/O for nothing. The copy-mode tiers (`HlsRemux`,
-    // `HlsAudioTranscode`) REQUIRE this index to support deep seeking
-    // (ffmpeg can't synthesize keyframes without a re-encode, so segment
-    // boundaries must land on source keyframes). The full-transcode tier
-    // could skip this probe in theory — forced keyframes on output give
-    // us an exact 2 s grid regardless of source GOP — but a title's
-    // playback mode can change across library rescans (codec support
-    // flags, new browser hints, …) and indexing once keeps us cheap on a
-    // future mode flip.
-    //
-    // Failures here are intentionally non-fatal and don't poison the
-    // main probe row. The session layer falls back to a single-segment
-    // plan when the index is missing or empty, which degrades to
-    // "linear-only playback" — the pre-deep-seek behavior, not a crash.
-    if probe_succeeded && outcome.playback_mode.is_hls() {
-        let started = Instant::now();
-        match probe_video_keyframes(&job.media_path, Some(probe_command)).await {
-            Ok(offsets) => {
-                let elapsed_ms = started.elapsed().as_millis() as u64;
-                let count = offsets.len();
-                if let Err(error) = persistence
-                    .update_keyframes(media_id, &offsets, &outcome.probed_at)
-                    .await
-                {
-                    warn!(%error, %media_id, "failed to persist keyframe index");
-                } else {
-                    info!(
-                        %media_id,
-                        elapsed_ms,
-                        keyframes = count,
-                        "keyframe index complete"
-                    );
-                }
-            }
-            Err(error) => {
-                warn!(%error, %media_id, "keyframe probe failed");
-            }
-        }
     }
 
     // After a successful probe the thumbnail row is reset to pending; chain

@@ -149,9 +149,7 @@ pub struct SubtitleTrack {
 #[serde(rename_all = "camelCase")]
 pub enum PlaybackMode {
     Direct,
-    HlsRemux,
-    HlsAudioTranscode,
-    HlsFullTranscode,
+    NeedsPreparation,
     Unsupported,
 }
 
@@ -159,9 +157,7 @@ impl PlaybackMode {
     pub fn as_str(self) -> &'static str {
         match self {
             PlaybackMode::Direct => "direct",
-            PlaybackMode::HlsRemux => "hlsRemux",
-            PlaybackMode::HlsAudioTranscode => "hlsAudioTranscode",
-            PlaybackMode::HlsFullTranscode => "hlsFullTranscode",
+            PlaybackMode::NeedsPreparation => "needsPreparation",
             PlaybackMode::Unsupported => "unsupported",
         }
     }
@@ -169,22 +165,130 @@ impl PlaybackMode {
     pub fn from_str_opt(value: &str) -> Option<Self> {
         match value {
             "direct" => Some(PlaybackMode::Direct),
-            "hlsRemux" => Some(PlaybackMode::HlsRemux),
-            "hlsAudioTranscode" => Some(PlaybackMode::HlsAudioTranscode),
-            "hlsFullTranscode" => Some(PlaybackMode::HlsFullTranscode),
+            "needsPreparation" => Some(PlaybackMode::NeedsPreparation),
             "unsupported" => Some(PlaybackMode::Unsupported),
             _ => None,
         }
     }
+}
 
-    pub fn is_hls(self) -> bool {
-        matches!(
-            self,
-            PlaybackMode::HlsRemux
-                | PlaybackMode::HlsAudioTranscode
-                | PlaybackMode::HlsFullTranscode
-        )
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum PreparationState {
+    Direct,
+    NeedsPreparation,
+    Preparing,
+    Prepared,
+    Failed,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum StreamCopyStatus {
+    Queued,
+    Running,
+    Ready,
+    Failed,
+}
+
+impl StreamCopyStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StreamCopyStatus::Queued => "queued",
+            StreamCopyStatus::Running => "running",
+            StreamCopyStatus::Ready => "ready",
+            StreamCopyStatus::Failed => "failed",
+        }
     }
+
+    pub fn from_str_opt(value: &str) -> Option<Self> {
+        match value {
+            "queued" => Some(StreamCopyStatus::Queued),
+            "running" => Some(StreamCopyStatus::Running),
+            "ready" => Some(StreamCopyStatus::Ready),
+            "failed" => Some(StreamCopyStatus::Failed),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SubtitleMode {
+    Off,
+    Sidecar,
+    Burned,
+}
+
+impl SubtitleMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SubtitleMode::Off => "off",
+            SubtitleMode::Sidecar => "sidecar",
+            SubtitleMode::Burned => "burned",
+        }
+    }
+
+    pub fn from_str_opt(value: &str) -> Option<Self> {
+        match value {
+            "off" => Some(SubtitleMode::Off),
+            "sidecar" => Some(SubtitleMode::Sidecar),
+            "burned" => Some(SubtitleMode::Burned),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SubtitleSourceKind {
+    Sidecar,
+    Embedded,
+}
+
+impl SubtitleSourceKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SubtitleSourceKind::Sidecar => "sidecar",
+            SubtitleSourceKind::Embedded => "embedded",
+        }
+    }
+
+    pub fn from_str_opt(value: &str) -> Option<Self> {
+        match value {
+            "sidecar" => Some(SubtitleSourceKind::Sidecar),
+            "embedded" => Some(SubtitleSourceKind::Embedded),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamCopySubtitleSelection {
+    pub kind: SubtitleSourceKind,
+    pub index: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamCopySummary {
+    pub status: StreamCopyStatus,
+    pub audio_stream_index: Option<u32>,
+    pub subtitle_mode: SubtitleMode,
+    pub subtitle: Option<StreamCopySubtitleSelection>,
+    pub subtitle_url: Option<String>,
+    pub error: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateStreamCopyRequest {
+    pub audio_stream_index: Option<u32>,
+    pub subtitle_mode: SubtitleMode,
+    pub subtitle: Option<StreamCopySubtitleSelection>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -234,13 +338,14 @@ pub struct MediaItem {
     pub thumbnail_generated_at: Option<String>,
     pub thumbnail_error: Option<String>,
     pub playback_mode: PlaybackMode,
+    pub preparation_state: PreparationState,
     pub video_profile: Option<String>,
     pub video_level: Option<u32>,
     pub video_pix_fmt: Option<String>,
     pub video_bit_depth: Option<u8>,
     pub audio_streams: Vec<AudioStream>,
     pub subtitle_streams: Vec<SubtitleStream>,
-    pub hls_master_url: Option<String>,
+    pub stream_copy: Option<StreamCopySummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

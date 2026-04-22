@@ -11,8 +11,9 @@ use crate::{
     RoomRecord,
     clock::{AuthoritativePlaybackClock, PlaybackClockCheckpoint, format_timestamp},
     protocol::{
-        AudioStream, LibraryRoot, MediaItem, PlaybackMode, PlaybackStatus, SubtitleStream,
-        SubtitleTrack,
+        AudioStream, LibraryRoot, MediaItem, PlaybackMode, PlaybackStatus, PreparationState,
+        StreamCopyStatus, StreamCopySubtitleSelection, StreamCopySummary, SubtitleMode,
+        SubtitleSourceKind, SubtitleStream, SubtitleTrack,
     },
 };
 
@@ -141,6 +142,41 @@ pub struct PendingProbe {
     pub root_path: String,
     pub relative_path: String,
     pub extension: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StreamCopyRecord {
+    pub media_id: Uuid,
+    pub source_size_bytes: u64,
+    pub source_modified_at: String,
+    pub status: StreamCopyStatus,
+    pub audio_stream_index: Option<u32>,
+    pub subtitle_mode: SubtitleMode,
+    pub subtitle_kind: Option<SubtitleSourceKind>,
+    pub subtitle_index: Option<u32>,
+    pub output_path: Option<String>,
+    pub output_content_type: Option<String>,
+    pub subtitle_path: Option<String>,
+    pub error: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct StreamCopyRequestRecord {
+    pub media_id: Uuid,
+    pub source_size_bytes: u64,
+    pub source_modified_at: String,
+    pub audio_stream_index: Option<u32>,
+    pub subtitle_mode: SubtitleMode,
+    pub subtitle_kind: Option<SubtitleSourceKind>,
+    pub subtitle_index: Option<u32>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingStreamCopy {
+    pub media_id: Uuid,
 }
 
 #[derive(Debug)]
@@ -307,8 +343,22 @@ impl Persistence {
                 video_pix_fmt,
                 video_bit_depth,
                 audio_streams_json,
-                subtitle_streams_json
+                subtitle_streams_json,
+                stream_copies.source_size_bytes AS stream_copy_source_size_bytes,
+                stream_copies.source_modified_at AS stream_copy_source_modified_at,
+                stream_copies.status AS stream_copy_status,
+                stream_copies.audio_stream_index AS stream_copy_audio_stream_index,
+                stream_copies.subtitle_mode AS stream_copy_subtitle_mode,
+                stream_copies.subtitle_kind AS stream_copy_subtitle_kind,
+                stream_copies.subtitle_index AS stream_copy_subtitle_index,
+                stream_copies.output_path AS stream_copy_output_path,
+                stream_copies.output_content_type AS stream_copy_output_content_type,
+                stream_copies.subtitle_path AS stream_copy_subtitle_path,
+                stream_copies.error AS stream_copy_error,
+                stream_copies.created_at AS stream_copy_created_at,
+                stream_copies.updated_at AS stream_copy_updated_at
             FROM media_items
+            LEFT JOIN stream_copies ON stream_copies.media_id = media_items.id
             ORDER BY root_path ASC, relative_path ASC
             "#,
         )
@@ -360,8 +410,22 @@ impl Persistence {
                 video_pix_fmt,
                 video_bit_depth,
                 audio_streams_json,
-                subtitle_streams_json
+                subtitle_streams_json,
+                stream_copies.source_size_bytes AS stream_copy_source_size_bytes,
+                stream_copies.source_modified_at AS stream_copy_source_modified_at,
+                stream_copies.status AS stream_copy_status,
+                stream_copies.audio_stream_index AS stream_copy_audio_stream_index,
+                stream_copies.subtitle_mode AS stream_copy_subtitle_mode,
+                stream_copies.subtitle_kind AS stream_copy_subtitle_kind,
+                stream_copies.subtitle_index AS stream_copy_subtitle_index,
+                stream_copies.output_path AS stream_copy_output_path,
+                stream_copies.output_content_type AS stream_copy_output_content_type,
+                stream_copies.subtitle_path AS stream_copy_subtitle_path,
+                stream_copies.error AS stream_copy_error,
+                stream_copies.created_at AS stream_copy_created_at,
+                stream_copies.updated_at AS stream_copy_updated_at
             FROM media_items
+            LEFT JOIN stream_copies ON stream_copies.media_id = media_items.id
             WHERE id = ?1
             "#,
         )
@@ -370,6 +434,175 @@ impl Persistence {
         .await?;
 
         row.map(map_row_to_media_item).transpose()
+    }
+
+    pub async fn find_stream_copy(
+        &self,
+        media_id: Uuid,
+    ) -> Result<Option<StreamCopyRecord>, PersistenceError> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                media_id,
+                source_size_bytes,
+                source_modified_at,
+                status,
+                audio_stream_index,
+                subtitle_mode,
+                subtitle_kind,
+                subtitle_index,
+                output_path,
+                output_content_type,
+                subtitle_path,
+                error,
+                created_at,
+                updated_at
+            FROM stream_copies
+            WHERE media_id = ?1
+            "#,
+        )
+        .bind(media_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(map_row_to_stream_copy_record).transpose()
+    }
+
+    pub async fn upsert_stream_copy_request(
+        &self,
+        request: &StreamCopyRequestRecord,
+    ) -> Result<(), PersistenceError> {
+        sqlx::query(
+            r#"
+            INSERT INTO stream_copies (
+                media_id,
+                source_size_bytes,
+                source_modified_at,
+                status,
+                audio_stream_index,
+                subtitle_mode,
+                subtitle_kind,
+                subtitle_index,
+                output_path,
+                output_content_type,
+                subtitle_path,
+                error,
+                created_at,
+                updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL, NULL, NULL, ?9, ?10)
+            ON CONFLICT(media_id) DO UPDATE SET
+                source_size_bytes = excluded.source_size_bytes,
+                source_modified_at = excluded.source_modified_at,
+                status = excluded.status,
+                audio_stream_index = excluded.audio_stream_index,
+                subtitle_mode = excluded.subtitle_mode,
+                subtitle_kind = excluded.subtitle_kind,
+                subtitle_index = excluded.subtitle_index,
+                output_path = NULL,
+                output_content_type = NULL,
+                subtitle_path = NULL,
+                error = NULL,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(request.media_id.to_string())
+        .bind(request.source_size_bytes as i64)
+        .bind(&request.source_modified_at)
+        .bind(StreamCopyStatus::Queued.as_str())
+        .bind(request.audio_stream_index.map(i64::from))
+        .bind(request.subtitle_mode.as_str())
+        .bind(request.subtitle_kind.map(SubtitleSourceKind::as_str))
+        .bind(request.subtitle_index.map(i64::from))
+        .bind(&request.updated_at)
+        .bind(&request.updated_at)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn mark_stream_copy_running(
+        &self,
+        media_id: Uuid,
+        updated_at: &str,
+    ) -> Result<(), PersistenceError> {
+        sqlx::query(
+            r#"
+            UPDATE stream_copies
+            SET status = ?1,
+                error = NULL,
+                updated_at = ?2
+            WHERE media_id = ?3
+            "#,
+        )
+        .bind(StreamCopyStatus::Running.as_str())
+        .bind(updated_at)
+        .bind(media_id.to_string())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn mark_stream_copy_ready(
+        &self,
+        media_id: Uuid,
+        output_path: &str,
+        output_content_type: &str,
+        subtitle_path: Option<&str>,
+        updated_at: &str,
+    ) -> Result<(), PersistenceError> {
+        sqlx::query(
+            r#"
+            UPDATE stream_copies
+            SET status = ?1,
+                output_path = ?2,
+                output_content_type = ?3,
+                subtitle_path = ?4,
+                error = NULL,
+                updated_at = ?5
+            WHERE media_id = ?6
+            "#,
+        )
+        .bind(StreamCopyStatus::Ready.as_str())
+        .bind(output_path)
+        .bind(output_content_type)
+        .bind(subtitle_path)
+        .bind(updated_at)
+        .bind(media_id.to_string())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn mark_stream_copy_failed(
+        &self,
+        media_id: Uuid,
+        error: &str,
+        updated_at: &str,
+    ) -> Result<(), PersistenceError> {
+        sqlx::query(
+            r#"
+            UPDATE stream_copies
+            SET status = ?1,
+                output_path = NULL,
+                output_content_type = NULL,
+                subtitle_path = NULL,
+                error = ?2,
+                updated_at = ?3
+            WHERE media_id = ?4
+            "#,
+        )
+        .bind(StreamCopyStatus::Failed.as_str())
+        .bind(error)
+        .bind(updated_at)
+        .bind(media_id.to_string())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
     }
 
     pub(crate) async fn sync_library_roots(
@@ -1001,6 +1234,36 @@ impl Persistence {
             .collect()
     }
 
+    pub async fn list_pending_stream_copies(
+        &self,
+    ) -> Result<Vec<PendingStreamCopy>, PersistenceError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT media_id
+            FROM stream_copies
+            WHERE status IN (?1, ?2)
+            ORDER BY updated_at ASC
+            "#,
+        )
+        .bind(StreamCopyStatus::Queued.as_str())
+        .bind(StreamCopyStatus::Running.as_str())
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                let raw_id = row.try_get::<String, _>("media_id")?;
+                let media_id = Uuid::parse_str(&raw_id).map_err(|error| {
+                    PersistenceError::InvalidData(format!(
+                        "invalid stored media id '{raw_id}': {error}"
+                    ))
+                })?;
+
+                Ok(PendingStreamCopy { media_id })
+            })
+            .collect()
+    }
+
     pub(crate) async fn record_library_scan_failure(
         &self,
         root_path: &str,
@@ -1127,17 +1390,34 @@ fn map_row_to_media_item(row: sqlx::sqlite::SqliteRow) -> Result<MediaItem, Pers
     let media_uuid = Uuid::parse_str(&id).map_err(|error| {
         PersistenceError::InvalidData(format!("invalid stored media id '{id}': {error}"))
     })?;
-    let hls_master_url = if playback_mode.is_hls() {
-        Some(format!("/api/media/{media_uuid}/hls/master.m3u8"))
-    } else {
-        None
-    };
-
     if size_bytes < 0 {
         return Err(PersistenceError::InvalidData(format!(
             "invalid stored media size '{size_bytes}'"
         )));
     }
+
+    let size_bytes = size_bytes as u64;
+    let modified_at = row.try_get::<String, _>("modified_at")?;
+    let current_stream_copy = map_joined_stream_copy_record(&row)?.filter(|record| {
+        record.source_size_bytes == size_bytes && record.source_modified_at == modified_at
+    });
+    let (preparation_state, stream_copy) = match playback_mode {
+        PlaybackMode::Direct => (PreparationState::Direct, None),
+        PlaybackMode::Unsupported => (PreparationState::Unsupported, None),
+        PlaybackMode::NeedsPreparation => match current_stream_copy {
+            Some(record) => {
+                let state = match record.status {
+                    StreamCopyStatus::Queued | StreamCopyStatus::Running => {
+                        PreparationState::Preparing
+                    }
+                    StreamCopyStatus::Ready => PreparationState::Prepared,
+                    StreamCopyStatus::Failed => PreparationState::Failed,
+                };
+                (state, Some(stream_copy_summary_for(media_uuid, &record)))
+            }
+            None => (PreparationState::NeedsPreparation, None),
+        },
+    };
 
     Ok(MediaItem {
         id: media_uuid,
@@ -1145,8 +1425,8 @@ fn map_row_to_media_item(row: sqlx::sqlite::SqliteRow) -> Result<MediaItem, Pers
         relative_path: row.try_get("relative_path")?,
         file_name: row.try_get("file_name")?,
         extension: row.try_get("extension")?,
-        size_bytes: size_bytes as u64,
-        modified_at: row.try_get("modified_at")?,
+        size_bytes,
+        modified_at,
         indexed_at: row.try_get("indexed_at")?,
         content_type: row.try_get("content_type")?,
         duration_seconds: row.try_get("duration_seconds")?,
@@ -1161,14 +1441,158 @@ fn map_row_to_media_item(row: sqlx::sqlite::SqliteRow) -> Result<MediaItem, Pers
         thumbnail_generated_at: row.try_get("thumbnail_generated_at")?,
         thumbnail_error: row.try_get("thumbnail_error")?,
         playback_mode,
+        preparation_state,
         video_profile: row.try_get("video_profile")?,
         video_level: parse_optional_u32(&row, "video_level")?,
         video_pix_fmt: row.try_get("video_pix_fmt")?,
         video_bit_depth: parse_optional_u8(&row, "video_bit_depth")?,
         audio_streams: deserialize_audio_streams(&audio_streams_json)?,
         subtitle_streams: deserialize_subtitle_streams(&subtitle_streams_json)?,
-        hls_master_url,
+        stream_copy,
     })
+}
+
+fn map_joined_stream_copy_record(
+    row: &sqlx::sqlite::SqliteRow,
+) -> Result<Option<StreamCopyRecord>, PersistenceError> {
+    let Some(status_raw) = row.try_get::<Option<String>, _>("stream_copy_status")? else {
+        return Ok(None);
+    };
+    let Some(source_size_bytes) = row.try_get::<Option<i64>, _>("stream_copy_source_size_bytes")?
+    else {
+        return Err(PersistenceError::InvalidData(
+            "stream copy row missing source size".to_string(),
+        ));
+    };
+    if source_size_bytes < 0 {
+        return Err(PersistenceError::InvalidData(format!(
+            "invalid stored stream copy source size '{source_size_bytes}'"
+        )));
+    }
+    let media_id = row.try_get::<String, _>("id")?;
+    let media_id = Uuid::parse_str(&media_id).map_err(|error| {
+        PersistenceError::InvalidData(format!("invalid stored media id '{media_id}': {error}"))
+    })?;
+    let status = StreamCopyStatus::from_str_opt(&status_raw).ok_or_else(|| {
+        PersistenceError::InvalidData(format!("invalid stream copy status '{status_raw}'"))
+    })?;
+    let subtitle_mode_raw = row.try_get::<Option<String>, _>("stream_copy_subtitle_mode")?;
+    let subtitle_mode = subtitle_mode_raw
+        .as_deref()
+        .and_then(SubtitleMode::from_str_opt)
+        .ok_or_else(|| {
+            PersistenceError::InvalidData("stream copy row missing subtitle mode".to_string())
+        })?;
+    let subtitle_kind = match row.try_get::<Option<String>, _>("stream_copy_subtitle_kind")? {
+        Some(raw) => Some(SubtitleSourceKind::from_str_opt(&raw).ok_or_else(|| {
+            PersistenceError::InvalidData(format!("invalid stream copy subtitle kind '{raw}'"))
+        })?),
+        None => None,
+    };
+
+    Ok(Some(StreamCopyRecord {
+        media_id,
+        source_size_bytes: source_size_bytes as u64,
+        source_modified_at: row
+            .try_get::<Option<String>, _>("stream_copy_source_modified_at")?
+            .ok_or_else(|| {
+                PersistenceError::InvalidData(
+                    "stream copy row missing source modified_at".to_string(),
+                )
+            })?,
+        status,
+        audio_stream_index: parse_optional_u32(row, "stream_copy_audio_stream_index")?,
+        subtitle_mode,
+        subtitle_kind,
+        subtitle_index: parse_optional_u32(row, "stream_copy_subtitle_index")?,
+        output_path: row.try_get("stream_copy_output_path")?,
+        output_content_type: row.try_get("stream_copy_output_content_type")?,
+        subtitle_path: row.try_get("stream_copy_subtitle_path")?,
+        error: row.try_get("stream_copy_error")?,
+        created_at: row
+            .try_get::<Option<String>, _>("stream_copy_created_at")?
+            .ok_or_else(|| {
+                PersistenceError::InvalidData("stream copy row missing created_at".to_string())
+            })?,
+        updated_at: row
+            .try_get::<Option<String>, _>("stream_copy_updated_at")?
+            .ok_or_else(|| {
+                PersistenceError::InvalidData("stream copy row missing updated_at".to_string())
+            })?,
+    }))
+}
+
+fn map_row_to_stream_copy_record(
+    row: sqlx::sqlite::SqliteRow,
+) -> Result<StreamCopyRecord, PersistenceError> {
+    let media_id = row.try_get::<String, _>("media_id")?;
+    let media_id = Uuid::parse_str(&media_id).map_err(|error| {
+        PersistenceError::InvalidData(format!(
+            "invalid stored stream copy media id '{media_id}': {error}"
+        ))
+    })?;
+    let source_size_bytes = row.try_get::<i64, _>("source_size_bytes")?;
+    if source_size_bytes < 0 {
+        return Err(PersistenceError::InvalidData(format!(
+            "invalid stored stream copy source size '{source_size_bytes}'"
+        )));
+    }
+    let status_raw = row.try_get::<String, _>("status")?;
+    let status = StreamCopyStatus::from_str_opt(&status_raw).ok_or_else(|| {
+        PersistenceError::InvalidData(format!("invalid stream copy status '{status_raw}'"))
+    })?;
+    let subtitle_mode_raw = row.try_get::<String, _>("subtitle_mode")?;
+    let subtitle_mode = SubtitleMode::from_str_opt(&subtitle_mode_raw).ok_or_else(|| {
+        PersistenceError::InvalidData(format!(
+            "invalid stream copy subtitle mode '{subtitle_mode_raw}'"
+        ))
+    })?;
+    let subtitle_kind = match row.try_get::<Option<String>, _>("subtitle_kind")? {
+        Some(raw) => Some(SubtitleSourceKind::from_str_opt(&raw).ok_or_else(|| {
+            PersistenceError::InvalidData(format!("invalid stream copy subtitle kind '{raw}'"))
+        })?),
+        None => None,
+    };
+
+    Ok(StreamCopyRecord {
+        media_id,
+        source_size_bytes: source_size_bytes as u64,
+        source_modified_at: row.try_get("source_modified_at")?,
+        status,
+        audio_stream_index: parse_optional_u32(&row, "audio_stream_index")?,
+        subtitle_mode,
+        subtitle_kind,
+        subtitle_index: parse_optional_u32(&row, "subtitle_index")?,
+        output_path: row.try_get("output_path")?,
+        output_content_type: row.try_get("output_content_type")?,
+        subtitle_path: row.try_get("subtitle_path")?,
+        error: row.try_get("error")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
+fn stream_copy_summary_for(media_id: Uuid, record: &StreamCopyRecord) -> StreamCopySummary {
+    let subtitle = match (record.subtitle_kind, record.subtitle_index) {
+        (Some(kind), Some(index)) => Some(StreamCopySubtitleSelection { kind, index }),
+        _ => None,
+    };
+    let subtitle_url = if record.status == StreamCopyStatus::Ready && record.subtitle_path.is_some()
+    {
+        Some(format!("/api/media/{media_id}/stream-copy/subtitle"))
+    } else {
+        None
+    };
+
+    StreamCopySummary {
+        status: record.status,
+        audio_stream_index: record.audio_stream_index,
+        subtitle_mode: record.subtitle_mode,
+        subtitle,
+        subtitle_url,
+        error: record.error.clone(),
+        updated_at: record.updated_at.clone(),
+    }
 }
 
 fn serialize_audio_streams(streams: &[AudioStream]) -> Result<String, PersistenceError> {

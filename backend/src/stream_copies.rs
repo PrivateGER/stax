@@ -1,0 +1,621 @@
+use std::{
+    env,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Instant,
+};
+
+use tokio::{
+    fs,
+    process::Command,
+    sync::{Semaphore, mpsc},
+};
+use tracing::{debug, info, warn};
+use uuid::Uuid;
+
+use crate::{
+    clock::format_timestamp,
+    library::{LibraryService, is_browser_safe_video_codec},
+    persistence::{PendingStreamCopy, Persistence, StreamCopyRecord},
+    protocol::{MediaItem, SubtitleMode, SubtitleSourceKind, SubtitleTrack},
+    streaming::convert_srt_to_vtt,
+};
+
+const DEFAULT_STREAM_COPY_CACHE_DIR: &str = "syncplay-stream-copies";
+const DEFAULT_WORKERS: usize = 1;
+
+#[derive(Clone, Debug)]
+pub struct StreamCopyConfig {
+    pub cache_dir: Option<PathBuf>,
+    pub ffmpeg_command: Option<PathBuf>,
+    pub max_concurrent: usize,
+}
+
+impl Default for StreamCopyConfig {
+    fn default() -> Self {
+        Self {
+            cache_dir: Some(default_stream_copy_cache_dir()),
+            ffmpeg_command: Some(PathBuf::from("ffmpeg")),
+            max_concurrent: DEFAULT_WORKERS,
+        }
+    }
+}
+
+impl StreamCopyConfig {
+    pub fn with_env_overrides(mut self) -> Self {
+        if let Some(value) = env::var("SYNCPLAY_STREAM_COPY_WORKERS")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+        {
+            self.max_concurrent = value;
+        }
+
+        self
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct StreamCopyJob {
+    pub media_id: Uuid,
+}
+
+impl StreamCopyJob {
+    pub fn from_pending(pending: PendingStreamCopy) -> Self {
+        Self {
+            media_id: pending.media_id,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct StreamCopyWorkerPool {
+    sender: mpsc::UnboundedSender<StreamCopyJob>,
+}
+
+impl StreamCopyWorkerPool {
+    pub fn spawn(
+        config: StreamCopyConfig,
+        persistence: Persistence,
+        library: LibraryService,
+    ) -> Self {
+        let (sender, mut receiver) = mpsc::unbounded_channel::<StreamCopyJob>();
+        let semaphore = Arc::new(Semaphore::new(config.max_concurrent.max(1)));
+        let config = Arc::new(config);
+        info!(
+            workers = config.max_concurrent,
+            ffmpeg = ?config.ffmpeg_command,
+            cache_dir = ?config.cache_dir,
+            "stream copy worker pool starting"
+        );
+
+        tokio::spawn(async move {
+            while let Some(job) = receiver.recv().await {
+                let permit = match Arc::clone(&semaphore).acquire_owned().await {
+                    Ok(permit) => permit,
+                    Err(_) => return,
+                };
+                let config = Arc::clone(&config);
+                let persistence = persistence.clone();
+                let library = library.clone();
+
+                tokio::spawn(async move {
+                    process_job(job, &config, &persistence, &library).await;
+                    drop(permit);
+                });
+            }
+        });
+
+        Self { sender }
+    }
+
+    pub fn enqueue(&self, job: StreamCopyJob) {
+        let media_id = job.media_id;
+        if let Err(error) = self.sender.send(job) {
+            warn!(
+                media_id = %error.0.media_id,
+                "stream copy worker pool is closed; dropping job"
+            );
+        } else {
+            debug!(%media_id, "stream copy job enqueued");
+        }
+    }
+
+    pub fn enqueue_pending(&self, pending: Vec<PendingStreamCopy>) {
+        for entry in pending {
+            self.enqueue(StreamCopyJob::from_pending(entry));
+        }
+    }
+}
+
+async fn process_job(
+    job: StreamCopyJob,
+    config: &StreamCopyConfig,
+    persistence: &Persistence,
+    library: &LibraryService,
+) {
+    let media_id = job.media_id;
+    let now = format_timestamp(time::OffsetDateTime::now_utc());
+
+    let Some(ffmpeg_command) = config.ffmpeg_command.as_deref() else {
+        let _ = persistence
+            .mark_stream_copy_failed(media_id, "ffmpeg is not configured.", &now)
+            .await;
+        return;
+    };
+    let Some(cache_dir) = config.cache_dir.as_deref() else {
+        let _ = persistence
+            .mark_stream_copy_failed(
+                media_id,
+                "Stream copy cache directory is not configured.",
+                &now,
+            )
+            .await;
+        return;
+    };
+
+    if let Err(error) = persistence.mark_stream_copy_running(media_id, &now).await {
+        warn!(%error, %media_id, "failed to mark stream copy running");
+        return;
+    }
+
+    let media_item = match library.media_item(media_id).await {
+        Ok(Some(item)) => item,
+        Ok(None) => {
+            let now = format_timestamp(time::OffsetDateTime::now_utc());
+            let _ = persistence
+                .mark_stream_copy_failed(media_id, "Media item no longer exists.", &now)
+                .await;
+            return;
+        }
+        Err(error) => {
+            warn!(%error, %media_id, "failed to load media item for stream copy");
+            let now = format_timestamp(time::OffsetDateTime::now_utc());
+            let _ = persistence
+                .mark_stream_copy_failed(media_id, "Failed to load media item.", &now)
+                .await;
+            return;
+        }
+    };
+    let copy = match persistence.find_stream_copy(media_id).await {
+        Ok(Some(record)) => record,
+        Ok(None) => return,
+        Err(error) => {
+            warn!(%error, %media_id, "failed to load stream copy row");
+            let now = format_timestamp(time::OffsetDateTime::now_utc());
+            let _ = persistence
+                .mark_stream_copy_failed(media_id, "Failed to load stream copy request.", &now)
+                .await;
+            return;
+        }
+    };
+
+    let started = Instant::now();
+    match build_stream_copy(&media_item, &copy, cache_dir, ffmpeg_command).await {
+        Ok(outcome) => {
+            let now = format_timestamp(time::OffsetDateTime::now_utc());
+            if let Err(error) = persistence
+                .mark_stream_copy_ready(
+                    media_id,
+                    &outcome.output_path,
+                    outcome.content_type,
+                    outcome.subtitle_path.as_deref(),
+                    &now,
+                )
+                .await
+            {
+                warn!(%error, %media_id, "failed to persist ready stream copy");
+                return;
+            }
+            info!(
+                %media_id,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "stream copy ready"
+            );
+        }
+        Err(error_message) => {
+            warn!(%media_id, error = %error_message, "stream copy failed");
+            let now = format_timestamp(time::OffsetDateTime::now_utc());
+            let _ = persistence
+                .mark_stream_copy_failed(media_id, &error_message, &now)
+                .await;
+        }
+    }
+}
+
+struct StreamCopyOutcome {
+    output_path: String,
+    subtitle_path: Option<String>,
+    content_type: &'static str,
+}
+
+async fn build_stream_copy(
+    media_item: &MediaItem,
+    copy: &StreamCopyRecord,
+    cache_dir: &Path,
+    ffmpeg_command: &Path,
+) -> Result<StreamCopyOutcome, String> {
+    let media_path = crate::streaming::resolve_media_path(media_item);
+    let output_dir = stream_copy_output_dir(cache_dir, media_item.id);
+    fs::create_dir_all(&output_dir)
+        .await
+        .map_err(|error| format!("failed to create stream copy directory: {error}"))?;
+
+    let has_video = media_item.video_codec.is_some();
+    let (output_name, content_type) = if has_video {
+        ("stream.mp4", "video/mp4")
+    } else {
+        ("stream.m4a", "audio/mp4")
+    };
+    let final_output_path = output_dir.join(output_name);
+    let temp_output_path = temp_path_for_final(&final_output_path);
+    let final_subtitle_path = output_dir.join("subtitle.vtt");
+    let temp_subtitle_path = temp_path_for_final(&final_subtitle_path);
+
+    cleanup_path(&temp_output_path).await;
+    cleanup_path(&temp_subtitle_path).await;
+
+    let selected_audio_index = selected_audio_stream_index(media_item, copy)?;
+    let burned_filter = if copy.subtitle_mode == SubtitleMode::Burned {
+        Some(build_burn_subtitle_filter(media_item, copy, &media_path)?)
+    } else {
+        None
+    };
+
+    run_ffmpeg_stream_copy(
+        ffmpeg_command,
+        media_item,
+        &media_path,
+        &temp_output_path,
+        selected_audio_index,
+        burned_filter.as_deref(),
+    )
+    .await?;
+
+    cleanup_path(&final_output_path).await;
+    fs::rename(&temp_output_path, &final_output_path)
+        .await
+        .map_err(|error| format!("failed to finalize stream copy: {error}"))?;
+
+    let subtitle_path = if copy.subtitle_mode == SubtitleMode::Sidecar {
+        prepare_sidecar_subtitle(
+            ffmpeg_command,
+            media_item,
+            copy,
+            &media_path,
+            &temp_subtitle_path,
+            &final_subtitle_path,
+        )
+        .await?
+    } else {
+        cleanup_path(&final_subtitle_path).await;
+        None
+    };
+
+    Ok(StreamCopyOutcome {
+        output_path: final_output_path.to_string_lossy().to_string(),
+        subtitle_path: subtitle_path.map(|path| path.to_string_lossy().to_string()),
+        content_type,
+    })
+}
+
+async fn prepare_sidecar_subtitle(
+    ffmpeg_command: &Path,
+    media_item: &MediaItem,
+    copy: &StreamCopyRecord,
+    media_path: &Path,
+    temp_subtitle_path: &Path,
+    final_subtitle_path: &Path,
+) -> Result<Option<PathBuf>, String> {
+    let Some((kind, index)) = copy.subtitle_kind.zip(copy.subtitle_index) else {
+        return Err("A subtitle source is required for sidecar subtitles.".to_string());
+    };
+
+    cleanup_path(temp_subtitle_path).await;
+    cleanup_path(final_subtitle_path).await;
+
+    match kind {
+        SubtitleSourceKind::Sidecar => {
+            let track = media_item
+                .subtitle_tracks
+                .get(index as usize)
+                .ok_or_else(|| "Selected sidecar subtitle track does not exist.".to_string())?;
+            let subtitle_path = resolve_sidecar_subtitle_path(media_item, track);
+            let bytes = fs::read(&subtitle_path)
+                .await
+                .map_err(|error| format!("failed to read subtitle track: {error}"))?;
+            let prepared = match track.extension.to_ascii_lowercase().as_str() {
+                "vtt" => String::from_utf8_lossy(&bytes).into_owned(),
+                "srt" => convert_srt_to_vtt(&String::from_utf8_lossy(&bytes)),
+                _ => {
+                    return Err(format!(
+                        "Subtitle sidecar format '{}' cannot be converted to WebVTT.",
+                        track.extension
+                    ));
+                }
+            };
+            fs::write(temp_subtitle_path, prepared)
+                .await
+                .map_err(|error| format!("failed to write prepared subtitle: {error}"))?;
+        }
+        SubtitleSourceKind::Embedded => {
+            let stream = media_item
+                .subtitle_streams
+                .iter()
+                .find(|stream| stream.index == index)
+                .ok_or_else(|| "Selected embedded subtitle stream does not exist.".to_string())?;
+            if !is_text_subtitle_codec(stream.codec.as_deref()) {
+                return Err(
+                    "Selected embedded subtitle stream cannot be converted to WebVTT.".to_string(),
+                );
+            }
+            let output = Command::new(ffmpeg_command)
+                .arg("-y")
+                .arg("-loglevel")
+                .arg("error")
+                .arg("-nostdin")
+                .arg("-i")
+                .arg(media_path)
+                .arg("-map")
+                .arg(format!("0:{index}"))
+                .arg("-f")
+                .arg("webvtt")
+                .arg(temp_subtitle_path)
+                .output()
+                .await
+                .map_err(|error| format!("failed to start ffmpeg subtitle extract: {error}"))?;
+            if !output.status.success() {
+                return Err(ffmpeg_error("subtitle extraction failed", &output.stderr));
+            }
+        }
+    }
+
+    fs::rename(temp_subtitle_path, final_subtitle_path)
+        .await
+        .map_err(|error| format!("failed to finalize prepared subtitle: {error}"))?;
+
+    Ok(Some(final_subtitle_path.to_path_buf()))
+}
+
+async fn run_ffmpeg_stream_copy(
+    ffmpeg_command: &Path,
+    media_item: &MediaItem,
+    media_path: &Path,
+    output_path: &Path,
+    selected_audio_index: Option<u32>,
+    burned_filter: Option<&str>,
+) -> Result<(), String> {
+    let has_video = media_item.video_codec.is_some();
+    let mut command = Command::new(ffmpeg_command);
+    command
+        .arg("-y")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-nostdin")
+        .arg("-i")
+        .arg(media_path);
+
+    if has_video {
+        command.arg("-map").arg("0:v:0?");
+    } else {
+        command.arg("-vn");
+    }
+
+    if let Some(audio_index) = selected_audio_index {
+        command.arg("-map").arg(format!("0:{audio_index}"));
+        command.arg("-c:a").arg("aac");
+        command.arg("-b:a").arg("192k");
+    } else {
+        command.arg("-an");
+    }
+
+    if has_video {
+        let browser_safe_video = media_item
+            .video_codec
+            .as_deref()
+            .map(|codec| {
+                is_browser_safe_video_codec(
+                    codec,
+                    media_item.video_profile.as_deref(),
+                    media_item.video_pix_fmt.as_deref(),
+                    media_item.video_level,
+                    media_item.video_bit_depth,
+                )
+            })
+            .unwrap_or(false);
+        if browser_safe_video && burned_filter.is_none() {
+            command.arg("-c:v").arg("copy");
+        } else {
+            command
+                .arg("-c:v")
+                .arg("libx264")
+                .arg("-preset")
+                .arg("veryfast")
+                .arg("-pix_fmt")
+                .arg("yuv420p");
+            if let Some(filter) = burned_filter {
+                command.arg("-vf").arg(filter);
+            }
+        }
+    }
+
+    command
+        .arg("-f")
+        .arg("mp4")
+        .arg("-movflags")
+        .arg("+faststart")
+        .arg(output_path);
+
+    let output = command
+        .output()
+        .await
+        .map_err(|error| format!("failed to start ffmpeg stream copy: {error}"))?;
+    if !output.status.success() {
+        return Err(ffmpeg_error("stream copy failed", &output.stderr));
+    }
+
+    Ok(())
+}
+
+fn selected_audio_stream_index(
+    media_item: &MediaItem,
+    copy: &StreamCopyRecord,
+) -> Result<Option<u32>, String> {
+    if media_item.audio_streams.is_empty() {
+        return Ok(None);
+    }
+
+    let selected = match copy.audio_stream_index {
+        Some(index) => media_item
+            .audio_streams
+            .iter()
+            .find(|stream| stream.index == index)
+            .map(|stream| stream.index),
+        None => media_item
+            .audio_streams
+            .iter()
+            .find(|stream| stream.default)
+            .or_else(|| media_item.audio_streams.first())
+            .map(|stream| stream.index),
+    };
+
+    selected
+        .map(Some)
+        .ok_or_else(|| "Selected audio stream does not exist.".to_string())
+}
+
+fn build_burn_subtitle_filter(
+    media_item: &MediaItem,
+    copy: &StreamCopyRecord,
+    media_path: &Path,
+) -> Result<String, String> {
+    let Some((kind, index)) = copy.subtitle_kind.zip(copy.subtitle_index) else {
+        return Err("A subtitle source is required for burned subtitles.".to_string());
+    };
+
+    match kind {
+        SubtitleSourceKind::Sidecar => {
+            let track = media_item
+                .subtitle_tracks
+                .get(index as usize)
+                .ok_or_else(|| "Selected sidecar subtitle track does not exist.".to_string())?;
+            Ok(format!(
+                "subtitles={}",
+                escape_subtitles_path(&resolve_sidecar_subtitle_path(media_item, track))
+            ))
+        }
+        SubtitleSourceKind::Embedded => {
+            let ordinal = media_item
+                .subtitle_streams
+                .iter()
+                .position(|stream| stream.index == index)
+                .ok_or_else(|| "Selected embedded subtitle stream does not exist.".to_string())?;
+            let stream = &media_item.subtitle_streams[ordinal];
+            if !is_text_subtitle_codec(stream.codec.as_deref()) {
+                return Err("Selected embedded subtitle stream cannot be burned in.".to_string());
+            }
+            Ok(format!(
+                "subtitles={}:si={ordinal}",
+                escape_subtitles_path(media_path)
+            ))
+        }
+    }
+}
+
+fn resolve_sidecar_subtitle_path(media_item: &MediaItem, track: &SubtitleTrack) -> PathBuf {
+    let mut path = PathBuf::from(&media_item.root_path);
+    for component in Path::new(&track.relative_path).components() {
+        path.push(component.as_os_str());
+    }
+    path
+}
+
+fn is_text_subtitle_codec(codec: Option<&str>) -> bool {
+    matches!(
+        codec.unwrap_or_default().to_ascii_lowercase().as_str(),
+        "ass" | "ssa" | "subrip" | "srt" | "webvtt" | "mov_text" | "text"
+    )
+}
+
+fn escape_subtitles_path(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace(':', "\\:")
+        .replace('\'', "\\'")
+        .replace('[', "\\[")
+        .replace(']', "\\]")
+        .replace(',', "\\,")
+}
+
+fn ffmpeg_error(prefix: &str, stderr: &[u8]) -> String {
+    let stderr = String::from_utf8_lossy(stderr);
+    let message = stderr.trim();
+    if message.is_empty() {
+        prefix.to_string()
+    } else {
+        format!("{prefix}: {message}")
+    }
+}
+
+async fn cleanup_path(path: &Path) {
+    match fs::remove_file(path).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => warn!(path = %path.display(), %error, "failed to remove stale file"),
+    }
+}
+
+pub fn default_stream_copy_cache_dir() -> PathBuf {
+    PathBuf::from(DEFAULT_STREAM_COPY_CACHE_DIR)
+}
+
+pub fn stream_copy_output_dir(cache_dir: &Path, media_id: Uuid) -> PathBuf {
+    cache_dir.join(media_id.to_string())
+}
+
+fn temp_path_for_final(final_path: &Path) -> PathBuf {
+    let parent = final_path.parent().map(Path::to_path_buf).unwrap_or_default();
+    let file_name = final_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("output");
+
+    let temp_name = match file_name.rsplit_once('.') {
+        Some((stem, extension)) if !stem.is_empty() && !extension.is_empty() => {
+            format!("{stem}.tmp.{extension}")
+        }
+        _ => format!("{file_name}.tmp"),
+    };
+
+    parent.join(temp_name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::temp_path_for_final;
+    use std::path::Path;
+
+    #[test]
+    fn temp_path_preserves_media_extension_for_ffmpeg_muxer_detection() {
+        let temp = temp_path_for_final(Path::new("/tmp/stream.mp4"));
+        assert_eq!(temp, Path::new("/tmp/stream.tmp.mp4"));
+    }
+
+    #[test]
+    fn temp_path_preserves_audio_extension_for_ffmpeg_muxer_detection() {
+        let temp = temp_path_for_final(Path::new("/tmp/stream.m4a"));
+        assert_eq!(temp, Path::new("/tmp/stream.tmp.m4a"));
+    }
+
+    #[test]
+    fn temp_path_preserves_vtt_extension() {
+        let temp = temp_path_for_final(Path::new("/tmp/subtitle.vtt"));
+        assert_eq!(temp, Path::new("/tmp/subtitle.tmp.vtt"));
+    }
+
+    #[test]
+    fn temp_path_falls_back_when_no_extension_exists() {
+        let temp = temp_path_for_final(Path::new("/tmp/output"));
+        assert_eq!(temp, Path::new("/tmp/output.tmp"));
+    }
+}

@@ -15,12 +15,11 @@ use reqwest::header::{CONTENT_RANGE, RANGE};
 use syncplay_backend::{
     build_app,
     library::LibraryConfig,
-    load_state, load_state_with_library, load_state_with_library_and_hls,
-    muxing::{HlsConfig, HlsSessionManager},
+    load_state, load_state_with_library,
     persistence::Persistence,
     protocol::{
-        DriftCorrectionAction, LibraryResponse, LibraryScanResponse, Room, RoomsResponse,
-        ServerEvent,
+        CreateStreamCopyRequest, DriftCorrectionAction, LibraryResponse, LibraryScanResponse, Room,
+        RoomsResponse, ServerEvent,
     },
     seeded_state,
 };
@@ -33,7 +32,6 @@ struct TestServer {
     ws_base_url: String,
     client: Client,
     task: JoinHandle<()>,
-    hls: Option<HlsSessionManager>,
 }
 
 impl TestServer {
@@ -77,19 +75,6 @@ impl TestServer {
         Self::spawn_with_app(app).await
     }
 
-    async fn spawn_with_library_and_hls(config: LibraryConfig, hls_config: HlsConfig) -> Self {
-        let persistence = Persistence::open_in_memory().await.unwrap();
-        let state = load_state_with_library_and_hls(persistence, config, hls_config)
-            .await
-            .unwrap();
-        let hls = state.hls();
-        let app = build_app(state);
-
-        let mut server = Self::spawn_with_app(app).await;
-        server.hls = Some(hls);
-        server
-    }
-
     async fn spawn_with_app(app: Router) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -100,7 +85,6 @@ impl TestServer {
             ws_base_url: format!("ws://{address}"),
             client: Client::new(),
             task,
-            hls: None,
         }
     }
 
@@ -225,6 +209,52 @@ impl TestServer {
                 panic!(
                     "library never settled: {probe_pending} probe pending, {thumb_pending} thumbnail pending"
                 );
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    async fn create_stream_copy(
+        &self,
+        media_id: &str,
+        request: &CreateStreamCopyRequest,
+    ) -> reqwest::Response {
+        self.client
+            .post(format!(
+                "{}/api/media/{media_id}/stream-copy",
+                self.base_url
+            ))
+            .json(request)
+            .send()
+            .await
+            .unwrap()
+    }
+
+    async fn wait_for_preparation_state(
+        &self,
+        media_id: &str,
+        expected: &str,
+    ) -> syncplay_backend::protocol::MediaItem {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let library = self.library().await;
+            if let Some(item) = library
+                .items
+                .into_iter()
+                .find(|item| item.id.to_string() == media_id)
+            {
+                let state = serde_json::to_value(&item.preparation_state)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                if state == expected {
+                    return item;
+                }
+            }
+
+            if std::time::Instant::now() >= deadline {
+                panic!("preparation state did not become {expected} within 5s");
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
@@ -1904,47 +1934,6 @@ fn write_ffmpeg_stub(temp_dir: &TempDir, name: &str, contents: &str) -> PathBuf 
 }
 
 #[cfg(unix)]
-fn hls_respawn_ffmpeg_stub_script(run_forever: bool) -> String {
-    let tail = if run_forever {
-        r#"
-trap 'exit 0' TERM INT
-while true; do sleep 1; done
-"#
-    } else {
-        "exit 0\n"
-    };
-    format!(
-        r#"#!/usr/bin/env bash
-set -euo pipefail
-
-start_number=0
-while (($#)); do
-  if [[ "$1" == "-start_number" ]]; then
-    shift
-    start_number="${{1:-0}}"
-  fi
-  shift || true
-done
-
-segment="$(printf 'seg_0_%05d.m4s' "$start_number")"
-printf 'init' > "init_0.mp4"
-printf 'segment-%s' "$start_number" > "$segment"
-cat > "stream_0.m3u8" <<EOF
-#EXTM3U
-#EXT-X-VERSION:7
-#EXT-X-TARGETDURATION:2
-#EXT-X-MEDIA-SEQUENCE:$start_number
-#EXT-X-PLAYLIST-TYPE:VOD
-#EXT-X-INDEPENDENT-SEGMENTS
-#EXT-X-MAP:URI="init_0.mp4"
-#EXTINF:2.000000,
-$segment
-EOF
-{tail}"#
-    )
-}
-
-#[cfg(unix)]
 const SUCCESSFUL_PROBE_JSON: &str = r#"#!/usr/bin/env bash
 set -euo pipefail
 cat <<'JSON'
@@ -2188,6 +2177,7 @@ printf 'STUBJPEG' > "$output"
 // ---------------------------------------------------------------------------
 
 /// Returns true iff both `ffmpeg` and `ffprobe` resolve on PATH.
+#[cfg(any())]
 fn external_av_tools_available() -> bool {
     fn probe(bin: &str) -> bool {
         std::process::Command::new(bin)
@@ -2204,6 +2194,7 @@ fn external_av_tools_available() -> bool {
 /// Generate a tiny H.264 + AC3 MKV using real ffmpeg. The classifier sees this
 /// as `HlsAudioTranscode` (browser-safe video, browser-hostile audio) which is
 /// the most common real-world tier.
+#[cfg(any())]
 fn generate_h264_ac3_mkv(path: &Path) {
     let output = std::process::Command::new("ffmpeg")
         .args([
@@ -2242,6 +2233,7 @@ fn generate_h264_ac3_mkv(path: &Path) {
 
 /// Generate a tiny H.264 + AAC MP4 using real ffmpeg — classifier sees
 /// `Direct` (no muxing required).
+#[cfg(any())]
 fn generate_h264_aac_mp4(path: &Path) {
     let output = std::process::Command::new("ffmpeg")
         .args([
@@ -2279,461 +2271,873 @@ fn generate_h264_aac_mp4(path: &Path) {
 }
 
 #[cfg(unix)]
-fn hls_attr_value<'a>(line: &'a str, key: &str) -> Option<&'a str> {
-    let needle = format!("{key}=\"");
-    let start = line.find(&needle)? + needle.len();
-    line[start..].split('"').next()
+const NEEDS_PREPARATION_PROBE_JSON: &str = r#"#!/usr/bin/env bash
+set -euo pipefail
+cat <<'JSON'
+{
+  "format": { "format_name": "matroska,webm", "duration": "120.000" },
+  "streams": [
+    {
+      "index": 0,
+      "codec_type": "video",
+      "codec_name": "h264",
+      "profile": "High",
+      "level": 40,
+      "pix_fmt": "yuv420p",
+      "bits_per_raw_sample": "8",
+      "width": 1920,
+      "height": 1080
+    },
+    {
+      "index": 1,
+      "codec_type": "audio",
+      "codec_name": "ac3",
+      "channels": 2,
+      "channel_layout": "stereo",
+      "disposition": { "default": 1 }
+    }
+  ]
+}
+JSON
+"#;
+
+#[cfg(unix)]
+const EMBEDDED_PGS_PROBE_JSON: &str = r#"#!/usr/bin/env bash
+set -euo pipefail
+cat <<'JSON'
+{
+  "format": { "format_name": "matroska,webm", "duration": "120.000" },
+  "streams": [
+    {
+      "index": 0,
+      "codec_type": "video",
+      "codec_name": "h264",
+      "profile": "High",
+      "level": 40,
+      "pix_fmt": "yuv420p",
+      "bits_per_raw_sample": "8",
+      "width": 1920,
+      "height": 1080
+    },
+    {
+      "index": 1,
+      "codec_type": "audio",
+      "codec_name": "ac3",
+      "channels": 2,
+      "channel_layout": "stereo",
+      "disposition": { "default": 1 }
+    },
+    {
+      "index": 2,
+      "codec_type": "subtitle",
+      "codec_name": "hdmv_pgs_subtitle"
+    }
+  ]
+}
+JSON
+"#;
+
+#[cfg(unix)]
+const FFMPEG_STREAM_COPY_OK_STUB: &str = r#"#!/usr/bin/env bash
+set -euo pipefail
+output="${!#}"
+printf 'STREAMCOPY' > "$output"
+"#;
+
+#[cfg(unix)]
+const FFMPEG_STREAM_COPY_SLOW_STUB: &str = r#"#!/usr/bin/env bash
+set -euo pipefail
+sleep 2
+output="${!#}"
+printf 'STREAMCOPY' > "$output"
+"#;
+
+#[cfg(unix)]
+fn stream_copy_config(
+    root: PathBuf,
+    probe_script: PathBuf,
+    ffmpeg_stub: Option<PathBuf>,
+    cache_dir: PathBuf,
+) -> LibraryConfig {
+    let config = LibraryConfig::from_paths(vec![root])
+        .with_probe_command(probe_script)
+        .with_stream_copy_cache_dir(cache_dir);
+
+    match ffmpeg_stub {
+        Some(ffmpeg_stub) => config.with_ffmpeg_command(ffmpeg_stub),
+        None => config,
+    }
 }
 
 #[cfg(unix)]
-async fn hls_test_setup(temp_dir: &TempDir) -> (TestServer, syncplay_backend::protocol::MediaItem) {
+#[tokio::test]
+async fn stream_endpoint_returns_409_when_stream_copy_is_missing() {
+    let temp_dir = TempDir::new().unwrap();
     let root = temp_dir.path().join("library");
     fs::create_dir_all(&root).unwrap();
-    generate_h264_ac3_mkv(&root.join("movie.mkv"));
+    fs::write(root.join("movie.mkv"), b"synthetic").unwrap();
 
-    let cache_dir = temp_dir.path().join("hls-cache");
-
-    // Use real ffprobe (no probe-command override) and real ffmpeg.
-    let library = LibraryConfig::from_paths(vec![root]);
-    let hls_config = HlsConfig {
+    let probe_script = write_probe_script(
+        &temp_dir,
+        "probe-needs-preparation.sh",
+        NEEDS_PREPARATION_PROBE_JSON,
+    );
+    let cache_dir = temp_dir.path().join("stream-copies");
+    let server = TestServer::spawn_with_library_config(stream_copy_config(
+        root,
+        probe_script,
+        None,
         cache_dir,
-        max_concurrent: 4,
-        idle_secs: 60,
-        ffmpeg_command: Some(PathBuf::from("ffmpeg")),
-        hw_accel: Default::default(),
-        vaapi_device: None,
-    };
+    ))
+    .await;
 
-    let server = TestServer::spawn_with_library_and_hls(library, hls_config).await;
     server.scan_library().await;
-    // Probe runs in the background after the walk; HLS tests need
-    // playback_mode populated, which only lands after probe completes.
-    let library = server.wait_for_probes_complete().await;
-    let item = library
+    let item = server
+        .wait_for_probes_complete()
+        .await
         .items
         .into_iter()
         .next()
-        .expect("scanned media item");
-    (server, item)
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn hls_master_returns_415_when_media_is_unsupported() {
-    // This test exercises the endpoint contract "classifier emits Unsupported
-    // → endpoint returns 415". Triggering Unsupported deterministically requires
-    // probe metadata that has zero streams (a different code path from "ffprobe
-    // couldn't read the file at all", which falls back to Direct). A probe
-    // stub is the cleanest way to drive that exact state — orthogonal to
-    // whether real ffmpeg is involved downstream.
-    let temp_dir = TempDir::new().unwrap();
-    let root = temp_dir.path().join("library");
-    fs::create_dir_all(&root).unwrap();
-    fs::write(root.join("broken.mp4"), b"x").unwrap();
-    let probe = write_probe_script(
-        &temp_dir,
-        "probe-empty.sh",
-        r#"#!/usr/bin/env bash
-set -euo pipefail
-cat <<'JSON'
-{ "format": { "format_name": "matroska,webm", "duration": "1.0" }, "streams": [] }
-JSON
-"#,
-    );
-
-    let library = LibraryConfig::from_paths(vec![root]).with_probe_command(probe);
-    let hls_config = HlsConfig {
-        cache_dir: temp_dir.path().join("hls-cache"),
-        max_concurrent: 1,
-        idle_secs: 60,
-        ffmpeg_command: Some(PathBuf::from("ffmpeg")),
-        hw_accel: Default::default(),
-        vaapi_device: None,
-    };
-    let server = TestServer::spawn_with_library_and_hls(library, hls_config).await;
-    server.scan_library().await;
-    let library = server.wait_for_probes_complete().await;
-    let item = library.items.into_iter().next().unwrap();
+        .unwrap();
     assert_eq!(
         item.playback_mode,
-        syncplay_backend::protocol::PlaybackMode::Unsupported
+        syncplay_backend::protocol::PlaybackMode::NeedsPreparation
+    );
+    assert_eq!(
+        item.preparation_state,
+        syncplay_backend::protocol::PreparationState::NeedsPreparation
     );
 
     let response = server
         .client
-        .get(format!(
-            "{}/api/media/{}/hls/master.m3u8",
-            server.base_url, item.id
-        ))
+        .get(format!("{}/api/media/{}/stream", server.base_url, item.id))
         .send()
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert!(response.text().await.unwrap().contains("stream copy"));
 }
 
 #[cfg(unix)]
 #[tokio::test]
-async fn hls_master_returns_409_for_direct_playback() {
-    if !external_av_tools_available() {
-        eprintln!("skipping: ffmpeg/ffprobe not on PATH");
-        return;
-    }
-
+async fn create_stream_copy_returns_409_for_direct_playable_media() {
     let temp_dir = TempDir::new().unwrap();
     let root = temp_dir.path().join("library");
     fs::create_dir_all(&root).unwrap();
-    generate_h264_aac_mp4(&root.join("movie.mp4"));
+    fs::write(root.join("movie.mp4"), b"synthetic").unwrap();
 
-    let library = LibraryConfig::from_paths(vec![root]);
-    let hls_config = HlsConfig {
-        cache_dir: temp_dir.path().join("hls-cache"),
-        max_concurrent: 1,
-        idle_secs: 60,
-        ffmpeg_command: Some(PathBuf::from("ffmpeg")),
-        hw_accel: Default::default(),
-        vaapi_device: None,
-    };
-    let server = TestServer::spawn_with_library_and_hls(library, hls_config).await;
+    let probe_script = write_probe_script(&temp_dir, "probe-direct.sh", SUCCESSFUL_PROBE_JSON);
+    let ffmpeg_stub = write_ffmpeg_stub(&temp_dir, "ffmpeg-copy.sh", FFMPEG_STREAM_COPY_OK_STUB);
+    let cache_dir = temp_dir.path().join("stream-copies");
+    let server = TestServer::spawn_with_library_config(stream_copy_config(
+        root,
+        probe_script,
+        Some(ffmpeg_stub),
+        cache_dir,
+    ))
+    .await;
+
     server.scan_library().await;
-    let library = server.wait_for_probes_complete().await;
-    let item = library.items.into_iter().next().unwrap();
-
-    assert_eq!(
-        item.playback_mode,
-        syncplay_backend::protocol::PlaybackMode::Direct,
-        "h264+aac mp4 should be classified as direct-playable"
-    );
+    let item = server
+        .wait_for_probes_complete()
+        .await
+        .items
+        .into_iter()
+        .next()
+        .unwrap();
 
     let response = server
-        .client
-        .get(format!(
-            "{}/api/media/{}/hls/master.m3u8",
-            server.base_url, item.id
-        ))
-        .send()
-        .await
-        .unwrap();
+        .create_stream_copy(
+            &item.id.to_string(),
+            &CreateStreamCopyRequest {
+                audio_stream_index: item.audio_streams.first().map(|stream| stream.index),
+                subtitle_mode: syncplay_backend::protocol::SubtitleMode::Off,
+                subtitle: None,
+            },
+        )
+        .await;
 
     assert_eq!(response.status(), StatusCode::CONFLICT);
 }
 
 #[cfg(unix)]
 #[tokio::test]
-async fn hls_master_returns_playable_manifest_for_eligible_media() {
-    if !external_av_tools_available() {
-        eprintln!("skipping: ffmpeg/ffprobe not on PATH");
-        return;
-    }
-
-    let temp_dir = TempDir::new().unwrap();
-    let (server, item) = hls_test_setup(&temp_dir).await;
-
-    assert!(item.playback_mode.is_hls(), "expected an HLS playback mode");
-    assert!(item.hls_master_url.is_some());
-
-    let response = server
-        .client
-        .get(format!(
-            "{}/api/media/{}/hls/master.m3u8",
-            server.base_url, item.id
-        ))
-        .send()
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response
-            .headers()
-            .get("content-type")
-            .and_then(|value| value.to_str().ok()),
-        Some("application/vnd.apple.mpegurl")
-    );
-    let master_body = response.text().await.unwrap();
-    assert!(master_body.contains("#EXTM3U"));
-    // Master lists at least one variant playlist.
-    assert!(
-        master_body.lines().any(|line| line.ends_with(".m3u8")),
-        "master playlist should reference at least one variant: {master_body}"
-    );
-
-    // Variant playlist must reference an init segment that actually exists on
-    // disk and is reachable via the server. This is the assertion that catches
-    // the fmp4 init bugs the shim missed.
-    let variant_name = master_body
-        .lines()
-        .find(|line| line.ends_with(".m3u8"))
-        .expect("variant playlist line");
-
-    let variant_response = server
-        .client
-        .get(format!(
-            "{}/api/media/{}/hls/{}",
-            server.base_url, item.id, variant_name
-        ))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(variant_response.status(), StatusCode::OK);
-    let variant_body = variant_response.text().await.unwrap();
-
-    let init_uri = variant_body
-        .lines()
-        .find_map(|line| line.strip_prefix("#EXT-X-MAP:URI=\""))
-        .and_then(|rest| rest.split('"').next())
-        .expect("variant playlist must declare an init segment via #EXT-X-MAP");
-
-    let init_response = server
-        .client
-        .get(format!(
-            "{}/api/media/{}/hls/{}",
-            server.base_url, item.id, init_uri
-        ))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(
-        init_response.status(),
-        StatusCode::OK,
-        "init segment '{init_uri}' must be servable"
-    );
-    let init_bytes = init_response.bytes().await.unwrap();
-    assert!(
-        !init_bytes.is_empty(),
-        "init segment should contain real fmp4 bytes"
-    );
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn hls_segment_is_real_fmp4_bytes() {
-    if !external_av_tools_available() {
-        eprintln!("skipping: ffmpeg/ffprobe not on PATH");
-        return;
-    }
-
-    let temp_dir = TempDir::new().unwrap();
-    let (server, item) = hls_test_setup(&temp_dir).await;
-
-    // Master kicks off the session; wait for it to be ready.
-    let _ = server
-        .client
-        .get(format!(
-            "{}/api/media/{}/hls/master.m3u8",
-            server.base_url, item.id
-        ))
-        .send()
-        .await
-        .unwrap();
-
-    // Locate the first segment by reading the variant playlist.
-    let master = server
-        .client
-        .get(format!(
-            "{}/api/media/{}/hls/master.m3u8",
-            server.base_url, item.id
-        ))
-        .send()
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
-    let variant_name = master
-        .lines()
-        .find(|line| line.ends_with(".m3u8"))
-        .expect("variant in master");
-    let variant = server
-        .client
-        .get(format!(
-            "{}/api/media/{}/hls/{}",
-            server.base_url, item.id, variant_name
-        ))
-        .send()
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
-    let segment_name = variant
-        .lines()
-        .find(|line| line.ends_with(".m4s"))
-        .expect("variant must reference at least one .m4s segment");
-
-    let response = server
-        .client
-        .get(format!(
-            "{}/api/media/{}/hls/{}",
-            server.base_url, item.id, segment_name
-        ))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response
-            .headers()
-            .get("content-type")
-            .and_then(|value| value.to_str().ok()),
-        Some("video/iso.segment")
-    );
-    let body = response.bytes().await.unwrap();
-    // fMP4 segment should start with a `styp` or `moof` box (size + 4-byte tag
-    // at offset 4). Sanity-check we got real container bytes.
-    assert!(body.len() > 16, "segment too small to be real fmp4");
-    let box_tag = std::str::from_utf8(&body[4..8]).unwrap_or("");
-    assert!(
-        matches!(box_tag, "styp" | "moof" | "ftyp"),
-        "segment first box should be styp/moof/ftyp, got '{box_tag}'"
-    );
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn hls_happy_path_serves_video_and_audio_playlists_and_segments() {
-    if !external_av_tools_available() {
-        eprintln!("skipping: ffmpeg/ffprobe not on PATH");
-        return;
-    }
-
-    let temp_dir = TempDir::new().unwrap();
-    let (server, item) = hls_test_setup(&temp_dir).await;
-
-    let master = server
-        .client
-        .get(format!(
-            "{}/api/media/{}/hls/master.m3u8",
-            server.base_url, item.id
-        ))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(master.status(), StatusCode::OK);
-    let master_body = master.text().await.unwrap();
-
-    let video_variant = master_body
-        .lines()
-        .find(|line| line == &"stream_0.m3u8")
-        .expect("master should advertise the video variant");
-    let audio_variant = master_body
-        .lines()
-        .find(|line| line.starts_with("#EXT-X-MEDIA:TYPE=AUDIO"))
-        .and_then(|line| hls_attr_value(line, "URI"))
-        .expect("master should advertise at least one audio variant");
-
-    let video_playlist = server
-        .client
-        .get(format!(
-            "{}/api/media/{}/hls/{}",
-            server.base_url, item.id, video_variant
-        ))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(video_playlist.status(), StatusCode::OK);
-    let video_body = video_playlist.text().await.unwrap();
-    assert!(
-        video_body.contains("#EXT-X-ENDLIST"),
-        "expected bounded VOD video playlist: {video_body}"
-    );
-    let video_init = video_body
-        .lines()
-        .find_map(|line| hls_attr_value(line, "URI"))
-        .expect("video playlist should include EXT-X-MAP");
-    let video_segment = video_body
-        .lines()
-        .find(|line| line.ends_with(".m4s"))
-        .expect("video playlist should include at least one segment");
-
-    let init_response = server
-        .client
-        .get(format!(
-            "{}/api/media/{}/hls/{}",
-            server.base_url, item.id, video_init
-        ))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(init_response.status(), StatusCode::OK);
-    assert!(
-        !init_response.bytes().await.unwrap().is_empty(),
-        "video init segment should not be empty"
-    );
-
-    let video_segment_response = server
-        .client
-        .get(format!(
-            "{}/api/media/{}/hls/{}",
-            server.base_url, item.id, video_segment
-        ))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(video_segment_response.status(), StatusCode::OK);
-    let video_bytes = video_segment_response.bytes().await.unwrap();
-    assert!(
-        video_bytes.len() > 16,
-        "video segment should contain fmp4 bytes"
-    );
-
-    let audio_playlist = server
-        .client
-        .get(format!(
-            "{}/api/media/{}/hls/{}",
-            server.base_url, item.id, audio_variant
-        ))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(audio_playlist.status(), StatusCode::OK);
-    let audio_body = audio_playlist.text().await.unwrap();
-    let audio_segment = audio_body
-        .lines()
-        .find(|line| line.ends_with(".m4s"))
-        .expect("audio playlist should include at least one segment");
-
-    let audio_segment_response = server
-        .client
-        .get(format!(
-            "{}/api/media/{}/hls/{}",
-            server.base_url, item.id, audio_segment
-        ))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(audio_segment_response.status(), StatusCode::OK);
-    assert_eq!(
-        audio_segment_response
-            .headers()
-            .get("content-type")
-            .and_then(|value| value.to_str().ok()),
-        Some("video/iso.segment")
-    );
-    assert!(
-        !audio_segment_response.bytes().await.unwrap().is_empty(),
-        "audio segment should not be empty"
-    );
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn hls_unknown_duration_serves_ffmpeg_variant_playlist() {
-    if !external_av_tools_available() {
-        eprintln!("skipping: ffmpeg/ffprobe not on PATH");
-        return;
-    }
-
+async fn create_stream_copy_exposes_preparing_state_while_job_runs() {
     let temp_dir = TempDir::new().unwrap();
     let root = temp_dir.path().join("library");
     fs::create_dir_all(&root).unwrap();
-    generate_h264_ac3_mkv(&root.join("movie.mkv"));
+    fs::write(root.join("movie.mkv"), b"synthetic").unwrap();
 
-    // Duration intentionally omitted to exercise the unknown-duration path.
-    let probe = write_probe_script(
+    let probe_script = write_probe_script(
         &temp_dir,
-        "probe-unknown-duration.sh",
-        r###"#!/usr/bin/env bash
+        "probe-needs-preparation.sh",
+        NEEDS_PREPARATION_PROBE_JSON,
+    );
+    let ffmpeg_stub = write_ffmpeg_stub(&temp_dir, "ffmpeg-slow.sh", FFMPEG_STREAM_COPY_SLOW_STUB);
+    let cache_dir = temp_dir.path().join("stream-copies");
+    let server = TestServer::spawn_with_library_config(stream_copy_config(
+        root,
+        probe_script,
+        Some(ffmpeg_stub),
+        cache_dir,
+    ))
+    .await;
+
+    server.scan_library().await;
+    let item = server
+        .wait_for_probes_complete()
+        .await
+        .items
+        .into_iter()
+        .next()
+        .unwrap();
+
+    let response = server
+        .create_stream_copy(
+            &item.id.to_string(),
+            &CreateStreamCopyRequest {
+                audio_stream_index: item.audio_streams.first().map(|stream| stream.index),
+                subtitle_mode: syncplay_backend::protocol::SubtitleMode::Off,
+                subtitle: None,
+            },
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let preparing = server
+        .wait_for_preparation_state(&item.id.to_string(), "preparing")
+        .await;
+    assert_eq!(
+        preparing.preparation_state,
+        syncplay_backend::protocol::PreparationState::Preparing
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn prepared_stream_copy_serves_prepared_media_and_vtt_subtitle() {
+    let temp_dir = TempDir::new().unwrap();
+    let root = temp_dir.path().join("library");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("movie.mkv"), b"synthetic").unwrap();
+    fs::write(
+        root.join("movie.en.srt"),
+        "1\n00:00:01,000 --> 00:00:02,000\nHello from SRT\n",
+    )
+    .unwrap();
+
+    let probe_script = write_probe_script(
+        &temp_dir,
+        "probe-needs-preparation.sh",
+        NEEDS_PREPARATION_PROBE_JSON,
+    );
+    let ffmpeg_stub = write_ffmpeg_stub(&temp_dir, "ffmpeg-copy.sh", FFMPEG_STREAM_COPY_OK_STUB);
+    let cache_dir = temp_dir.path().join("stream-copies");
+    let server = TestServer::spawn_with_library_config(stream_copy_config(
+        root,
+        probe_script,
+        Some(ffmpeg_stub),
+        cache_dir,
+    ))
+    .await;
+
+    server.scan_library().await;
+    let item = server
+        .wait_for_probes_complete()
+        .await
+        .items
+        .into_iter()
+        .next()
+        .unwrap();
+
+    let response = server
+        .create_stream_copy(
+            &item.id.to_string(),
+            &CreateStreamCopyRequest {
+                audio_stream_index: item.audio_streams.first().map(|stream| stream.index),
+                subtitle_mode: syncplay_backend::protocol::SubtitleMode::Sidecar,
+                subtitle: Some(syncplay_backend::protocol::StreamCopySubtitleSelection {
+                    kind: syncplay_backend::protocol::SubtitleSourceKind::Sidecar,
+                    index: 0,
+                }),
+            },
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let prepared = server
+        .wait_for_preparation_state(&item.id.to_string(), "prepared")
+        .await;
+    assert_eq!(
+        prepared.preparation_state,
+        syncplay_backend::protocol::PreparationState::Prepared
+    );
+
+    let media_response = server
+        .client
+        .get(format!("{}/api/media/{}/stream", server.base_url, item.id))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(media_response.status(), StatusCode::OK);
+    assert_eq!(
+        media_response.bytes().await.unwrap().as_ref(),
+        b"STREAMCOPY"
+    );
+
+    let subtitle_response = server
+        .client
+        .get(format!(
+            "{}/api/media/{}/stream-copy/subtitle",
+            server.base_url, item.id
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(subtitle_response.status(), StatusCode::OK);
+    let subtitle_body = subtitle_response.text().await.unwrap();
+    assert!(subtitle_body.starts_with("WEBVTT"));
+    assert!(subtitle_body.contains("00:00:01.000 --> 00:00:02.000"));
+    assert!(subtitle_body.contains("Hello from SRT"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn create_stream_copy_rejects_non_text_embedded_subtitle_for_sidecar_mode() {
+    let temp_dir = TempDir::new().unwrap();
+    let root = temp_dir.path().join("library");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("movie.mkv"), b"synthetic").unwrap();
+
+    let probe_script = write_probe_script(&temp_dir, "probe-pgs.sh", EMBEDDED_PGS_PROBE_JSON);
+    let ffmpeg_stub = write_ffmpeg_stub(&temp_dir, "ffmpeg-copy.sh", FFMPEG_STREAM_COPY_OK_STUB);
+    let cache_dir = temp_dir.path().join("stream-copies");
+    let server = TestServer::spawn_with_library_config(stream_copy_config(
+        root,
+        probe_script,
+        Some(ffmpeg_stub),
+        cache_dir,
+    ))
+    .await;
+
+    server.scan_library().await;
+    let item = server
+        .wait_for_probes_complete()
+        .await
+        .items
+        .into_iter()
+        .next()
+        .unwrap();
+
+    let response = server
+        .create_stream_copy(
+            &item.id.to_string(),
+            &CreateStreamCopyRequest {
+                audio_stream_index: item.audio_streams.first().map(|stream| stream.index),
+                subtitle_mode: syncplay_backend::protocol::SubtitleMode::Sidecar,
+                subtitle: Some(syncplay_backend::protocol::StreamCopySubtitleSelection {
+                    kind: syncplay_backend::protocol::SubtitleSourceKind::Embedded,
+                    index: 2,
+                }),
+            },
+        )
+        .await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        response
+            .text()
+            .await
+            .unwrap()
+            .contains("cannot be converted")
+    );
+}
+
+#[cfg(any())]
+mod old_hls_tests {
+    use super::*;
+
+    #[cfg(unix)]
+    fn hls_attr_value<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+        let needle = format!("{key}=\"");
+        let start = line.find(&needle)? + needle.len();
+        line[start..].split('"').next()
+    }
+
+    #[cfg(unix)]
+    async fn fetch_hls_eventually_ok(
+        server: &TestServer,
+        url: String,
+        timeout_duration: Duration,
+    ) -> reqwest::Response {
+        let deadline = std::time::Instant::now() + timeout_duration;
+        loop {
+            let response = server.client.get(&url).send().await.unwrap();
+            if response.status() == StatusCode::OK {
+                return response;
+            }
+            assert_eq!(
+                response.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "expected retryable 503 while waiting for asset, got {} at {url}",
+                response.status()
+            );
+            if std::time::Instant::now() >= deadline {
+                panic!("timed out waiting for HLS asset at {url}");
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    async fn hls_test_setup(
+        temp_dir: &TempDir,
+    ) -> (TestServer, syncplay_backend::protocol::MediaItem) {
+        let root = temp_dir.path().join("library");
+        fs::create_dir_all(&root).unwrap();
+        generate_h264_ac3_mkv(&root.join("movie.mkv"));
+
+        let cache_dir = temp_dir.path().join("hls-cache");
+
+        // Use real ffprobe (no probe-command override) and real ffmpeg.
+        let library = LibraryConfig::from_paths(vec![root]);
+        let hls_config = HlsConfig {
+            cache_dir,
+            max_concurrent: 4,
+            idle_secs: 60,
+            ffmpeg_command: Some(PathBuf::from("ffmpeg")),
+            hw_accel: Default::default(),
+            vaapi_device: None,
+        };
+
+        let server = TestServer::spawn_with_library_and_hls(library, hls_config).await;
+        server.scan_library().await;
+        // Probe runs in the background after the walk; HLS tests need
+        // playback_mode populated, which only lands after probe completes.
+        let library = server.wait_for_probes_complete().await;
+        let item = library
+            .items
+            .into_iter()
+            .next()
+            .expect("scanned media item");
+        (server, item)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hls_master_returns_415_when_media_is_unsupported() {
+        // This test exercises the endpoint contract "classifier emits Unsupported
+        // → endpoint returns 415". Triggering Unsupported deterministically requires
+        // probe metadata that has zero streams (a different code path from "ffprobe
+        // couldn't read the file at all", which falls back to Direct). A probe
+        // stub is the cleanest way to drive that exact state — orthogonal to
+        // whether real ffmpeg is involved downstream.
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path().join("library");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("broken.mp4"), b"x").unwrap();
+        let probe = write_probe_script(
+            &temp_dir,
+            "probe-empty.sh",
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+cat <<'JSON'
+{ "format": { "format_name": "matroska,webm", "duration": "1.0" }, "streams": [] }
+JSON
+"#,
+        );
+
+        let library = LibraryConfig::from_paths(vec![root]).with_probe_command(probe);
+        let hls_config = HlsConfig {
+            cache_dir: temp_dir.path().join("hls-cache"),
+            max_concurrent: 1,
+            idle_secs: 60,
+            ffmpeg_command: Some(PathBuf::from("ffmpeg")),
+            hw_accel: Default::default(),
+            vaapi_device: None,
+        };
+        let server = TestServer::spawn_with_library_and_hls(library, hls_config).await;
+        server.scan_library().await;
+        let library = server.wait_for_probes_complete().await;
+        let item = library.items.into_iter().next().unwrap();
+        assert_eq!(
+            item.playback_mode,
+            syncplay_backend::protocol::PlaybackMode::Unsupported
+        );
+
+        let response = server
+            .client
+            .get(format!(
+                "{}/api/media/{}/hls/master.m3u8",
+                server.base_url, item.id
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hls_master_returns_409_for_direct_playback() {
+        if !external_av_tools_available() {
+            eprintln!("skipping: ffmpeg/ffprobe not on PATH");
+            return;
+        }
+
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path().join("library");
+        fs::create_dir_all(&root).unwrap();
+        generate_h264_aac_mp4(&root.join("movie.mp4"));
+
+        let library = LibraryConfig::from_paths(vec![root]);
+        let hls_config = HlsConfig {
+            cache_dir: temp_dir.path().join("hls-cache"),
+            max_concurrent: 1,
+            idle_secs: 60,
+            ffmpeg_command: Some(PathBuf::from("ffmpeg")),
+            hw_accel: Default::default(),
+            vaapi_device: None,
+        };
+        let server = TestServer::spawn_with_library_and_hls(library, hls_config).await;
+        server.scan_library().await;
+        let library = server.wait_for_probes_complete().await;
+        let item = library.items.into_iter().next().unwrap();
+
+        assert_eq!(
+            item.playback_mode,
+            syncplay_backend::protocol::PlaybackMode::Direct,
+            "h264+aac mp4 should be classified as direct-playable"
+        );
+
+        let response = server
+            .client
+            .get(format!(
+                "{}/api/media/{}/hls/master.m3u8",
+                server.base_url, item.id
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hls_master_returns_playable_manifest_for_eligible_media() {
+        if !external_av_tools_available() {
+            eprintln!("skipping: ffmpeg/ffprobe not on PATH");
+            return;
+        }
+
+        let temp_dir = TempDir::new().unwrap();
+        let (server, item) = hls_test_setup(&temp_dir).await;
+
+        assert!(item.playback_mode.is_hls(), "expected an HLS playback mode");
+        assert!(item.hls_master_url.is_some());
+
+        let response = server
+            .client
+            .get(format!(
+                "{}/api/media/{}/hls/master.m3u8",
+                server.base_url, item.id
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("application/vnd.apple.mpegurl")
+        );
+        let master_body = response.text().await.unwrap();
+        assert!(master_body.contains("#EXTM3U"));
+        // Master lists at least one variant playlist.
+        assert!(
+            master_body.lines().any(|line| line.ends_with(".m3u8")),
+            "master playlist should reference at least one variant: {master_body}"
+        );
+
+        // Variant playlist must reference an init segment that actually exists on
+        // disk and is reachable via the server. This is the assertion that catches
+        // the fmp4 init bugs the shim missed.
+        let variant_name = master_body
+            .lines()
+            .find(|line| line.ends_with(".m3u8"))
+            .expect("variant playlist line");
+
+        let variant_response = server
+            .client
+            .get(format!(
+                "{}/api/media/{}/hls/{}",
+                server.base_url, item.id, variant_name
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(variant_response.status(), StatusCode::OK);
+        let variant_body = variant_response.text().await.unwrap();
+
+        let init_uri = variant_body
+            .lines()
+            .find_map(|line| line.strip_prefix("#EXT-X-MAP:URI=\""))
+            .and_then(|rest| rest.split('"').next())
+            .expect("variant playlist must declare an init segment via #EXT-X-MAP");
+
+        let init_response = fetch_hls_eventually_ok(
+            &server,
+            format!("{}/api/media/{}/hls/{}", server.base_url, item.id, init_uri),
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(
+            init_response.status(),
+            StatusCode::OK,
+            "init segment '{init_uri}' must be servable"
+        );
+        let init_bytes = init_response.bytes().await.unwrap();
+        assert!(
+            !init_bytes.is_empty(),
+            "init segment should contain real fmp4 bytes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hls_segment_is_real_fmp4_bytes() {
+        if !external_av_tools_available() {
+            eprintln!("skipping: ffmpeg/ffprobe not on PATH");
+            return;
+        }
+
+        let temp_dir = TempDir::new().unwrap();
+        let (server, item) = hls_test_setup(&temp_dir).await;
+
+        // Master kicks off the session; wait for it to be ready.
+        let _ = server
+            .client
+            .get(format!(
+                "{}/api/media/{}/hls/master.m3u8",
+                server.base_url, item.id
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        // Locate the first segment by reading the variant playlist.
+        let master = server
+            .client
+            .get(format!(
+                "{}/api/media/{}/hls/master.m3u8",
+                server.base_url, item.id
+            ))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let variant_name = master
+            .lines()
+            .find(|line| line.ends_with(".m3u8"))
+            .expect("variant in master");
+        let variant = server
+            .client
+            .get(format!(
+                "{}/api/media/{}/hls/{}",
+                server.base_url, item.id, variant_name
+            ))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let segment_name = variant
+            .lines()
+            .find(|line| line.ends_with(".m4s"))
+            .expect("variant must reference at least one .m4s segment");
+
+        let response = fetch_hls_eventually_ok(
+            &server,
+            format!(
+                "{}/api/media/{}/hls/{}",
+                server.base_url, item.id, segment_name
+            ),
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("video/iso.segment")
+        );
+        let body = response.bytes().await.unwrap();
+        // fMP4 segment should start with a `styp` or `moof` box (size + 4-byte tag
+        // at offset 4). Sanity-check we got real container bytes.
+        assert!(body.len() > 16, "segment too small to be real fmp4");
+        let box_tag = std::str::from_utf8(&body[4..8]).unwrap_or("");
+        assert!(
+            matches!(box_tag, "styp" | "moof" | "ftyp"),
+            "segment first box should be styp/moof/ftyp, got '{box_tag}'"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hls_happy_path_serves_video_and_audio_playlists_and_segments() {
+        if !external_av_tools_available() {
+            eprintln!("skipping: ffmpeg/ffprobe not on PATH");
+            return;
+        }
+
+        let temp_dir = TempDir::new().unwrap();
+        let (server, item) = hls_test_setup(&temp_dir).await;
+
+        let master = server
+            .client
+            .get(format!(
+                "{}/api/media/{}/hls/master.m3u8",
+                server.base_url, item.id
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(master.status(), StatusCode::OK);
+        let master_body = master.text().await.unwrap();
+
+        let video_variant = master_body
+            .lines()
+            .find(|line| line == &"stream_0.m3u8")
+            .expect("master should advertise the video variant");
+        let audio_variant = master_body
+            .lines()
+            .find(|line| line.starts_with("#EXT-X-MEDIA:TYPE=AUDIO"))
+            .and_then(|line| hls_attr_value(line, "URI"))
+            .expect("master should advertise at least one audio variant");
+
+        let video_playlist = server
+            .client
+            .get(format!(
+                "{}/api/media/{}/hls/{}",
+                server.base_url, item.id, video_variant
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(video_playlist.status(), StatusCode::OK);
+        let video_body = video_playlist.text().await.unwrap();
+        assert!(
+            video_body.contains("#EXT-X-ENDLIST"),
+            "expected bounded VOD video playlist: {video_body}"
+        );
+        let video_init = video_body
+            .lines()
+            .find_map(|line| hls_attr_value(line, "URI"))
+            .expect("video playlist should include EXT-X-MAP");
+        let video_segment = video_body
+            .lines()
+            .find(|line| line.ends_with(".m4s"))
+            .expect("video playlist should include at least one segment");
+
+        let init_response = fetch_hls_eventually_ok(
+            &server,
+            format!(
+                "{}/api/media/{}/hls/{}",
+                server.base_url, item.id, video_init
+            ),
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(init_response.status(), StatusCode::OK);
+        assert!(
+            !init_response.bytes().await.unwrap().is_empty(),
+            "video init segment should not be empty"
+        );
+
+        let video_segment_response = fetch_hls_eventually_ok(
+            &server,
+            format!(
+                "{}/api/media/{}/hls/{}",
+                server.base_url, item.id, video_segment
+            ),
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(video_segment_response.status(), StatusCode::OK);
+        let video_bytes = video_segment_response.bytes().await.unwrap();
+        assert!(
+            video_bytes.len() > 16,
+            "video segment should contain fmp4 bytes"
+        );
+
+        let audio_playlist = fetch_hls_eventually_ok(
+            &server,
+            format!(
+                "{}/api/media/{}/hls/{}",
+                server.base_url, item.id, audio_variant
+            ),
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(audio_playlist.status(), StatusCode::OK);
+        let audio_body = audio_playlist.text().await.unwrap();
+        let audio_segment = audio_body
+            .lines()
+            .find(|line| line.ends_with(".m4s"))
+            .expect("audio playlist should include at least one segment");
+
+        let audio_segment_response = fetch_hls_eventually_ok(
+            &server,
+            format!(
+                "{}/api/media/{}/hls/{}",
+                server.base_url, item.id, audio_segment
+            ),
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(audio_segment_response.status(), StatusCode::OK);
+        assert_eq!(
+            audio_segment_response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("video/iso.segment")
+        );
+        assert!(
+            !audio_segment_response.bytes().await.unwrap().is_empty(),
+            "audio segment should not be empty"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hls_unknown_duration_serves_ffmpeg_variant_playlist() {
+        if !external_av_tools_available() {
+            eprintln!("skipping: ffmpeg/ffprobe not on PATH");
+            return;
+        }
+
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path().join("library");
+        fs::create_dir_all(&root).unwrap();
+        generate_h264_ac3_mkv(&root.join("movie.mkv"));
+
+        // Duration intentionally omitted to exercise the unknown-duration path.
+        let probe = write_probe_script(
+            &temp_dir,
+            "probe-unknown-duration.sh",
+            r###"#!/usr/bin/env bash
 set -euo pipefail
 cat <<'JSON'
 {
@@ -2745,532 +3149,511 @@ cat <<'JSON'
 }
 JSON
 "###,
-    );
+        );
 
-    let library = LibraryConfig::from_paths(vec![root]).with_probe_command(probe);
-    let hls_config = HlsConfig {
-        cache_dir: temp_dir.path().join("hls-cache"),
-        max_concurrent: 4,
-        idle_secs: 60,
-        ffmpeg_command: Some(PathBuf::from("ffmpeg")),
-        hw_accel: Default::default(),
-        vaapi_device: None,
-    };
-    let server = TestServer::spawn_with_library_and_hls(library, hls_config).await;
-    server.scan_library().await;
-    let library = server.wait_for_probes_complete().await;
-    let item = library
-        .items
-        .into_iter()
-        .next()
-        .expect("scanned media item");
+        let library = LibraryConfig::from_paths(vec![root]).with_probe_command(probe);
+        let hls_config = HlsConfig {
+            cache_dir: temp_dir.path().join("hls-cache"),
+            max_concurrent: 4,
+            idle_secs: 60,
+            ffmpeg_command: Some(PathBuf::from("ffmpeg")),
+            hw_accel: Default::default(),
+            vaapi_device: None,
+        };
+        let server = TestServer::spawn_with_library_and_hls(library, hls_config).await;
+        server.scan_library().await;
+        let library = server.wait_for_probes_complete().await;
+        let item = library
+            .items
+            .into_iter()
+            .next()
+            .expect("scanned media item");
 
-    assert!(item.duration_seconds.is_none());
-    assert!(item.playback_mode.is_hls());
+        assert!(item.duration_seconds.is_none());
+        assert!(item.playback_mode.is_hls());
 
-    // Kick session startup first.
-    let master = server
-        .client
-        .get(format!(
-            "{}/api/media/{}/hls/master.m3u8",
-            server.base_url, item.id
-        ))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(master.status(), StatusCode::OK);
-
-    let variant = server
-        .client
-        .get(format!(
-            "{}/api/media/{}/hls/stream_0.m3u8",
-            server.base_url, item.id
-        ))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(variant.status(), StatusCode::OK);
-    let body = variant.text().await.unwrap();
-
-    // Unknown-duration sessions should follow ffmpeg's variant directly,
-    // which references the raw init name, not the synthesized locked init.
-    assert!(
-        body.contains("#EXT-X-MAP:URI=\"init_0.mp4\""),
-        "expected ffmpeg variant MAP for unknown-duration session: {body}"
-    );
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn hls_master_returns_immediately_before_transcoder_is_ready() {
-    let temp_dir = TempDir::new().unwrap();
-    let root = temp_dir.path().join("library");
-    fs::create_dir_all(&root).unwrap();
-    fs::write(root.join("movie.mkv"), b"synthetic").unwrap();
-
-    let probe = write_probe_script(
-        &temp_dir,
-        "probe-full-transcode.sh",
-        r###"#!/usr/bin/env bash
-set -euo pipefail
-cat <<'JSON'
-{
-  "format": { "format_name": "matroska,webm", "duration": "600.0" },
-  "streams": [
-    { "codec_type": "video", "codec_name": "hevc", "width": 320, "height": 240 },
-    { "codec_type": "audio", "codec_name": "ac3" }
-  ]
-}
-JSON
-"###,
-    );
-    let ffmpeg_stub = write_ffmpeg_stub(
-        &temp_dir,
-        "ffmpeg-delayed-ready.sh",
-        r###"#!/usr/bin/env bash
-set -euo pipefail
-
-# Delay readiness to mimic a cold full-transcode startup.
-sleep 2
-printf 'init' > "init_0.mp4"
-printf 'segment' > "seg_0_00000.m4s"
-cat > "stream_0.m3u8" <<'EOF'
-#EXTM3U
-#EXT-X-VERSION:7
-#EXT-X-TARGETDURATION:2
-#EXT-X-MAP:URI="init_0.mp4"
-#EXTINF:2.000,
-seg_0_00000.m4s
-EOF
-
-trap 'exit 0' TERM INT
-while true; do sleep 1; done
-"###,
-    );
-
-    let library = LibraryConfig::from_paths(vec![root]).with_probe_command(probe);
-    let hls_config = HlsConfig {
-        cache_dir: temp_dir.path().join("hls-cache"),
-        max_concurrent: 2,
-        idle_secs: 60,
-        ffmpeg_command: Some(ffmpeg_stub),
-        hw_accel: Default::default(),
-        vaapi_device: None,
-    };
-
-    let server = TestServer::spawn_with_library_and_hls(library, hls_config).await;
-    server.scan_library().await;
-    let library = server.wait_for_probes_complete().await;
-    let item = library
-        .items
-        .into_iter()
-        .next()
-        .expect("scanned media item");
-    assert_eq!(
-        item.playback_mode,
-        syncplay_backend::protocol::PlaybackMode::HlsFullTranscode
-    );
-
-    let started = std::time::Instant::now();
-    let response = server
-        .client
-        .get(format!(
-            "{}/api/media/{}/hls/master.m3u8",
-            server.base_url, item.id
-        ))
-        .send()
-        .await
-        .unwrap();
-    let elapsed = started.elapsed();
-
-    assert_eq!(response.status(), StatusCode::OK);
-    assert!(
-        elapsed < Duration::from_millis(1200),
-        "master playlist should not wait for transcoder readiness (elapsed {:?})",
-        elapsed
-    );
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn hls_video_variant_returns_immediately_before_transcoder_is_ready() {
-    let temp_dir = TempDir::new().unwrap();
-    let root = temp_dir.path().join("library");
-    fs::create_dir_all(&root).unwrap();
-    fs::write(root.join("movie.mkv"), b"synthetic").unwrap();
-
-    let probe = write_probe_script(
-        &temp_dir,
-        "probe-full-transcode.sh",
-        r###"#!/usr/bin/env bash
-set -euo pipefail
-cat <<'JSON'
-{
-  "format": { "format_name": "matroska,webm", "duration": "600.0" },
-  "streams": [
-    { "codec_type": "video", "codec_name": "hevc", "width": 320, "height": 240 },
-    { "codec_type": "audio", "codec_name": "ac3" }
-  ]
-}
-JSON
-"###,
-    );
-    let ffmpeg_stub = write_ffmpeg_stub(
-        &temp_dir,
-        "ffmpeg-delayed-ready.sh",
-        r###"#!/usr/bin/env bash
-set -euo pipefail
-
-# Delay readiness to mimic a cold full-transcode startup.
-sleep 2
-printf 'init' > "init_0.mp4"
-printf 'segment' > "seg_0_00000.m4s"
-cat > "stream_0.m3u8" <<'EOF'
-#EXTM3U
-#EXT-X-VERSION:7
-#EXT-X-TARGETDURATION:2
-#EXT-X-MAP:URI="init_0.mp4"
-#EXTINF:2.000,
-seg_0_00000.m4s
-EOF
-
-trap 'exit 0' TERM INT
-while true; do sleep 1; done
-"###,
-    );
-
-    let library = LibraryConfig::from_paths(vec![root]).with_probe_command(probe);
-    let hls_config = HlsConfig {
-        cache_dir: temp_dir.path().join("hls-cache"),
-        max_concurrent: 2,
-        idle_secs: 60,
-        ffmpeg_command: Some(ffmpeg_stub),
-        hw_accel: Default::default(),
-        vaapi_device: None,
-    };
-
-    let server = TestServer::spawn_with_library_and_hls(library, hls_config).await;
-    server.scan_library().await;
-    let library = server.wait_for_probes_complete().await;
-    let item = library
-        .items
-        .into_iter()
-        .next()
-        .expect("scanned media item");
-    assert_eq!(
-        item.playback_mode,
-        syncplay_backend::protocol::PlaybackMode::HlsFullTranscode
-    );
-
-    let started = std::time::Instant::now();
-    let response = server
-        .client
-        .get(format!(
-            "{}/api/media/{}/hls/stream_0.m3u8",
-            server.base_url, item.id
-        ))
-        .send()
-        .await
-        .unwrap();
-    let elapsed = started.elapsed();
-
-    assert_eq!(response.status(), StatusCode::OK);
-    assert!(
-        elapsed < Duration::from_millis(1200),
-        "video variant should not wait for transcoder readiness (elapsed {:?})",
-        elapsed
-    );
-    let body = response.text().await.unwrap();
-    assert!(
-        body.contains("#EXT-X-ENDLIST"),
-        "bounded synthetic variant should be returned immediately: {body}"
-    );
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn hls_seek_respawn_throttle_returns_429_with_retry_after() {
-    let temp_dir = TempDir::new().unwrap();
-    let root = temp_dir.path().join("library");
-    fs::create_dir_all(&root).unwrap();
-    fs::write(root.join("movie.mkv"), b"synthetic").unwrap();
-
-    let probe = write_probe_script(
-        &temp_dir,
-        "probe-long-transcode.sh",
-        r###"#!/usr/bin/env bash
-set -euo pipefail
-cat <<'JSON'
-{
-  "format": { "format_name": "matroska,webm", "duration": "600.0" },
-  "streams": [
-    { "codec_type": "video", "codec_name": "hevc", "width": 320, "height": 240 },
-    { "codec_type": "audio", "codec_name": "ac3" }
-  ]
-}
-JSON
-"###,
-    );
-
-    let ffmpeg_stub = write_ffmpeg_stub(
-        &temp_dir,
-        "ffmpeg-hls-stub.sh",
-        &hls_respawn_ffmpeg_stub_script(true),
-    );
-
-    let library = LibraryConfig::from_paths(vec![root]).with_probe_command(probe);
-    let hls_config = HlsConfig {
-        cache_dir: temp_dir.path().join("hls-cache"),
-        max_concurrent: 2,
-        idle_secs: 60,
-        ffmpeg_command: Some(ffmpeg_stub),
-        hw_accel: Default::default(),
-        vaapi_device: None,
-    };
-    let server = TestServer::spawn_with_library_and_hls(library, hls_config).await;
-    server.scan_library().await;
-    let library = server.wait_for_probes_complete().await;
-    let item = library
-        .items
-        .into_iter()
-        .next()
-        .expect("scanned media item");
-    let manager = server.hls.as_ref().expect("hls manager handle");
-
-    assert_eq!(
-        item.playback_mode,
-        syncplay_backend::protocol::PlaybackMode::HlsFullTranscode
-    );
-
-    // Boot the initial session and baseline spawn count.
-    let master = server
-        .client
-        .get(format!(
-            "{}/api/media/{}/hls/master.m3u8",
-            server.base_url, item.id
-        ))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(master.status(), StatusCode::OK);
-    assert_eq!(manager.total_spawn_count().await, 1);
-
-    // Space requests so each one clears cooldown and forces a true respawn
-    // (segment index jumps > catchup window from current frontier).
-    for segment in [35_u32, 70, 105, 140, 175, 210] {
-        let response = server
+        // Kick session startup first.
+        let master = server
             .client
             .get(format!(
-                "{}/api/media/{}/hls/seg_0_{segment:05}.m4s",
+                "{}/api/media/{}/hls/master.m3u8",
                 server.base_url, item.id
             ))
             .send()
             .await
             .unwrap();
-        assert_eq!(
-            response.status(),
-            StatusCode::OK,
-            "seek segment {segment} should trigger a successful respawn"
+        assert_eq!(master.status(), StatusCode::OK);
+
+        let variant = fetch_hls_eventually_ok(
+            &server,
+            format!(
+                "{}/api/media/{}/hls/stream_0.m3u8",
+                server.base_url, item.id
+            ),
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(variant.status(), StatusCode::OK);
+        let body = variant.text().await.unwrap();
+
+        // Unknown-duration sessions should follow ffmpeg's variant directly,
+        // which references the raw init name, not the synthesized locked init.
+        assert!(
+            body.contains("#EXT-X-MAP:URI=\"init_0.mp4\""),
+            "expected ffmpeg variant MAP for unknown-duration session: {body}"
         );
-        tokio::time::sleep(Duration::from_millis(800)).await;
     }
 
-    let before_throttle = manager.total_spawn_count().await;
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hls_master_returns_immediately_before_transcoder_is_ready() {
+        let temp_dir = TempDir::new().unwrap();
+        let (server, item) = setup_hls_delayed_ready_full_transcode(&temp_dir).await;
 
-    let throttled = server
-        .client
-        .get(format!(
-            "{}/api/media/{}/hls/seg_0_{:05}.m4s",
-            server.base_url, item.id, 245
-        ))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(throttled.status(), StatusCode::TOO_MANY_REQUESTS);
-    let retry_after = throttled
-        .headers()
-        .get("retry-after")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok())
-        .expect("throttled response should carry Retry-After");
-    assert!(
-        retry_after >= 4,
-        "rate-limit backoff should be surfaced via Retry-After: {retry_after}"
-    );
+        let started = std::time::Instant::now();
+        let response = server
+            .client
+            .get(format!(
+                "{}/api/media/{}/hls/master.m3u8",
+                server.base_url, item.id
+            ))
+            .send()
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
 
-    assert_eq!(
-        manager.total_spawn_count().await,
-        before_throttle,
-        "throttled request must not spawn a new ffmpeg process"
-    );
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            elapsed < Duration::from_millis(1200),
+            "master playlist should not wait for transcoder readiness (elapsed {:?})",
+            elapsed
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hls_video_variant_returns_immediately_before_transcoder_is_ready() {
+        let temp_dir = TempDir::new().unwrap();
+        let (server, item) = setup_hls_delayed_ready_full_transcode(&temp_dir).await;
+
+        let started = std::time::Instant::now();
+        let response = server
+            .client
+            .get(format!(
+                "{}/api/media/{}/hls/stream_0.m3u8",
+                server.base_url, item.id
+            ))
+            .send()
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            elapsed < Duration::from_millis(1200),
+            "video variant should not wait for transcoder readiness (elapsed {:?})",
+            elapsed
+        );
+        let body = response.text().await.unwrap();
+        assert!(
+            body.contains("#EXT-X-ENDLIST"),
+            "bounded synthetic variant should be returned immediately: {body}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hls_init_segment_returns_retryable_503_before_transcoder_is_ready() {
+        let temp_dir = TempDir::new().unwrap();
+        let (server, item) = setup_hls_delayed_ready_full_transcode(&temp_dir).await;
+
+        let started = std::time::Instant::now();
+        let response = server
+            .client
+            .get(format!(
+                "{}/api/media/{}/hls/init_0.lock.mp4",
+                server.base_url, item.id
+            ))
+            .send()
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            elapsed < Duration::from_millis(1200),
+            "init request should fail fast with retryable readiness (elapsed {:?})",
+            elapsed
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("retry-after")
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hls_audio_variant_returns_retryable_503_before_transcoder_is_ready() {
+        let temp_dir = TempDir::new().unwrap();
+        let (server, item) = setup_hls_delayed_ready_full_transcode(&temp_dir).await;
+
+        let master = server
+            .client
+            .get(format!(
+                "{}/api/media/{}/hls/master.m3u8",
+                server.base_url, item.id
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(master.status(), StatusCode::OK);
+        let master_body = master.text().await.unwrap();
+        let audio_variant = master_body
+            .lines()
+            .find(|line| line.starts_with("#EXT-X-MEDIA:TYPE=AUDIO"))
+            .and_then(|line| hls_attr_value(line, "URI"))
+            .expect("master should include audio rendition URI");
+
+        let started = std::time::Instant::now();
+        let response = server
+            .client
+            .get(format!(
+                "{}/api/media/{}/hls/{}",
+                server.base_url, item.id, audio_variant
+            ))
+            .send()
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            elapsed < Duration::from_millis(1200),
+            "audio variant request should fail fast with retryable readiness (elapsed {:?})",
+            elapsed
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("retry-after")
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hls_unknown_m3u8_stays_404_while_session_starts() {
+        let temp_dir = TempDir::new().unwrap();
+        let (server, item) = setup_hls_delayed_ready_full_transcode(&temp_dir).await;
+
+        let started = std::time::Instant::now();
+        let response = server
+            .client
+            .get(format!(
+                "{}/api/media/{}/hls/not-a-real-playlist.m3u8",
+                server.base_url, item.id
+            ))
+            .send()
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(
+            elapsed < Duration::from_millis(1200),
+            "unknown asset lookup should not block on transcoder readiness (elapsed {:?})",
+            elapsed
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hls_seek_respawn_throttle_returns_429_with_retry_after() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path().join("library");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("movie.mkv"), b"synthetic").unwrap();
+
+        let probe = write_probe_script(
+            &temp_dir,
+            "probe-long-transcode.sh",
+            r###"#!/usr/bin/env bash
+set -euo pipefail
+cat <<'JSON'
+{
+  "format": { "format_name": "matroska,webm", "duration": "600.0" },
+  "streams": [
+    { "codec_type": "video", "codec_name": "hevc", "width": 320, "height": 240 },
+    { "codec_type": "audio", "codec_name": "ac3" }
+  ]
 }
+JSON
+"###,
+        );
 
-#[cfg(unix)]
-#[tokio::test]
-async fn hls_respawn_shim_matches_real_ffmpeg_start_number_shape() {
-    if !external_av_tools_available() {
-        eprintln!("skipping: ffmpeg/ffprobe not on PATH");
-        return;
+        let ffmpeg_stub = write_ffmpeg_stub(
+            &temp_dir,
+            "ffmpeg-hls-stub.sh",
+            &hls_respawn_ffmpeg_stub_script(true),
+        );
+
+        let library = LibraryConfig::from_paths(vec![root]).with_probe_command(probe);
+        let hls_config = HlsConfig {
+            cache_dir: temp_dir.path().join("hls-cache"),
+            max_concurrent: 2,
+            idle_secs: 60,
+            ffmpeg_command: Some(ffmpeg_stub),
+            hw_accel: Default::default(),
+            vaapi_device: None,
+        };
+        let server = TestServer::spawn_with_library_and_hls(library, hls_config).await;
+        server.scan_library().await;
+        let library = server.wait_for_probes_complete().await;
+        let item = library
+            .items
+            .into_iter()
+            .next()
+            .expect("scanned media item");
+        let manager = server.hls.as_ref().expect("hls manager handle");
+
+        assert_eq!(
+            item.playback_mode,
+            syncplay_backend::protocol::PlaybackMode::HlsFullTranscode
+        );
+
+        // Boot the initial session and baseline spawn count.
+        let master = server
+            .client
+            .get(format!(
+                "{}/api/media/{}/hls/master.m3u8",
+                server.base_url, item.id
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(master.status(), StatusCode::OK);
+        assert_eq!(manager.total_spawn_count().await, 1);
+
+        // Space requests so each one clears cooldown and forces a true respawn
+        // (segment index jumps > catchup window from current frontier).
+        for segment in [35_u32, 70, 105, 140, 175, 210] {
+            let response = fetch_hls_eventually_ok(
+                &server,
+                format!(
+                    "{}/api/media/{}/hls/seg_0_{segment:05}.m4s",
+                    server.base_url, item.id
+                ),
+                Duration::from_secs(5),
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "seek segment {segment} should trigger a successful respawn"
+            );
+            tokio::time::sleep(Duration::from_millis(800)).await;
+        }
+
+        let before_throttle = manager.total_spawn_count().await;
+
+        let throttled = server
+            .client
+            .get(format!(
+                "{}/api/media/{}/hls/seg_0_{:05}.m4s",
+                server.base_url, item.id, 245
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(throttled.status(), StatusCode::TOO_MANY_REQUESTS);
+        let retry_after = throttled
+            .headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .expect("throttled response should carry Retry-After");
+        assert!(
+            retry_after >= 4,
+            "rate-limit backoff should be surfaced via Retry-After: {retry_after}"
+        );
+
+        assert_eq!(
+            manager.total_spawn_count().await,
+            before_throttle,
+            "throttled request must not spawn a new ffmpeg process"
+        );
     }
 
-    let temp_dir = TempDir::new().unwrap();
-    let input_path = temp_dir.path().join("input.mkv");
-    generate_h264_ac3_mkv(&input_path);
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hls_respawn_shim_matches_real_ffmpeg_start_number_shape() {
+        if !external_av_tools_available() {
+            eprintln!("skipping: ffmpeg/ffprobe not on PATH");
+            return;
+        }
 
-    let start_number = 35_u32;
-    let expected_segment = format!("seg_0_{start_number:05}.m4s");
+        let temp_dir = TempDir::new().unwrap();
+        let input_path = temp_dir.path().join("input.mkv");
+        generate_h264_ac3_mkv(&input_path);
 
-    let real_dir = temp_dir.path().join("real");
-    fs::create_dir_all(&real_dir).unwrap();
-    let real_status = std::process::Command::new("ffmpeg")
-        .arg("-y")
-        .arg("-loglevel")
-        .arg("error")
-        .arg("-nostdin")
-        .arg("-i")
-        .arg(&input_path)
-        .arg("-map")
-        .arg("0:v:0?")
-        .arg("-map")
-        .arg("0:a:0")
-        .arg("-sn")
-        .arg("-c:v")
-        .arg("copy")
-        .arg("-c:a")
-        .arg("aac")
-        .arg("-b:a")
-        .arg("192k")
-        .arg("-ac")
-        .arg("2")
-        .arg("-f")
-        .arg("hls")
-        .arg("-hls_time")
-        .arg("2")
-        .arg("-hls_list_size")
-        .arg("0")
-        .arg("-hls_playlist_type")
-        .arg("vod")
-        .arg("-hls_segment_type")
-        .arg("fmp4")
-        .arg("-hls_flags")
-        .arg("independent_segments+temp_file")
-        .arg("-start_number")
-        .arg(start_number.to_string())
-        .arg("-hls_segment_filename")
-        .arg(real_dir.join("seg_%v_%05d.m4s"))
-        .arg("-var_stream_map")
-        .arg("v:0,agroup:aud a:0,agroup:aud,name:a0_eng,default:yes")
-        .arg(real_dir.join("stream_%v.m3u8"))
-        .status()
-        .unwrap();
-    assert!(
-        real_status.success(),
-        "real ffmpeg invocation failed with status {real_status}"
-    );
+        let start_number = 35_u32;
+        let expected_segment = format!("seg_0_{start_number:05}.m4s");
 
-    let shim_dir = temp_dir.path().join("shim");
-    fs::create_dir_all(&shim_dir).unwrap();
-    let shim = write_ffmpeg_stub(
-        &temp_dir,
-        "ffmpeg-hls-shape.sh",
-        &hls_respawn_ffmpeg_stub_script(false),
-    );
-    let shim_status = std::process::Command::new(&shim)
-        .arg("-start_number")
-        .arg(start_number.to_string())
-        .current_dir(&shim_dir)
-        .status()
-        .unwrap();
-    assert!(
-        shim_status.success(),
-        "shim invocation failed with status {shim_status}"
-    );
+        let real_dir = temp_dir.path().join("real");
+        fs::create_dir_all(&real_dir).unwrap();
+        let real_status = std::process::Command::new("ffmpeg")
+            .arg("-y")
+            .arg("-loglevel")
+            .arg("error")
+            .arg("-nostdin")
+            .arg("-i")
+            .arg(&input_path)
+            .arg("-map")
+            .arg("0:v:0?")
+            .arg("-map")
+            .arg("0:a:0")
+            .arg("-sn")
+            .arg("-c:v")
+            .arg("copy")
+            .arg("-c:a")
+            .arg("aac")
+            .arg("-b:a")
+            .arg("192k")
+            .arg("-ac")
+            .arg("2")
+            .arg("-f")
+            .arg("hls")
+            .arg("-hls_time")
+            .arg("2")
+            .arg("-hls_list_size")
+            .arg("0")
+            .arg("-hls_playlist_type")
+            .arg("vod")
+            .arg("-hls_segment_type")
+            .arg("fmp4")
+            .arg("-hls_flags")
+            .arg("independent_segments+temp_file")
+            .arg("-start_number")
+            .arg(start_number.to_string())
+            .arg("-hls_segment_filename")
+            .arg(real_dir.join("seg_%v_%05d.m4s"))
+            .arg("-var_stream_map")
+            .arg("v:0,agroup:aud a:0,agroup:aud,name:a0_eng,default:yes")
+            .arg(real_dir.join("stream_%v.m3u8"))
+            .status()
+            .unwrap();
+        assert!(
+            real_status.success(),
+            "real ffmpeg invocation failed with status {real_status}"
+        );
 
-    let real_playlist = fs::read_to_string(real_dir.join("stream_0.m3u8")).unwrap();
-    let shim_playlist = fs::read_to_string(shim_dir.join("stream_0.m3u8")).unwrap();
+        let shim_dir = temp_dir.path().join("shim");
+        fs::create_dir_all(&shim_dir).unwrap();
+        let shim = write_ffmpeg_stub(
+            &temp_dir,
+            "ffmpeg-hls-shape.sh",
+            &hls_respawn_ffmpeg_stub_script(false),
+        );
+        let shim_status = std::process::Command::new(&shim)
+            .arg("-start_number")
+            .arg(start_number.to_string())
+            .current_dir(&shim_dir)
+            .status()
+            .unwrap();
+        assert!(
+            shim_status.success(),
+            "shim invocation failed with status {shim_status}"
+        );
 
-    let real_map_uri = real_playlist
-        .lines()
-        .find_map(|line| hls_attr_value(line, "URI"))
-        .expect("real playlist should include map URI");
-    let shim_map_uri = shim_playlist
-        .lines()
-        .find_map(|line| hls_attr_value(line, "URI"))
-        .expect("shim playlist should include map URI");
-    assert_eq!(real_map_uri, "init_0.mp4");
-    assert_eq!(shim_map_uri, "init_0.mp4");
+        let real_playlist = fs::read_to_string(real_dir.join("stream_0.m3u8")).unwrap();
+        let shim_playlist = fs::read_to_string(shim_dir.join("stream_0.m3u8")).unwrap();
 
-    let real_segment = real_playlist
-        .lines()
-        .find(|line| line.ends_with(".m4s"))
-        .expect("real playlist should include a segment");
-    let shim_segment = shim_playlist
-        .lines()
-        .find(|line| line.ends_with(".m4s"))
-        .expect("shim playlist should include a segment");
-    assert_eq!(real_segment, expected_segment);
-    assert_eq!(shim_segment, expected_segment);
+        let real_map_uri = real_playlist
+            .lines()
+            .find_map(|line| hls_attr_value(line, "URI"))
+            .expect("real playlist should include map URI");
+        let shim_map_uri = shim_playlist
+            .lines()
+            .find_map(|line| hls_attr_value(line, "URI"))
+            .expect("shim playlist should include map URI");
+        assert_eq!(real_map_uri, "init_0.mp4");
+        assert_eq!(shim_map_uri, "init_0.mp4");
 
-    assert!(
-        real_playlist.contains(&format!("#EXT-X-MEDIA-SEQUENCE:{start_number}")),
-        "real playlist should carry media sequence"
-    );
-    assert!(
-        shim_playlist.contains(&format!("#EXT-X-MEDIA-SEQUENCE:{start_number}")),
-        "shim playlist should carry media sequence"
-    );
-}
+        let real_segment = real_playlist
+            .lines()
+            .find(|line| line.ends_with(".m4s"))
+            .expect("real playlist should include a segment");
+        let shim_segment = shim_playlist
+            .lines()
+            .find(|line| line.ends_with(".m4s"))
+            .expect("shim playlist should include a segment");
+        assert_eq!(real_segment, expected_segment);
+        assert_eq!(shim_segment, expected_segment);
 
-#[cfg(unix)]
-#[tokio::test]
-async fn hls_concurrent_master_requests_share_one_session() {
-    if !external_av_tools_available() {
-        eprintln!("skipping: ffmpeg/ffprobe not on PATH");
-        return;
+        assert!(
+            real_playlist.contains(&format!("#EXT-X-MEDIA-SEQUENCE:{start_number}")),
+            "real playlist should carry media sequence"
+        );
+        assert!(
+            shim_playlist.contains(&format!("#EXT-X-MEDIA-SEQUENCE:{start_number}")),
+            "shim playlist should carry media sequence"
+        );
     }
 
-    let temp_dir = TempDir::new().unwrap();
-    let (server, item) = hls_test_setup(&temp_dir).await;
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hls_concurrent_master_requests_share_one_session() {
+        if !external_av_tools_available() {
+            eprintln!("skipping: ffmpeg/ffprobe not on PATH");
+            return;
+        }
 
-    let url = format!("{}/api/media/{}/hls/master.m3u8", server.base_url, item.id);
-    let (a, b) = tokio::join!(
-        server.client.get(&url).send(),
-        server.client.get(&url).send()
-    );
-    assert_eq!(a.unwrap().status(), StatusCode::OK);
-    assert_eq!(b.unwrap().status(), StatusCode::OK);
+        let temp_dir = TempDir::new().unwrap();
+        let (server, item) = hls_test_setup(&temp_dir).await;
 
-    // Each session corresponds to exactly one ffmpeg spawn (idempotent under
-    // the per-session startup mutex). With both callers racing, the manager
-    // must still hold only one session for this media id.
-    let manager = server.hls.as_ref().expect("hls manager handle");
-    assert_eq!(
-        manager.session_count().await,
-        1,
-        "concurrent callers should share a single HLS session"
-    );
-}
+        let url = format!("{}/api/media/{}/hls/master.m3u8", server.base_url, item.id);
+        let (a, b) = tokio::join!(
+            server.client.get(&url).send(),
+            server.client.get(&url).send()
+        );
+        assert_eq!(a.unwrap().status(), StatusCode::OK);
+        assert_eq!(b.unwrap().status(), StatusCode::OK);
 
-#[cfg(unix)]
-#[tokio::test]
-async fn hls_full_transcode_uses_separate_sessions_for_safari_and_non_safari() {
-    if !external_av_tools_available() {
-        eprintln!("skipping: ffmpeg/ffprobe not on PATH");
-        return;
+        // Each session corresponds to exactly one ffmpeg spawn (idempotent under
+        // the per-session startup mutex). With both callers racing, the manager
+        // must still hold only one session for this media id.
+        let manager = server.hls.as_ref().expect("hls manager handle");
+        assert_eq!(
+            manager.session_count().await,
+            1,
+            "concurrent callers should share a single HLS session"
+        );
     }
 
-    let temp_dir = TempDir::new().unwrap();
-    let root = temp_dir.path().join("library");
-    fs::create_dir_all(&root).unwrap();
-    generate_h264_ac3_mkv(&root.join("movie.mkv"));
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hls_full_transcode_uses_separate_sessions_for_safari_and_non_safari() {
+        if !external_av_tools_available() {
+            eprintln!("skipping: ffmpeg/ffprobe not on PATH");
+            return;
+        }
 
-    // Force `HlsFullTranscode` classification regardless of the synthetic
-    // source file so we can verify browser-specific session splitting:
-    // Safari should get the passthrough bucket, non-Safari the transcode one.
-    let probe = write_probe_script(
-        &temp_dir,
-        "probe-full-transcode.sh",
-        r#"#!/usr/bin/env bash
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path().join("library");
+        fs::create_dir_all(&root).unwrap();
+        generate_h264_ac3_mkv(&root.join("movie.mkv"));
+
+        // Force `HlsFullTranscode` classification regardless of the synthetic
+        // source file so we can verify browser-specific session splitting:
+        // Safari should get the passthrough bucket, non-Safari the transcode one.
+        let probe = write_probe_script(
+            &temp_dir,
+            "probe-full-transcode.sh",
+            r#"#!/usr/bin/env bash
 set -euo pipefail
 cat <<'JSON'
 {
@@ -3282,153 +3665,154 @@ cat <<'JSON'
 }
 JSON
 "#,
-    );
+        );
 
-    let library = LibraryConfig::from_paths(vec![root]).with_probe_command(probe);
-    let hls_config = HlsConfig {
-        cache_dir: temp_dir.path().join("hls-cache"),
-        max_concurrent: 4,
-        idle_secs: 60,
-        ffmpeg_command: Some(PathBuf::from("ffmpeg")),
-        hw_accel: Default::default(),
-        vaapi_device: None,
-    };
+        let library = LibraryConfig::from_paths(vec![root]).with_probe_command(probe);
+        let hls_config = HlsConfig {
+            cache_dir: temp_dir.path().join("hls-cache"),
+            max_concurrent: 4,
+            idle_secs: 60,
+            ffmpeg_command: Some(PathBuf::from("ffmpeg")),
+            hw_accel: Default::default(),
+            vaapi_device: None,
+        };
 
-    let server = TestServer::spawn_with_library_and_hls(library, hls_config).await;
-    server.scan_library().await;
-    let library = server.wait_for_probes_complete().await;
-    let item = library
-        .items
-        .into_iter()
-        .next()
-        .expect("scanned media item");
+        let server = TestServer::spawn_with_library_and_hls(library, hls_config).await;
+        server.scan_library().await;
+        let library = server.wait_for_probes_complete().await;
+        let item = library
+            .items
+            .into_iter()
+            .next()
+            .expect("scanned media item");
 
-    assert_eq!(
-        item.playback_mode,
-        syncplay_backend::protocol::PlaybackMode::HlsFullTranscode
-    );
+        assert_eq!(
+            item.playback_mode,
+            syncplay_backend::protocol::PlaybackMode::HlsFullTranscode
+        );
 
-    let url = format!("{}/api/media/{}/hls/master.m3u8", server.base_url, item.id);
-    let safari_ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 12_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Safari/605.1.15";
-    let chrome_ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+        let url = format!("{}/api/media/{}/hls/master.m3u8", server.base_url, item.id);
+        let safari_ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 12_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Safari/605.1.15";
+        let chrome_ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
-    let safari_response = server
-        .client
-        .get(&url)
-        .header("user-agent", safari_ua)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(safari_response.status(), StatusCode::OK);
+        let safari_response = server
+            .client
+            .get(&url)
+            .header("user-agent", safari_ua)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(safari_response.status(), StatusCode::OK);
 
-    let chrome_response = server
-        .client
-        .get(&url)
-        .header("user-agent", chrome_ua)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(chrome_response.status(), StatusCode::OK);
+        let chrome_response = server
+            .client
+            .get(&url)
+            .header("user-agent", chrome_ua)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(chrome_response.status(), StatusCode::OK);
 
-    let manager = server.hls.as_ref().expect("hls manager handle");
-    assert_eq!(
-        manager.session_count().await,
-        2,
-        "incompatible browser pipelines should not share one HLS session"
-    );
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn hls_rejects_invalid_filenames() {
-    if !external_av_tools_available() {
-        eprintln!("skipping: ffmpeg/ffprobe not on PATH");
-        return;
+        let manager = server.hls.as_ref().expect("hls manager handle");
+        assert_eq!(
+            manager.session_count().await,
+            2,
+            "incompatible browser pipelines should not share one HLS session"
+        );
     }
 
-    let temp_dir = TempDir::new().unwrap();
-    let (server, item) = hls_test_setup(&temp_dir).await;
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hls_rejects_invalid_filenames() {
+        if !external_av_tools_available() {
+            eprintln!("skipping: ffmpeg/ffprobe not on PATH");
+            return;
+        }
 
-    let response = server
-        .client
-        .get(format!(
-            "{}/api/media/{}/hls/secret.txt",
-            server.base_url, item.id
-        ))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-}
+        let temp_dir = TempDir::new().unwrap();
+        let (server, item) = hls_test_setup(&temp_dir).await;
 
-#[cfg(unix)]
-#[tokio::test]
-async fn hls_out_of_range_segment_returns_404_without_respawn() {
-    if !external_av_tools_available() {
-        eprintln!("skipping: ffmpeg/ffprobe not on PATH");
-        return;
+        let response = server
+            .client
+            .get(format!(
+                "{}/api/media/{}/hls/secret.txt",
+                server.base_url, item.id
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
-    let temp_dir = TempDir::new().unwrap();
-    let (server, item) = hls_test_setup(&temp_dir).await;
-    let manager = server.hls.as_ref().expect("hls manager handle");
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hls_out_of_range_segment_returns_404_without_respawn() {
+        if !external_av_tools_available() {
+            eprintln!("skipping: ffmpeg/ffprobe not on PATH");
+            return;
+        }
 
-    // First request boots the session and spawns ffmpeg once.
-    let master = server
-        .client
-        .get(format!(
-            "{}/api/media/{}/hls/master.m3u8",
-            server.base_url, item.id
-        ))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(master.status(), StatusCode::OK);
-    assert_eq!(manager.total_spawn_count().await, 1);
+        let temp_dir = TempDir::new().unwrap();
+        let (server, item) = hls_test_setup(&temp_dir).await;
+        let manager = server.hls.as_ref().expect("hls manager handle");
 
-    // Deliberately impossible segment index for a tiny test clip.
-    let out_of_range = server
-        .client
-        .get(format!(
-            "{}/api/media/{}/hls/seg_0_99999.m4s",
-            server.base_url, item.id
-        ))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(out_of_range.status(), StatusCode::NOT_FOUND);
-    assert_eq!(
-        manager.total_spawn_count().await,
-        1,
-        "out-of-range segment must not trigger a respawn"
-    );
+        // First request boots the session and spawns ffmpeg once.
+        let master = server
+            .client
+            .get(format!(
+                "{}/api/media/{}/hls/master.m3u8",
+                server.base_url, item.id
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(master.status(), StatusCode::OK);
+        assert_eq!(manager.total_spawn_count().await, 1);
 
-    // Sanity: valid segment fetch still works and still without extra spawns.
-    let variant = server
-        .client
-        .get(format!(
-            "{}/api/media/{}/hls/stream_0.m3u8",
-            server.base_url, item.id
-        ))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(variant.status(), StatusCode::OK);
-    let variant_body = variant.text().await.unwrap();
-    let first_segment = variant_body
-        .lines()
-        .find(|line| line.ends_with(".m4s"))
-        .expect("variant should list at least one segment");
+        // Deliberately impossible segment index for a tiny test clip.
+        let out_of_range = server
+            .client
+            .get(format!(
+                "{}/api/media/{}/hls/seg_0_99999.m4s",
+                server.base_url, item.id
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(out_of_range.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            manager.total_spawn_count().await,
+            1,
+            "out-of-range segment must not trigger a respawn"
+        );
 
-    let ok_segment = server
-        .client
-        .get(format!(
-            "{}/api/media/{}/hls/{}",
-            server.base_url, item.id, first_segment
-        ))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(ok_segment.status(), StatusCode::OK);
-    assert_eq!(manager.total_spawn_count().await, 1);
+        // Sanity: valid segment fetch still works and still without extra spawns.
+        let variant = server
+            .client
+            .get(format!(
+                "{}/api/media/{}/hls/stream_0.m3u8",
+                server.base_url, item.id
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(variant.status(), StatusCode::OK);
+        let variant_body = variant.text().await.unwrap();
+        let first_segment = variant_body
+            .lines()
+            .find(|line| line.ends_with(".m4s"))
+            .expect("variant should list at least one segment");
+
+        let ok_segment = fetch_hls_eventually_ok(
+            &server,
+            format!(
+                "{}/api/media/{}/hls/{}",
+                server.base_url, item.id, first_segment
+            ),
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(ok_segment.status(), StatusCode::OK);
+        assert_eq!(manager.total_spawn_count().await, 1);
+    }
 }

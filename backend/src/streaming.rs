@@ -43,7 +43,20 @@ pub(crate) async fn stream_media_response(
     range_header: Option<&str>,
 ) -> Result<Response<Body>, StreamMediaError> {
     let media_path = resolve_media_path(media_item);
-    let metadata = fs::metadata(&media_path).await.map_err(map_file_error)?;
+    let content_type = media_item
+        .content_type
+        .as_deref()
+        .unwrap_or("application/octet-stream");
+
+    stream_file_response(&media_path, content_type, range_header).await
+}
+
+pub(crate) async fn stream_file_response(
+    path: &Path,
+    content_type: &str,
+    range_header: Option<&str>,
+) -> Result<Response<Body>, StreamMediaError> {
+    let metadata = fs::metadata(path).await.map_err(map_file_error)?;
 
     if !metadata.is_file() {
         return Err(StreamMediaError::NotFound);
@@ -55,7 +68,7 @@ pub(crate) async fn stream_media_response(
         None => None,
     };
 
-    let mut file = File::open(&media_path).await.map_err(map_file_error)?;
+    let mut file = File::open(path).await.map_err(map_file_error)?;
     let (status, start, end) = match range {
         Some(range) => (StatusCode::PARTIAL_CONTENT, range.start, range.end),
         None => (
@@ -84,11 +97,6 @@ pub(crate) async fn stream_media_response(
         CONTENT_LENGTH,
         HeaderValue::from_str(&content_len.to_string()).expect("content length should be valid"),
     );
-
-    let content_type = media_item
-        .content_type
-        .as_deref()
-        .unwrap_or("application/octet-stream");
     headers.insert(
         CONTENT_TYPE,
         HeaderValue::from_str(content_type)
@@ -148,31 +156,22 @@ pub(crate) async fn stream_subtitle_response(
     Ok(response)
 }
 
-pub(crate) async fn stream_hls_file_response(
-    asset_path: &Path,
-    content_type: &'static str,
+pub(crate) async fn stream_webvtt_file_response(
+    subtitle_path: &Path,
 ) -> Result<Response<Body>, StreamMediaError> {
-    // Stream the file rather than read-into-memory-then-ship. Init segments
-    // and fmp4 media segments can be multiple MB; buffering the whole file
-    // before the first byte goes out adds unnecessary latency and, under
-    // concurrent segment fetches, unnecessary peak RSS. The ReaderStream
-    // adapter hands chunks to axum as they come off the disk.
-    let file = File::open(asset_path).await.map_err(map_file_error)?;
-    let metadata = file.metadata().await.map_err(map_file_error)?;
+    let metadata = fs::metadata(subtitle_path).await.map_err(map_file_error)?;
 
     if !metadata.is_file() {
         return Err(StreamMediaError::NotFound);
     }
 
-    let file_len = metadata.len();
-    let mut response = Response::new(Body::from_stream(ReaderStream::new(file)));
-    let headers = response.headers_mut();
-    headers.insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
-    headers.insert(ACCEPT_RANGES, HeaderValue::from_static("none"));
-    headers.insert(
-        CONTENT_LENGTH,
-        HeaderValue::from_str(&file_len.to_string()).expect("content length should be valid"),
+    let body = fs::read(subtitle_path).await.map_err(map_file_error)?;
+    let mut response = Response::new(Body::from(body));
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("text/vtt; charset=utf-8"),
     );
+
     Ok(response)
 }
 
@@ -215,7 +214,7 @@ fn resolve_relative_path(root_path: &str, relative_path: &str) -> PathBuf {
     path
 }
 
-fn prepare_webvtt<'a>(bytes: &'a [u8], extension: &str) -> Cow<'a, str> {
+pub(crate) fn prepare_webvtt<'a>(bytes: &'a [u8], extension: &str) -> Cow<'a, str> {
     let text = if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
         String::from_utf8_lossy(&bytes[3..])
     } else {
@@ -229,7 +228,7 @@ fn prepare_webvtt<'a>(bytes: &'a [u8], extension: &str) -> Cow<'a, str> {
     }
 }
 
-fn convert_srt_to_vtt(input: &str) -> String {
+pub(crate) fn convert_srt_to_vtt(input: &str) -> String {
     let mut converted = String::from("WEBVTT\n\n");
 
     for line in input.lines() {
