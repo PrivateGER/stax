@@ -921,6 +921,50 @@ code {
   border-color: rgba(255, 107, 107, 0.3);
 }
 
+.session-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.55rem;
+  padding: 0.4rem 0.85rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg-hover);
+  color: var(--text);
+  font-size: 0.82rem;
+  font-weight: 500;
+  transition: background 120ms ease, border-color 120ms ease;
+}
+
+.session-pill:hover {
+  background: rgba(255, 255, 255, 0.08);
+  border-color: var(--border-strong);
+}
+
+.session-pill[aria-pressed="true"] {
+  background: rgba(229, 160, 13, 0.08);
+  border-color: rgba(229, 160, 13, 0.3);
+}
+
+.session-pill-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--text-muted);
+}
+
+.session-pill-dot.live {
+  background: var(--success);
+  box-shadow: 0 0 0 3px rgba(127, 212, 127, 0.18);
+}
+
+.session-pill-dot.connecting {
+  background: var(--accent);
+}
+
+.session-pill-dot.error {
+  background: var(--danger);
+}
+
 /* ========== Admin page ========== */
 
 .admin-page {

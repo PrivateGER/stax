@@ -10,7 +10,7 @@ import { useAudioTracks } from "../player/useAudioTracks";
 import { useRoomSync } from "../player/useRoomSync";
 import { navigate } from "../router";
 import type { MediaItem, Room } from "../types";
-import { useRoomSocket } from "../useRoomSocket";
+import { useRoomSocket, type RoomSocketApi } from "../useRoomSocket";
 import { usePlayerSource } from "../usePlayerSource";
 import { useStreamCopyProgress } from "../useStreamCopyProgress";
 import { useWatchTogether } from "../useWatchTogether";
@@ -176,11 +176,17 @@ export function PlayerPage({
 
           {roomId ? (
             <button
-              className="ghost-button"
+              aria-pressed={showSessionPanel}
+              className="session-pill"
               onClick={() => setShowSessionPanel((visible) => !visible)}
+              title={showSessionPanel ? "Hide session panel" : "Show session panel"}
               type="button"
             >
-              {showSessionPanel ? "Hide session" : "Show session"}
+              <span
+                aria-hidden="true"
+                className={`session-pill-dot ${socket.connectionState}`}
+              />
+              <span>{sessionPillLabel(socket)}</span>
             </button>
           ) : (
             <button
@@ -237,4 +243,19 @@ export function PlayerPage({
       </div>
     </div>
   );
+}
+
+function sessionPillLabel(socket: RoomSocketApi): string {
+  switch (socket.connectionState) {
+    case "connecting":
+      return "Connecting…";
+    case "error":
+      return "Connection error";
+    case "offline":
+      return "Offline";
+    case "live":
+      return socket.presenceCount > 1
+        ? `Live · ${socket.presenceCount}`
+        : "Live";
+  }
 }
