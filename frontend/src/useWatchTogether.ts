@@ -21,7 +21,7 @@ export function useWatchTogether(
 
       const title = displayMediaTitle(item);
       const room = await api.createRoom({
-        name: `${title} · Watch Party`,
+        name: title,
         mediaId: item.id,
         mediaTitle: title,
       });

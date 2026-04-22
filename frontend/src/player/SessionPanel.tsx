@@ -68,7 +68,7 @@ export function SessionPanel({
         onClick={onCatchUp}
         type="button"
       >
-        Catch up to room
+        Catch up
       </button>
 
       <p className="muted session-activity">{socket.activity}</p>
