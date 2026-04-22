@@ -32,10 +32,41 @@ export type SubtitleTrack = {
 
 export type PlaybackMode =
   | "direct"
-  | "hlsRemux"
-  | "hlsAudioTranscode"
-  | "hlsFullTranscode"
+  | "needsPreparation"
   | "unsupported";
+
+export type PreparationState =
+  | "direct"
+  | "needsPreparation"
+  | "preparing"
+  | "prepared"
+  | "failed"
+  | "unsupported";
+
+export type StreamCopyStatus = "queued" | "running" | "ready" | "failed";
+export type SubtitleMode = "off" | "sidecar" | "burned";
+export type SubtitleSourceKind = "sidecar" | "embedded";
+
+export type StreamCopySubtitleSelection = {
+  kind: SubtitleSourceKind;
+  index: number;
+};
+
+export type StreamCopySummary = {
+  status: StreamCopyStatus;
+  audioStreamIndex: number | null;
+  subtitleMode: SubtitleMode;
+  subtitle: StreamCopySubtitleSelection | null;
+  subtitleUrl: string | null;
+  error: string | null;
+  updatedAt: string;
+};
+
+export type CreateStreamCopyRequest = {
+  audioStreamIndex: number | null;
+  subtitleMode: SubtitleMode;
+  subtitle: StreamCopySubtitleSelection | null;
+};
 
 export type AudioStream = {
   index: number;
@@ -78,13 +109,14 @@ export type MediaItem = {
   thumbnailGeneratedAt: string | null;
   thumbnailError: string | null;
   playbackMode: PlaybackMode;
+  preparationState: PreparationState;
   videoProfile: string | null;
   videoLevel: number | null;
   videoPixFmt: string | null;
   videoBitDepth: number | null;
   audioStreams: AudioStream[];
   subtitleStreams: SubtitleStream[];
-  hlsMasterUrl: string | null;
+  streamCopy: StreamCopySummary | null;
 };
 
 export type LibraryRoot = {

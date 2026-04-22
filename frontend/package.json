@@ -9,7 +9,6 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "hls.js": "^1.6.16",
     "react": "^19.2.0",
     "react-dom": "^19.2.0"
   },

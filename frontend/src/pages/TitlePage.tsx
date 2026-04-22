@@ -1,26 +1,49 @@
-import { useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 import { api, thumbnailUrl } from "../api";
 import {
   displayMediaTitle,
+  formatAudioStreamLabel,
   formatBytes,
   formatDuration,
   formatResolution,
+  formatSubtitleStreamLabel,
+  formatSubtitleTrackLabel,
   posterInitials,
   rootFolderName,
 } from "../format";
 import { navigate } from "../router";
-import type { MediaItem, Room } from "../types";
+import type {
+  CreateStreamCopyRequest,
+  MediaItem,
+  Room,
+  StreamCopySubtitleSelection,
+  SubtitleMode,
+  SubtitleSourceKind,
+} from "../types";
 
 type Props = {
   item: MediaItem | null;
   rooms: Room[];
   onRoomCreated: (room: Room) => void;
+  onRefresh: () => void;
 };
 
-export function TitlePage({ item, rooms, onRoomCreated }: Props) {
+type SubtitleOption = {
+  value: string;
+  kind: SubtitleSourceKind;
+  index: number;
+  label: string;
+};
+
+export function TitlePage({ item, rooms, onRoomCreated, onRefresh }: Props) {
   const [creating, setCreating] = useState(false);
+  const [creatingStreamCopy, setCreatingStreamCopy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [streamCopyError, setStreamCopyError] = useState<string | null>(null);
+  const [audioStreamIndex, setAudioStreamIndex] = useState<number | null>(null);
+  const [subtitleMode, setSubtitleMode] = useState<SubtitleMode>("off");
+  const [subtitleSelection, setSubtitleSelection] = useState<string>("");
 
   if (!item) {
     return (
@@ -40,6 +63,43 @@ export function TitlePage({ item, rooms, onRoomCreated }: Props) {
 
   const title = displayMediaTitle(item);
   const relatedRooms = rooms.filter((room) => room.mediaId === item.id);
+  const canPlay = item.preparationState === "direct" || item.preparationState === "prepared";
+  const audioOptions = useMemo(
+    () =>
+      item.audioStreams.map((stream, index) => ({
+        value: stream.index,
+        label: formatAudioStreamLabel(stream, index + 1),
+      })),
+    [item.audioStreams],
+  );
+  const subtitleOptions = useMemo<SubtitleOption[]>(() => {
+    const sidecarOptions = item.subtitleTracks.map((track, index) => ({
+      value: `sidecar:${index}`,
+      kind: "sidecar" as const,
+      index,
+      label: formatSubtitleTrackLabel(track, index + 1, true),
+    }));
+    const embeddedOptions = item.subtitleStreams.map((stream, index) => ({
+      value: `embedded:${stream.index}`,
+      kind: "embedded" as const,
+      index: stream.index,
+      label: formatSubtitleStreamLabel(stream, index + 1, true),
+    }));
+
+    return [...sidecarOptions, ...embeddedOptions];
+  }, [item.subtitleStreams, item.subtitleTracks]);
+  const subtitleSourceCount = item.subtitleTracks.length + item.subtitleStreams.length;
+
+  useEffect(() => {
+    const defaultAudio =
+      item.audioStreams.find((stream) => stream.default)?.index ??
+      item.audioStreams[0]?.index ??
+      null;
+    setAudioStreamIndex(defaultAudio);
+    setSubtitleMode("off");
+    setSubtitleSelection(subtitleOptions[0]?.value ?? "");
+    setStreamCopyError(null);
+  }, [item.id, item.audioStreams, subtitleOptions]);
 
   async function handleStartWatchTogether() {
     if (!item) return;
@@ -67,6 +127,34 @@ export function TitlePage({ item, rooms, onRoomCreated }: Props) {
     }
   }
 
+  async function handleCreateStreamCopy() {
+    if (!item) return;
+
+    const request: CreateStreamCopyRequest = {
+      audioStreamIndex,
+      subtitleMode,
+      subtitle:
+        subtitleMode === "off"
+          ? null
+          : parseSubtitleSelection(subtitleSelection),
+    };
+
+    try {
+      setCreatingStreamCopy(true);
+      setStreamCopyError(null);
+      await api.createStreamCopy(item.id, request);
+      onRefresh();
+    } catch (creationError) {
+      setStreamCopyError(
+        creationError instanceof Error
+          ? creationError.message
+          : "Could not create the stream copy.",
+      );
+    } finally {
+      setCreatingStreamCopy(false);
+    }
+  }
+
   const metaRows: Array<[string, string]> = [];
   if (item.durationSeconds !== null) {
     metaRows.push(["Runtime", formatDuration(item.durationSeconds)]);
@@ -76,8 +164,21 @@ export function TitlePage({ item, rooms, onRoomCreated }: Props) {
   if (item.videoCodec) metaRows.push(["Video", item.videoCodec.toUpperCase()]);
   if (item.audioCodec) metaRows.push(["Audio", item.audioCodec.toUpperCase()]);
   if (item.containerName) metaRows.push(["Container", item.containerName]);
+  if (item.audioStreams.length > 0) {
+    metaRows.push([
+      "Audio tracks",
+      `${item.audioStreams.length} track${item.audioStreams.length === 1 ? "" : "s"}`,
+    ]);
+  }
+  if (subtitleSourceCount > 0) {
+    metaRows.push([
+      "Subtitles",
+      `${subtitleSourceCount} source${subtitleSourceCount === 1 ? "" : "s"}`,
+    ]);
+  }
   metaRows.push(["File size", formatBytes(item.sizeBytes)]);
   metaRows.push(["Library", rootFolderName(item.rootPath)]);
+  metaRows.push(["Playback", playbackLabel(item.preparationState)]);
 
   return (
     <article className="title-page">
@@ -94,8 +195,8 @@ export function TitlePage({ item, rooms, onRoomCreated }: Props) {
           <p className="eyebrow">
             {item.durationSeconds !== null ? formatDuration(item.durationSeconds) : "Movie"}
             {resolution ? ` · ${resolution}` : ""}
-            {item.subtitleTracks.length > 0
-              ? ` · ${item.subtitleTracks.length} subtitle${item.subtitleTracks.length === 1 ? "" : "s"}`
+            {subtitleSourceCount > 0
+              ? ` · ${subtitleSourceCount} subtitle source${subtitleSourceCount === 1 ? "" : "s"}`
               : ""}
           </p>
           <h1>{title}</h1>
@@ -104,10 +205,11 @@ export function TitlePage({ item, rooms, onRoomCreated }: Props) {
           <div className="title-cta">
             <button
               className="primary-button"
+              disabled={!canPlay}
               onClick={() => navigate({ name: "watch", mediaId: item.id, roomId: null })}
               type="button"
             >
-              ▶ Play
+              {canPlay ? "▶ Play" : "Needs stream copy"}
             </button>
             <button
               className="ghost-button"
@@ -120,6 +222,91 @@ export function TitlePage({ item, rooms, onRoomCreated }: Props) {
           </div>
 
           {error ? <p className="error">{error}</p> : null}
+
+          {item.playbackMode === "needsPreparation" ? (
+            <div className="title-stream-copy">
+              <h2>Stream copy</h2>
+              <p className="muted">
+                {streamCopyDescription(item.preparationState, item.streamCopy?.error)}
+              </p>
+
+              <label className="input-stack">
+                <span className="label-text">Audio track</span>
+                <select
+                  onChange={(event) => {
+                    const value = event.target.value;
+                    setAudioStreamIndex(value === "" ? null : Number(value));
+                  }}
+                  value={audioStreamIndex ?? ""}
+                >
+                  {audioOptions.length === 0 ? (
+                    <option value="">No audio</option>
+                  ) : (
+                    audioOptions.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))
+                  )}
+                </select>
+              </label>
+
+              <label className="input-stack">
+                <span className="label-text">Subtitles</span>
+                <select
+                  onChange={(event) => setSubtitleMode(event.target.value as SubtitleMode)}
+                  value={subtitleMode}
+                >
+                  <option value="off">Off</option>
+                  <option value="sidecar">Sidecar WebVTT</option>
+                  <option value="burned">Burn into video</option>
+                </select>
+              </label>
+
+              {subtitleMode !== "off" ? (
+                <label className="input-stack">
+                  <span className="label-text">Subtitle source</span>
+                  <select
+                    disabled={subtitleOptions.length === 0}
+                    onChange={(event) => setSubtitleSelection(event.target.value)}
+                    value={subtitleSelection}
+                  >
+                    {subtitleOptions.length === 0 ? (
+                      <option value="">No subtitles available</option>
+                    ) : (
+                      subtitleOptions.map((option) => (
+                        <option key={option.value} value={option.value}>
+                          {option.label}
+                        </option>
+                      ))
+                    )}
+                  </select>
+                </label>
+              ) : null}
+
+              <div className="title-cta">
+                <button
+                  className="ghost-button"
+                  disabled={
+                    creatingStreamCopy ||
+                    (subtitleMode !== "off" && subtitleOptions.length === 0)
+                  }
+                  onClick={() => void handleCreateStreamCopy()}
+                  type="button"
+                >
+                  {creatingStreamCopy
+                    ? "Submitting…"
+                    : item.preparationState === "prepared"
+                      ? "Recreate stream copy"
+                      : item.preparationState === "preparing"
+                        ? "Refresh stream copy state"
+                        : "Create stream copy"}
+                </button>
+              </div>
+
+              {streamCopyError ? <p className="error">{streamCopyError}</p> : null}
+            </div>
+          ) : null}
         </div>
       </div>
 
@@ -138,14 +325,33 @@ export function TitlePage({ item, rooms, onRoomCreated }: Props) {
 
         <div>
           <h2>Subtitles</h2>
-          {item.subtitleTracks.length === 0 ? (
+          {subtitleSourceCount === 0 ? (
             <p className="muted">No subtitle tracks indexed.</p>
           ) : (
             <ul className="subtitle-list">
-              {item.subtitleTracks.map((track) => (
+              {item.subtitleTracks.map((track, index) => (
                 <li key={track.relativePath}>
-                  <strong>{track.label}</strong>
-                  {track.language ? <span className="muted"> · {track.language}</span> : null}
+                  {formatSubtitleTrackLabel(track, index + 1, true)}
+                </li>
+              ))}
+              {item.subtitleStreams.map((stream, index) => (
+                <li key={`embedded-${stream.index}`}>
+                  {formatSubtitleStreamLabel(stream, index + 1, true)}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+
+        <div>
+          <h2>Audio</h2>
+          {item.audioStreams.length === 0 ? (
+            <p className="muted">No audio streams indexed.</p>
+          ) : (
+            <ul className="subtitle-list">
+              {item.audioStreams.map((stream, index) => (
+                <li key={`audio-${stream.index}`}>
+                  {formatAudioStreamLabel(stream, index + 1)}
                 </li>
               ))}
             </ul>
@@ -178,4 +384,52 @@ export function TitlePage({ item, rooms, onRoomCreated }: Props) {
       </section>
     </article>
   );
+}
+
+function parseSubtitleSelection(value: string): StreamCopySubtitleSelection | null {
+  const [kind, rawIndex] = value.split(":");
+  if (!kind || rawIndex === undefined) return null;
+  const index = Number(rawIndex);
+  if (!Number.isFinite(index)) return null;
+  if (kind !== "sidecar" && kind !== "embedded") return null;
+
+  return {
+    kind,
+    index,
+  };
+}
+
+function playbackLabel(state: MediaItem["preparationState"]) {
+  switch (state) {
+    case "direct":
+      return "Direct stream";
+    case "prepared":
+      return "Prepared stream copy";
+    case "preparing":
+      return "Preparing stream copy";
+    case "failed":
+      return "Stream copy failed";
+    case "needsPreparation":
+      return "Needs stream copy";
+    default:
+      return "Unsupported";
+  }
+}
+
+function streamCopyDescription(
+  state: MediaItem["preparationState"],
+  error: string | null | undefined,
+) {
+  switch (state) {
+    case "prepared":
+      return "A prepared stream copy is ready and will be used for browser playback.";
+    case "preparing":
+      return "A stream copy is being prepared in the background.";
+    case "failed":
+      return error ?? "The last stream copy attempt failed.";
+    case "needsPreparation":
+      return "This file is not browser-safe as-is. Create a stream copy to play it.";
+    default:
+      return "This title can already be streamed directly.";
+  }
 }

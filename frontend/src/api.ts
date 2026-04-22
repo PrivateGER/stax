@@ -1,9 +1,11 @@
 import type {
+  CreateStreamCopyRequest,
   HealthResponse,
   LibraryResponse,
   LibraryScanResponse,
   Room,
   RoomsResponse,
+  StreamCopySummary,
 } from "./types";
 
 async function getJson<T>(url: string): Promise<T> {
@@ -51,6 +53,31 @@ export const api = {
     if (!response.ok) {
       const body = await response.json().catch(() => ({}) as { error?: string });
       throw new Error(body.error ?? "Failed to create room.");
+    }
+
+    return response.json();
+  },
+
+  getStreamCopy: (mediaId: string) =>
+    getJson<StreamCopySummary>(`/api/media/${mediaId}/stream-copy`),
+
+  createStreamCopy: async (
+    mediaId: string,
+    input: CreateStreamCopyRequest,
+  ): Promise<StreamCopySummary> => {
+    const response = await fetch(`/api/media/${mediaId}/stream-copy`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        audioStreamIndex: input.audioStreamIndex,
+        subtitleMode: input.subtitleMode,
+        subtitle: input.subtitle,
+      }),
+    });
+
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({}) as { error?: string });
+      throw new Error(body.error ?? "Failed to create stream copy.");
     }
 
     return response.json();

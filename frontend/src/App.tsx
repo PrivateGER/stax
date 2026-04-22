@@ -74,7 +74,8 @@ export default function App() {
   const hasPendingBackgroundWork = items.some(
     (item) =>
       (item.probedAt === null && item.probeError === null) ||
-      (item.thumbnailGeneratedAt === null && item.thumbnailError === null),
+      (item.thumbnailGeneratedAt === null && item.thumbnailError === null) ||
+      item.preparationState === "preparing",
   );
 
   useEffect(() => {
@@ -176,6 +177,7 @@ export default function App() {
           <TitlePage
             item={findItem(route.mediaId)}
             onRoomCreated={handleRoomCreated}
+            onRefresh={() => void refresh()}
             rooms={rooms}
           />
         ) : null}
@@ -185,6 +187,7 @@ export default function App() {
             clientName={clientName}
             item={findItem(route.mediaId)}
             onClientNameChange={setClientName}
+            onRefresh={() => void refresh()}
             onRoomCreated={handleRoomCreated}
             roomId={route.roomId}
             rooms={rooms}

@@ -3,7 +3,11 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { api, subtitleUrl } from "../api";
 import {
   displayMediaTitle,
+  formatAudioStreamLabel,
+  formatLanguageName,
   formatSignedDelta,
+  formatSubtitleStreamLabel,
+  formatSubtitleTrackLabel,
   formatTimeCode,
 } from "../format";
 import { navigate } from "../router";
@@ -21,6 +25,7 @@ type Props = {
   rooms: Room[];
   clientName: string;
   onClientNameChange: (name: string) => void;
+  onRefresh: () => void;
   onRoomCreated: (room: Room) => void;
 };
 
@@ -48,6 +53,7 @@ export function PlayerPage({
   rooms,
   clientName,
   onClientNameChange,
+  onRefresh,
   onRoomCreated,
 }: Props) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -61,12 +67,32 @@ export function PlayerPage({
   const [playerError, setPlayerError] = useState<string | null>(null);
   const [inviteError, setInviteError] = useState<string | null>(null);
   const [creatingRoom, setCreatingRoom] = useState(false);
+  const [creatingStreamCopy, setCreatingStreamCopy] = useState(false);
+  const [streamCopyError, setStreamCopyError] = useState<string | null>(null);
   const [clockTickMs, setClockTickMs] = useState<number>(monotonicNow());
   const [showSessionPanel, setShowSessionPanel] = useState<boolean>(Boolean(roomId));
 
   const socket = useRoomSocket(roomId, clientName);
   const live = socket.connectionState === "live";
   const { fatalError: sourceError } = usePlayerSource(videoRef, item);
+  const playable = item?.preparationState === "direct" || item?.preparationState === "prepared";
+  const subtitleSources = item
+    ? item.preparationState === "prepared" && item.streamCopy?.subtitleUrl
+      ? [
+          {
+            key: `${item.id}-prepared`,
+            label: preparedSubtitleLabel(item),
+            src: item.streamCopy.subtitleUrl,
+            language: preparedSubtitleLanguage(item),
+          },
+        ]
+      : item.subtitleTracks.map((track, index) => ({
+          key: `${item.id}-${track.relativePath}`,
+          label: formatSubtitleTrackLabel(track, index + 1),
+          src: subtitleUrl(item.id, index),
+          language: track.language ?? undefined,
+        }))
+    : [];
 
   useEffect(() => {
     if (sourceError) {
@@ -84,6 +110,7 @@ export function PlayerPage({
     setSelectedAudioId(null);
     setTracksMenuOpen(false);
     setPlayerError(null);
+    setStreamCopyError(null);
   }, [item?.id]);
 
   // Track the set of embedded audio tracks exposed by the browser. Support is
@@ -104,8 +131,7 @@ export function PlayerPage({
         const track = list[index];
         if (!track) continue;
         const id = track.id || String(index);
-        const label =
-          track.label || track.language?.toUpperCase() || `Track ${index + 1}`;
+        const label = formatBrowserAudioTrackLabel(track, item, index);
         entries.push({ id, label });
         if (track.enabled) activeId = id;
       }
@@ -126,7 +152,7 @@ export function PlayerPage({
       list.removeEventListener("change", rebuild);
       video.removeEventListener("loadedmetadata", rebuild);
     };
-  }, [item?.id]);
+  }, [item?.id, item?.audioStreams]);
 
   // Close the tracks menu on outside click / Escape.
   useEffect(() => {
@@ -358,6 +384,30 @@ export function PlayerPage({
     navigate({ name: "watch", mediaId: item.id, roomId: null });
   }
 
+  async function handleCreateStreamCopy() {
+    if (!item) return;
+
+    try {
+      setCreatingStreamCopy(true);
+      setStreamCopyError(null);
+      await api.createStreamCopy(item.id, {
+        audioStreamIndex:
+          item.audioStreams.find((stream) => stream.default)?.index ??
+          item.audioStreams[0]?.index ??
+          null,
+        subtitleMode: "off",
+        subtitle: null,
+      });
+      onRefresh();
+    } catch (error) {
+      setStreamCopyError(
+        error instanceof Error ? error.message : "Could not create the stream copy.",
+      );
+    } finally {
+      setCreatingStreamCopy(false);
+    }
+  }
+
   if (!item) {
     return (
       <section className="title-missing">
@@ -375,6 +425,46 @@ export function PlayerPage({
 
   const title = displayMediaTitle(item);
 
+  if (!playable) {
+    return (
+      <section className="title-missing">
+        <h1>{title}</h1>
+        <p className="muted">
+          {item.preparationState === "preparing"
+            ? "A stream copy is still being prepared for this title."
+            : item.preparationState === "failed"
+              ? item.streamCopy?.error ??
+                "The last stream copy attempt failed. Create a new one to try again."
+              : item.preparationState === "unsupported"
+                ? "This title is not supported for browser playback."
+                : "This title needs a stream copy before it can be played."}
+        </p>
+        {item.playbackMode === "needsPreparation" ? (
+          <button
+            className="primary-button"
+            disabled={creatingStreamCopy || item.preparationState === "preparing"}
+            onClick={() => void handleCreateStreamCopy()}
+            type="button"
+          >
+            {item.preparationState === "preparing"
+              ? "Preparing…"
+              : creatingStreamCopy
+                ? "Submitting…"
+                : "Create stream copy"}
+          </button>
+        ) : null}
+        {streamCopyError ? <p className="error">{streamCopyError}</p> : null}
+        <button
+          className="ghost-button"
+          onClick={() => navigate({ name: "title", mediaId: item.id })}
+          type="button"
+        >
+          Back to title
+        </button>
+      </section>
+    );
+  }
+
   return (
     <div className="player-page">
       <header className="player-bar">
@@ -387,7 +477,7 @@ export function PlayerPage({
         </button>
 
         <div className="player-bar-right">
-          {item.subtitleTracks.length > 0 || audioTracks.length > 1 ? (
+          {subtitleSources.length > 0 || audioTracks.length > 1 ? (
             <div className="tracks-menu">
               <button
                 aria-expanded={tracksMenuOpen}
@@ -405,7 +495,7 @@ export function PlayerPage({
                   ref={tracksMenuRef}
                   role="menu"
                 >
-                  {item.subtitleTracks.length > 0 ? (
+                  {subtitleSources.length > 0 ? (
                     <div className="tracks-menu-section">
                       <h3>Subtitles</h3>
                       <button
@@ -423,10 +513,10 @@ export function PlayerPage({
                           <span className="tracks-menu-option-marker" aria-hidden="true">•</span>
                         ) : null}
                       </button>
-                      {item.subtitleTracks.map((track, index) => (
+                      {subtitleSources.map((track, index) => (
                         <button
                           className={`tracks-menu-option ${selectedSubtitleIndex === index ? "active" : ""}`}
-                          key={track.relativePath}
+                          key={track.key}
                           onClick={() => {
                             setSelectedSubtitleIndex(index);
                             setTracksMenuOpen(false);
@@ -446,7 +536,7 @@ export function PlayerPage({
 
                   {audioTracks.length > 1 ? (
                     <>
-                      {item.subtitleTracks.length > 0 ? (
+                      {subtitleSources.length > 0 ? (
                         <div className="tracks-menu-divider" />
                       ) : null}
                       <div className="tracks-menu-section">
@@ -513,13 +603,13 @@ export function PlayerPage({
             preload="metadata"
             ref={videoRef}
           >
-            {item.subtitleTracks.map((track, index) => (
+            {subtitleSources.map((track) => (
               <track
-                key={`${item.id}-${track.relativePath}`}
+                key={track.key}
                 kind="subtitles"
                 label={track.label}
-                src={subtitleUrl(item.id, index)}
-                srcLang={track.language ?? undefined}
+                src={track.src}
+                srcLang={track.language}
               />
             ))}
           </video>
@@ -655,4 +745,53 @@ function labelForConnection(state: string) {
     default:
       return "Offline";
   }
+}
+
+function formatBrowserAudioTrackLabel(
+  track: AudioTrackLike,
+  item: MediaItem | null,
+  index: number,
+) {
+  const indexedStream = item?.audioStreams[index];
+  if (indexedStream) {
+    return formatAudioStreamLabel(indexedStream, index + 1);
+  }
+
+  const label = track.label?.trim();
+  const language = formatLanguageName(track.language);
+  return label || language || `Track ${index + 1}`;
+}
+
+function preparedSubtitleLabel(item: MediaItem) {
+  const selection = item.streamCopy?.subtitle;
+  if (!selection) return "Prepared subtitles";
+
+  if (selection.kind === "sidecar") {
+    const track = item.subtitleTracks[selection.index];
+    return track
+      ? `${formatSubtitleTrackLabel(track, selection.index + 1)} · prepared`
+      : "Prepared subtitles";
+  }
+
+  const streamIndex = item.subtitleStreams.findIndex(
+    (stream) => stream.index === selection.index,
+  );
+  const stream = streamIndex >= 0 ? item.subtitleStreams[streamIndex] : null;
+  return stream
+    ? `${formatSubtitleStreamLabel(stream, streamIndex + 1)} · prepared`
+    : "Prepared subtitles";
+}
+
+function preparedSubtitleLanguage(item: MediaItem) {
+  const selection = item.streamCopy?.subtitle;
+  if (!selection) return undefined;
+
+  if (selection.kind === "sidecar") {
+    return item.subtitleTracks[selection.index]?.language ?? undefined;
+  }
+
+  return (
+    item.subtitleStreams.find((stream) => stream.index === selection.index)?.language ??
+    undefined
+  );
 }
