@@ -1033,6 +1033,24 @@ impl HlsSessionManager {
             });
         }
 
+        // Master playlist is synthesized and written before ffmpeg startup
+        // completes. Serve it immediately so playback bootstrap never waits on
+        // transcoder readiness.
+        if filename == MASTER_FILENAME {
+            let path = session.dir.join(filename);
+            if !fs::try_exists(&path).await.unwrap_or(false) {
+                return Err(HlsError::NotFound);
+            }
+            session.in_flight.fetch_add(1, Ordering::Relaxed);
+            return Ok(HlsServeResult {
+                body: HlsServeBody::File(path),
+                content_type: content_type_for_filename(filename),
+                _guard: InFlightGuard {
+                    session: session.clone(),
+                },
+            });
+        }
+
         // Deep-seek fast path: if the request names a specific video
         // segment and that segment is outside the current encoder's
         // catch-up window, respawn ffmpeg at that offset instead of
@@ -3411,7 +3429,7 @@ seg_0_00100.m4s\n";
         };
 
         let result = manager
-            .serve(&item, MASTER_FILENAME, BrowserHint::Generic)
+            .serve(&item, VIDEO_VARIANT_FILENAME, BrowserHint::Generic)
             .await;
         match result {
             Err(HlsError::SpawnFailed(message)) => {
