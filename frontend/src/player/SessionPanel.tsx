@@ -6,9 +6,6 @@ type Props = {
   socket: RoomSocketApi;
   clientName: string;
   onClientNameChange: (name: string) => void;
-  onPlay: () => void;
-  onPause: () => void;
-  onSeek: () => void;
   onCatchUp: () => void;
   onLeave: () => void;
   rooms: Room[];
@@ -19,9 +16,6 @@ export function SessionPanel({
   socket,
   clientName,
   onClientNameChange,
-  onPlay,
-  onPause,
-  onSeek,
   onCatchUp,
   onLeave,
   rooms,
@@ -56,17 +50,9 @@ export function SessionPanel({
         />
       </label>
 
-      <div className="session-cta-row">
-        <button className="ghost-button" disabled={!live} onClick={onPlay} type="button">
-          Sync play
-        </button>
-        <button className="ghost-button" disabled={!live} onClick={onPause} type="button">
-          Sync pause
-        </button>
-        <button className="ghost-button" disabled={!live} onClick={onSeek} type="button">
-          Sync seek
-        </button>
-      </div>
+      <p className="muted session-hint">
+        Play, pause, and scrub from the video — everyone in the room follows.
+      </p>
 
       <button
         className="ghost-button wide"

@@ -862,15 +862,13 @@ code {
   color: var(--text);
 }
 
-.session-cta-row {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 0.5rem;
-}
-
-.session-cta-row .ghost-button {
-  padding: 0.55rem 0.65rem;
-  font-size: 0.84rem;
+.session-hint {
+  font-size: 0.85rem;
+  padding: 0.65rem 0.75rem;
+  background: rgba(229, 160, 13, 0.08);
+  border: 1px solid rgba(229, 160, 13, 0.2);
+  border-radius: 8px;
+  color: var(--text);
 }
 
 .session-activity {

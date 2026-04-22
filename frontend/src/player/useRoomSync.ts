@@ -5,6 +5,7 @@ import {
   deriveExpectedPosition,
   monotonicNow,
   type RoomSocketApi,
+  type RoomSocketCommand,
 } from "../useRoomSocket";
 
 type Options = {
@@ -14,11 +15,13 @@ type Options = {
   onAutoplayBlocked: (message: string) => void;
 };
 
-type SyncableCommand = "play" | "pause" | "seek";
+// How far local playback has to diverge from the room clock before a local
+// `seeked` event is treated as user intent rather than the echo of our own
+// follow-room effect writing `video.currentTime` back.
+const SEEK_ECHO_TOLERANCE_SECONDS = 0.5;
 
 export type UseRoomSync = {
   clockTickMs: number;
-  sendCommand: (type: SyncableCommand) => void;
   catchUp: () => void;
 };
 
@@ -31,6 +34,15 @@ export function useRoomSync({
   const live = socket.connectionState === "live";
   const nudgeResetRef = useRef<number | null>(null);
   const [clockTickMs, setClockTickMs] = useState<number>(monotonicNow());
+
+  // Mirror of the latest authoritative state so the native-event forwarders
+  // below don't need to tear down their listeners on every socket update.
+  const roomRef = useRef(socket.room);
+  const receiptRef = useRef(socket.authoritativeReceiptAtMs);
+  const sendRef = useRef(socket.send);
+  roomRef.current = socket.room;
+  receiptRef.current = socket.authoritativeReceiptAtMs;
+  sendRef.current = socket.send;
 
   useEffect(() => {
     const tickId = window.setInterval(() => {
@@ -145,25 +157,51 @@ export function useRoomSync({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [socket.lastCorrection, live, item?.id, socket.room]);
 
-  const sendCommand = useCallback(
-    (type: SyncableCommand) => {
-      const video = videoRef.current;
-      if (!video) return;
-      const positionSeconds = Number(video.currentTime.toFixed(1));
-      switch (type) {
-        case "play":
-          socket.send({ type: "play", positionSeconds });
-          return;
-        case "pause":
-          socket.send({ type: "pause", positionSeconds });
-          return;
-        case "seek":
-          socket.send({ type: "seek", positionSeconds });
-          return;
-      }
-    },
-    [socket, videoRef],
-  );
+  // Forward native video-element play/pause/seeked events as room intent.
+  // Compare against the authoritative state so programmatic updates we apply
+  // from the follow-room effect don't round-trip back to the server.
+  useEffect(() => {
+    if (!live) return;
+    const video = videoRef.current;
+    if (!video) return;
+
+    const send = (command: RoomSocketCommand) => sendRef.current(command);
+    const positionNow = () => Number(video.currentTime.toFixed(1));
+
+    const handlePlay = () => {
+      const room = roomRef.current;
+      if (!room || room.playbackState.status === "playing") return;
+      send({ type: "play", positionSeconds: positionNow() });
+    };
+
+    const handlePause = () => {
+      const room = roomRef.current;
+      if (!room || room.playbackState.status === "paused") return;
+      send({ type: "pause", positionSeconds: positionNow() });
+    };
+
+    const handleSeeked = () => {
+      const room = roomRef.current;
+      if (!room) return;
+      const expected = deriveExpectedPosition(
+        room,
+        receiptRef.current,
+        monotonicNow(),
+      );
+      if (Math.abs(video.currentTime - expected) < SEEK_ECHO_TOLERANCE_SECONDS) return;
+      send({ type: "seek", positionSeconds: positionNow() });
+    };
+
+    video.addEventListener("play", handlePlay);
+    video.addEventListener("pause", handlePause);
+    video.addEventListener("seeked", handleSeeked);
+
+    return () => {
+      video.removeEventListener("play", handlePlay);
+      video.removeEventListener("pause", handlePause);
+      video.removeEventListener("seeked", handleSeeked);
+    };
+  }, [live, videoRef]);
 
   const catchUp = useCallback(() => {
     if (!socket.room || socket.authoritativeReceiptAtMs === null) return;
@@ -184,5 +222,5 @@ export function useRoomSync({
     }
   }, [socket.room, socket.authoritativeReceiptAtMs, videoRef, onAutoplayBlocked]);
 
-  return { clockTickMs, sendCommand, catchUp };
+  return { clockTickMs, catchUp };
 }

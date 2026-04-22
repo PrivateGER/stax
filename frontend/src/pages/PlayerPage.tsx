@@ -65,7 +65,7 @@ export function PlayerPage({
   const socket = useRoomSocket(roomId, clientName);
   const watchTogether = useWatchTogether(item, onRoomCreated);
   const audio = useAudioTracks(videoRef, item);
-  const { clockTickMs, sendCommand, catchUp } = useRoomSync({
+  const { clockTickMs, catchUp } = useRoomSync({
     videoRef,
     socket,
     item,
@@ -231,9 +231,6 @@ export function PlayerPage({
             onCatchUp={catchUp}
             onClientNameChange={onClientNameChange}
             onLeave={() => navigate({ name: "watch", mediaId: item.id, roomId: null })}
-            onPause={() => sendCommand("pause")}
-            onPlay={() => sendCommand("play")}
-            onSeek={() => sendCommand("seek")}
             rooms={rooms}
             socket={socket}
           />
