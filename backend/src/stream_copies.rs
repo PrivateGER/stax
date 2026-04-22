@@ -1,14 +1,17 @@
 use std::{
+    collections::HashMap,
     env,
     path::{Path, PathBuf},
+    process::Stdio,
     sync::Arc,
     time::Instant,
 };
 
 use tokio::{
     fs,
+    io::{AsyncBufReadExt, AsyncReadExt, BufReader},
     process::Command,
-    sync::{Semaphore, mpsc},
+    sync::{RwLock, Semaphore, mpsc},
 };
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -16,13 +19,30 @@ use uuid::Uuid;
 use crate::{
     clock::format_timestamp,
     library::{LibraryService, is_browser_safe_video_codec},
-    persistence::{PendingStreamCopy, Persistence, StreamCopyRecord},
-    protocol::{MediaItem, SubtitleMode, SubtitleSourceKind, SubtitleTrack},
+    persistence::{PendingStreamCopy, Persistence, StreamCopyRecord, stream_copy_summary_for},
+    protocol::{
+        MediaItem, StreamCopyStatus, StreamCopySummary, SubtitleMode, SubtitleSourceKind,
+        SubtitleTrack,
+    },
     streaming::convert_srt_to_vtt,
 };
 
 const DEFAULT_STREAM_COPY_CACHE_DIR: &str = "syncplay-stream-copies";
 const DEFAULT_WORKERS: usize = 1;
+
+type SharedStreamCopyProgress = Arc<RwLock<HashMap<Uuid, StreamCopyProgressSnapshot>>>;
+
+#[derive(Clone, Debug, Default)]
+struct StreamCopyProgressSnapshot {
+    out_time_micros: Option<u64>,
+    speed: Option<f32>,
+}
+
+#[derive(Debug, Default)]
+struct FfmpegProgressBlock {
+    out_time_micros: Option<u64>,
+    speed: Option<f32>,
+}
 
 #[derive(Clone, Debug)]
 pub struct StreamCopyConfig {
@@ -71,6 +91,7 @@ impl StreamCopyJob {
 #[derive(Clone)]
 pub struct StreamCopyWorkerPool {
     sender: mpsc::UnboundedSender<StreamCopyJob>,
+    progress: SharedStreamCopyProgress,
 }
 
 impl StreamCopyWorkerPool {
@@ -82,6 +103,8 @@ impl StreamCopyWorkerPool {
         let (sender, mut receiver) = mpsc::unbounded_channel::<StreamCopyJob>();
         let semaphore = Arc::new(Semaphore::new(config.max_concurrent.max(1)));
         let config = Arc::new(config);
+        let progress = Arc::new(RwLock::new(HashMap::new()));
+        let worker_progress = Arc::clone(&progress);
         info!(
             workers = config.max_concurrent,
             ffmpeg = ?config.ffmpeg_command,
@@ -98,15 +121,16 @@ impl StreamCopyWorkerPool {
                 let config = Arc::clone(&config);
                 let persistence = persistence.clone();
                 let library = library.clone();
+                let progress = Arc::clone(&worker_progress);
 
                 tokio::spawn(async move {
-                    process_job(job, &config, &persistence, &library).await;
+                    process_job(job, &config, &persistence, &library, &progress).await;
                     drop(permit);
                 });
             }
         });
 
-        Self { sender }
+        Self { sender, progress }
     }
 
     pub fn enqueue(&self, job: StreamCopyJob) {
@@ -126,6 +150,28 @@ impl StreamCopyWorkerPool {
             self.enqueue(StreamCopyJob::from_pending(entry));
         }
     }
+
+    pub async fn summary_for(
+        &self,
+        media_id: Uuid,
+        duration_seconds: Option<f64>,
+        record: &StreamCopyRecord,
+    ) -> StreamCopySummary {
+        let mut summary = stream_copy_summary_for(media_id, record);
+        if record.status == StreamCopyStatus::Running {
+            if let Some(progress) = self.progress_snapshot(media_id).await {
+                summary.progress_ratio =
+                    progress_ratio_from_snapshot(duration_seconds, progress.out_time_micros);
+                summary.progress_speed = progress.speed;
+            }
+        }
+        summary
+    }
+
+    async fn progress_snapshot(&self, media_id: Uuid) -> Option<StreamCopyProgressSnapshot> {
+        let progress = self.progress.read().await;
+        progress.get(&media_id).cloned()
+    }
 }
 
 async fn process_job(
@@ -133,9 +179,11 @@ async fn process_job(
     config: &StreamCopyConfig,
     persistence: &Persistence,
     library: &LibraryService,
+    progress: &SharedStreamCopyProgress,
 ) {
     let media_id = job.media_id;
     let now = format_timestamp(time::OffsetDateTime::now_utc());
+    clear_progress(progress, media_id).await;
 
     let Some(ffmpeg_command) = config.ffmpeg_command.as_deref() else {
         let _ = persistence
@@ -191,9 +239,10 @@ async fn process_job(
     };
 
     let started = Instant::now();
-    match build_stream_copy(&media_item, &copy, cache_dir, ffmpeg_command).await {
+    match build_stream_copy(&media_item, &copy, cache_dir, ffmpeg_command, progress).await {
         Ok(outcome) => {
             let now = format_timestamp(time::OffsetDateTime::now_utc());
+            clear_progress(progress, media_id).await;
             if let Err(error) = persistence
                 .mark_stream_copy_ready(
                     media_id,
@@ -216,6 +265,7 @@ async fn process_job(
         Err(error_message) => {
             warn!(%media_id, error = %error_message, "stream copy failed");
             let now = format_timestamp(time::OffsetDateTime::now_utc());
+            clear_progress(progress, media_id).await;
             let _ = persistence
                 .mark_stream_copy_failed(media_id, &error_message, &now)
                 .await;
@@ -234,6 +284,7 @@ async fn build_stream_copy(
     copy: &StreamCopyRecord,
     cache_dir: &Path,
     ffmpeg_command: &Path,
+    progress: &SharedStreamCopyProgress,
 ) -> Result<StreamCopyOutcome, String> {
     let media_path = crate::streaming::resolve_media_path(media_item);
     let output_dir = stream_copy_output_dir(cache_dir, media_item.id);
@@ -269,6 +320,7 @@ async fn build_stream_copy(
         &temp_output_path,
         selected_audio_index,
         burned_filter.as_deref(),
+        progress,
     )
     .await?;
 
@@ -384,6 +436,7 @@ async fn run_ffmpeg_stream_copy(
     output_path: &Path,
     selected_audio_index: Option<u32>,
     burned_filter: Option<&str>,
+    progress: &SharedStreamCopyProgress,
 ) -> Result<(), String> {
     let has_video = media_item.video_codec.is_some();
     let mut command = Command::new(ffmpeg_command);
@@ -391,9 +444,14 @@ async fn run_ffmpeg_stream_copy(
         .arg("-y")
         .arg("-loglevel")
         .arg("error")
+        .arg("-nostats")
+        .arg("-progress")
+        .arg("pipe:1")
         .arg("-nostdin")
         .arg("-i")
-        .arg(media_path);
+        .arg(media_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
     if has_video {
         command.arg("-map").arg("0:v:0?");
@@ -446,15 +504,142 @@ async fn run_ffmpeg_stream_copy(
         .arg("+faststart")
         .arg(output_path);
 
-    let output = command
-        .output()
-        .await
+    let mut child = command
+        .spawn()
         .map_err(|error| format!("failed to start ffmpeg stream copy: {error}"))?;
-    if !output.status.success() {
-        return Err(ffmpeg_error("stream copy failed", &output.stderr));
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "failed to capture ffmpeg progress output.".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "failed to capture ffmpeg error output.".to_string())?;
+    let media_id = media_item.id;
+    let progress_reader =
+        tokio::spawn(read_ffmpeg_progress(media_id, Arc::clone(progress), stdout));
+    let stderr_reader = tokio::spawn(read_ffmpeg_stderr(stderr));
+
+    let status = child
+        .wait()
+        .await
+        .map_err(|error| format!("failed to wait for ffmpeg stream copy: {error}"))?;
+
+    if let Err(error) = progress_reader.await {
+        warn!(%media_id, %error, "ffmpeg progress reader task failed");
+    }
+
+    let stderr = match stderr_reader.await {
+        Ok(Ok(stderr)) => stderr,
+        Ok(Err(error)) => {
+            warn!(%media_id, %error, "failed to read ffmpeg stderr");
+            Vec::new()
+        }
+        Err(error) => {
+            warn!(%media_id, %error, "ffmpeg stderr reader task failed");
+            Vec::new()
+        }
+    };
+
+    if !status.success() {
+        return Err(ffmpeg_error("stream copy failed", &stderr));
     }
 
     Ok(())
+}
+
+async fn read_ffmpeg_progress(
+    media_id: Uuid,
+    progress: SharedStreamCopyProgress,
+    stdout: tokio::process::ChildStdout,
+) {
+    let mut lines = BufReader::new(stdout).lines();
+    let mut block = FfmpegProgressBlock::default();
+
+    loop {
+        match lines.next_line().await {
+            Ok(Some(line)) => {
+                update_progress_block(&mut block, &line);
+                if let Some(marker) = line.strip_prefix("progress=") {
+                    write_progress_snapshot(&progress, media_id, &block).await;
+                    if marker == "end" {
+                        break;
+                    }
+                    block = FfmpegProgressBlock::default();
+                }
+            }
+            Ok(None) => break,
+            Err(error) => {
+                warn!(%media_id, %error, "failed to read ffmpeg progress output");
+                break;
+            }
+        }
+    }
+}
+
+async fn read_ffmpeg_stderr(
+    mut stderr: tokio::process::ChildStderr,
+) -> Result<Vec<u8>, std::io::Error> {
+    let mut bytes = Vec::new();
+    stderr.read_to_end(&mut bytes).await?;
+    Ok(bytes)
+}
+
+fn update_progress_block(block: &mut FfmpegProgressBlock, line: &str) {
+    let Some((key, value)) = line.split_once('=') else {
+        return;
+    };
+
+    match key {
+        // Despite the key name, ffmpeg emits this value in microseconds.
+        "out_time_ms" => {
+            block.out_time_micros = value.parse::<u64>().ok();
+        }
+        "speed" => {
+            block.speed = parse_ffmpeg_speed(value);
+        }
+        _ => {}
+    }
+}
+
+fn parse_ffmpeg_speed(value: &str) -> Option<f32> {
+    value
+        .trim()
+        .strip_suffix('x')
+        .and_then(|value| value.parse::<f32>().ok())
+}
+
+async fn write_progress_snapshot(
+    progress: &SharedStreamCopyProgress,
+    media_id: Uuid,
+    block: &FfmpegProgressBlock,
+) {
+    if block.out_time_micros.is_none() && block.speed.is_none() {
+        return;
+    }
+
+    let mut progress_map = progress.write().await;
+    progress_map.insert(
+        media_id,
+        StreamCopyProgressSnapshot {
+            out_time_micros: block.out_time_micros,
+            speed: block.speed,
+        },
+    );
+}
+
+async fn clear_progress(progress: &SharedStreamCopyProgress, media_id: Uuid) {
+    let mut progress_map = progress.write().await;
+    progress_map.remove(&media_id);
+}
+
+fn progress_ratio_from_snapshot(
+    duration_seconds: Option<f64>,
+    out_time_micros: Option<u64>,
+) -> Option<f32> {
+    let duration_seconds = duration_seconds.filter(|value| *value > 0.0)?;
+    let out_time_seconds = out_time_micros? as f64 / 1_000_000.0;
+    Some((out_time_seconds / duration_seconds).clamp(0.0, 1.0) as f32)
 }
 
 fn selected_audio_stream_index(
@@ -574,7 +759,10 @@ pub fn stream_copy_output_dir(cache_dir: &Path, media_id: Uuid) -> PathBuf {
 }
 
 fn temp_path_for_final(final_path: &Path) -> PathBuf {
-    let parent = final_path.parent().map(Path::to_path_buf).unwrap_or_default();
+    let parent = final_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
     let file_name = final_path
         .file_name()
         .and_then(|value| value.to_str())

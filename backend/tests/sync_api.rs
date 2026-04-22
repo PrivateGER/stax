@@ -19,7 +19,7 @@ use syncplay_backend::{
     persistence::Persistence,
     protocol::{
         CreateStreamCopyRequest, DriftCorrectionAction, LibraryResponse, LibraryScanResponse, Room,
-        RoomsResponse, ServerEvent,
+        RoomsResponse, ServerEvent, StreamCopyStatus, StreamCopySummary,
     },
     seeded_state,
 };
@@ -228,6 +228,45 @@ impl TestServer {
             .send()
             .await
             .unwrap()
+    }
+
+    async fn stream_copy_summary(&self, media_id: &str) -> StreamCopySummary {
+        self.client
+            .get(format!(
+                "{}/api/media/{media_id}/stream-copy",
+                self.base_url
+            ))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
+    }
+
+    async fn wait_for_stream_copy_summary<F>(
+        &self,
+        media_id: &str,
+        timeout_duration: Duration,
+        mut predicate: F,
+    ) -> StreamCopySummary
+    where
+        F: FnMut(&StreamCopySummary) -> bool,
+    {
+        let deadline = std::time::Instant::now() + timeout_duration;
+        loop {
+            let summary = self.stream_copy_summary(media_id).await;
+            if predicate(&summary) {
+                return summary;
+            }
+
+            if std::time::Instant::now() >= deadline {
+                panic!("stream copy summary did not match predicate within {timeout_duration:?}");
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
     }
 
     async fn wait_for_preparation_state(
@@ -2353,6 +2392,24 @@ printf 'STREAMCOPY' > "$output"
 "#;
 
 #[cfg(unix)]
+const FFMPEG_STREAM_COPY_PROGRESS_STUB: &str = r#"#!/usr/bin/env bash
+set -euo pipefail
+cat <<'EOF'
+out_time_ms=60000000
+speed=1.50x
+progress=continue
+EOF
+sleep 2
+cat <<'EOF'
+out_time_ms=120000000
+speed=1.00x
+progress=end
+EOF
+output="${!#}"
+printf 'STREAMCOPY' > "$output"
+"#;
+
+#[cfg(unix)]
 fn stream_copy_config(
     root: PathBuf,
     probe_script: PathBuf,
@@ -2511,6 +2568,73 @@ async fn create_stream_copy_exposes_preparing_state_while_job_runs() {
     assert_eq!(
         preparing.preparation_state,
         syncplay_backend::protocol::PreparationState::Preparing
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn get_stream_copy_exposes_live_progress_while_job_runs() {
+    let temp_dir = TempDir::new().unwrap();
+    let root = temp_dir.path().join("library");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("movie.mkv"), b"synthetic").unwrap();
+
+    let probe_script = write_probe_script(
+        &temp_dir,
+        "probe-needs-preparation.sh",
+        NEEDS_PREPARATION_PROBE_JSON,
+    );
+    let ffmpeg_stub = write_ffmpeg_stub(
+        &temp_dir,
+        "ffmpeg-progress.sh",
+        FFMPEG_STREAM_COPY_PROGRESS_STUB,
+    );
+    let cache_dir = temp_dir.path().join("stream-copies");
+    let server = TestServer::spawn_with_library_config(stream_copy_config(
+        root,
+        probe_script,
+        Some(ffmpeg_stub),
+        cache_dir,
+    ))
+    .await;
+
+    server.scan_library().await;
+    let item = server
+        .wait_for_probes_complete()
+        .await
+        .items
+        .into_iter()
+        .next()
+        .unwrap();
+
+    let response = server
+        .create_stream_copy(
+            &item.id.to_string(),
+            &CreateStreamCopyRequest {
+                audio_stream_index: item.audio_streams.first().map(|stream| stream.index),
+                subtitle_mode: syncplay_backend::protocol::SubtitleMode::Off,
+                subtitle: None,
+            },
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let summary = server
+        .wait_for_stream_copy_summary(&item.id.to_string(), Duration::from_secs(5), |summary| {
+            summary.status == StreamCopyStatus::Running && summary.progress_ratio.is_some()
+        })
+        .await;
+
+    assert_eq!(summary.status, StreamCopyStatus::Running);
+    let ratio = summary.progress_ratio.expect("running progress ratio");
+    assert!(
+        (ratio - 0.5).abs() < 0.01,
+        "expected progress ratio close to 0.5, got {ratio}"
+    );
+    let speed = summary.progress_speed.expect("running progress speed");
+    assert!(
+        (speed - 1.5).abs() < 0.01,
+        "expected progress speed close to 1.5, got {speed}"
     );
 }
 

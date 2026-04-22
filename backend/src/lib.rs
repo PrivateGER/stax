@@ -678,10 +678,18 @@ async fn get_stream_copy(
         }
     };
 
-    media_item
-        .stream_copy
-        .map(Json)
-        .ok_or_else(|| ApiError::not_found("No current stream copy exists for this media."))
+    let Some(record) = load_current_stream_copy_record(&state, &media_item).await else {
+        return Err(ApiError::not_found(
+            "No current stream copy exists for this media.",
+        ));
+    };
+
+    let summary = state
+        .stream_copies
+        .summary_for(media_item.id, media_item.duration_seconds, &record)
+        .await;
+
+    Ok(Json(summary))
 }
 
 async fn create_stream_copy(
@@ -721,9 +729,11 @@ async fn create_stream_copy(
                 StreamCopyStatus::Queued | StreamCopyStatus::Running | StreamCopyStatus::Ready
             )
         {
-            if let Some(summary) = media_item.stream_copy {
-                return Ok(Json(summary));
-            }
+            let summary = state
+                .stream_copies
+                .summary_for(media_item.id, media_item.duration_seconds, &existing)
+                .await;
+            return Ok(Json(summary));
         }
         if !same_request
             && matches!(
@@ -760,15 +770,24 @@ async fn create_stream_copy(
         })?;
     state.stream_copies.enqueue(StreamCopyJob { media_id });
 
-    let refreshed = state.library.media_item(media_id).await.map_err(|error| {
-        warn!(%error, %media_id, "failed to reload media item after stream copy request");
-        ApiError::internal("Failed to load stream copy state.")
-    })?;
-    let Some(summary) = refreshed.and_then(|item| item.stream_copy) else {
+    let refreshed = state
+        .persistence
+        .find_stream_copy(media_id)
+        .await
+        .map_err(|error| {
+            warn!(%error, %media_id, "failed to load queued stream copy record");
+            ApiError::internal("Failed to load stream copy state.")
+        })?;
+    let Some(record) = refreshed else {
         return Err(ApiError::internal(
             "Failed to load the queued stream copy state.",
         ));
     };
+
+    let summary = state
+        .stream_copies
+        .summary_for(media_item.id, media_item.duration_seconds, &record)
+        .await;
 
     Ok(Json(summary))
 }

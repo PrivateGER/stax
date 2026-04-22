@@ -271,7 +271,7 @@ pub struct StreamCopySubtitleSelection {
     pub index: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct StreamCopySummary {
     pub status: StreamCopyStatus,
@@ -280,6 +280,8 @@ pub struct StreamCopySummary {
     pub subtitle: Option<StreamCopySubtitleSelection>,
     pub subtitle_url: Option<String>,
     pub error: Option<String>,
+    pub progress_ratio: Option<f32>,
+    pub progress_speed: Option<f32>,
     pub updated_at: String,
 }
 

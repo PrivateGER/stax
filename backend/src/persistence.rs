@@ -1572,7 +1572,10 @@ fn map_row_to_stream_copy_record(
     })
 }
 
-fn stream_copy_summary_for(media_id: Uuid, record: &StreamCopyRecord) -> StreamCopySummary {
+pub(crate) fn stream_copy_summary_for(
+    media_id: Uuid,
+    record: &StreamCopyRecord,
+) -> StreamCopySummary {
     let subtitle = match (record.subtitle_kind, record.subtitle_index) {
         (Some(kind), Some(index)) => Some(StreamCopySubtitleSelection { kind, index }),
         _ => None,
@@ -1591,6 +1594,8 @@ fn stream_copy_summary_for(media_id: Uuid, record: &StreamCopyRecord) -> StreamC
         subtitle,
         subtitle_url,
         error: record.error.clone(),
+        progress_ratio: None,
+        progress_speed: None,
         updated_at: record.updated_at.clone(),
     }
 }
