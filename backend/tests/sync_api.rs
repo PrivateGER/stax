@@ -1904,6 +1904,47 @@ fn write_ffmpeg_stub(temp_dir: &TempDir, name: &str, contents: &str) -> PathBuf 
 }
 
 #[cfg(unix)]
+fn hls_respawn_ffmpeg_stub_script(run_forever: bool) -> String {
+    let tail = if run_forever {
+        r#"
+trap 'exit 0' TERM INT
+while true; do sleep 1; done
+"#
+    } else {
+        "exit 0\n"
+    };
+    format!(
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+
+start_number=0
+while (($#)); do
+  if [[ "$1" == "-start_number" ]]; then
+    shift
+    start_number="${{1:-0}}"
+  fi
+  shift || true
+done
+
+segment="$(printf 'seg_0_%05d.m4s' "$start_number")"
+printf 'init' > "init_0.mp4"
+printf 'segment-%s' "$start_number" > "$segment"
+cat > "stream_0.m3u8" <<EOF
+#EXTM3U
+#EXT-X-VERSION:7
+#EXT-X-TARGETDURATION:2
+#EXT-X-MEDIA-SEQUENCE:$start_number
+#EXT-X-PLAYLIST-TYPE:VOD
+#EXT-X-INDEPENDENT-SEGMENTS
+#EXT-X-MAP:URI="init_0.mp4"
+#EXTINF:2.000000,
+$segment
+EOF
+{tail}"#
+    )
+}
+
+#[cfg(unix)]
 const SUCCESSFUL_PROBE_JSON: &str = r#"#!/usr/bin/env bash
 set -euo pipefail
 cat <<'JSON'
@@ -2878,33 +2919,7 @@ JSON
     let ffmpeg_stub = write_ffmpeg_stub(
         &temp_dir,
         "ffmpeg-hls-stub.sh",
-        r###"#!/usr/bin/env bash
-set -euo pipefail
-
-start_number=0
-while (($#)); do
-  if [[ "$1" == "-start_number" ]]; then
-    shift
-    start_number="${1:-0}"
-  fi
-  shift || true
-done
-
-segment="$(printf 'seg_0_%05d.m4s' "$start_number")"
-printf 'init' > "init_0.mp4"
-printf 'segment-%s' "$start_number" > "$segment"
-cat > "stream_0.m3u8" <<EOF
-#EXTM3U
-#EXT-X-VERSION:7
-#EXT-X-TARGETDURATION:2
-#EXT-X-MAP:URI="init_0.mp4"
-#EXTINF:2.000,
-$segment
-EOF
-
-trap 'exit 0' TERM INT
-while true; do sleep 1; done
-"###,
+        &hls_respawn_ffmpeg_stub_script(true),
     );
 
     let library = LibraryConfig::from_paths(vec![root]).with_probe_command(probe);
@@ -2991,6 +3006,122 @@ while true; do sleep 1; done
         manager.total_spawn_count().await,
         before_throttle,
         "throttled request must not spawn a new ffmpeg process"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn hls_respawn_shim_matches_real_ffmpeg_start_number_shape() {
+    if !external_av_tools_available() {
+        eprintln!("skipping: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+
+    let temp_dir = TempDir::new().unwrap();
+    let input_path = temp_dir.path().join("input.mkv");
+    generate_h264_ac3_mkv(&input_path);
+
+    let start_number = 35_u32;
+    let expected_segment = format!("seg_0_{start_number:05}.m4s");
+
+    let real_dir = temp_dir.path().join("real");
+    fs::create_dir_all(&real_dir).unwrap();
+    let real_status = std::process::Command::new("ffmpeg")
+        .arg("-y")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-nostdin")
+        .arg("-i")
+        .arg(&input_path)
+        .arg("-map")
+        .arg("0:v:0?")
+        .arg("-map")
+        .arg("0:a:0")
+        .arg("-sn")
+        .arg("-c:v")
+        .arg("copy")
+        .arg("-c:a")
+        .arg("aac")
+        .arg("-b:a")
+        .arg("192k")
+        .arg("-ac")
+        .arg("2")
+        .arg("-f")
+        .arg("hls")
+        .arg("-hls_time")
+        .arg("2")
+        .arg("-hls_list_size")
+        .arg("0")
+        .arg("-hls_playlist_type")
+        .arg("vod")
+        .arg("-hls_segment_type")
+        .arg("fmp4")
+        .arg("-hls_flags")
+        .arg("independent_segments+temp_file")
+        .arg("-start_number")
+        .arg(start_number.to_string())
+        .arg("-hls_segment_filename")
+        .arg(real_dir.join("seg_%v_%05d.m4s"))
+        .arg("-var_stream_map")
+        .arg("v:0,agroup:aud a:0,agroup:aud,name:a0_eng,default:yes")
+        .arg(real_dir.join("stream_%v.m3u8"))
+        .status()
+        .unwrap();
+    assert!(
+        real_status.success(),
+        "real ffmpeg invocation failed with status {real_status}"
+    );
+
+    let shim_dir = temp_dir.path().join("shim");
+    fs::create_dir_all(&shim_dir).unwrap();
+    let shim = write_ffmpeg_stub(
+        &temp_dir,
+        "ffmpeg-hls-shape.sh",
+        &hls_respawn_ffmpeg_stub_script(false),
+    );
+    let shim_status = std::process::Command::new(&shim)
+        .arg("-start_number")
+        .arg(start_number.to_string())
+        .current_dir(&shim_dir)
+        .status()
+        .unwrap();
+    assert!(
+        shim_status.success(),
+        "shim invocation failed with status {shim_status}"
+    );
+
+    let real_playlist = fs::read_to_string(real_dir.join("stream_0.m3u8")).unwrap();
+    let shim_playlist = fs::read_to_string(shim_dir.join("stream_0.m3u8")).unwrap();
+
+    let real_map_uri = real_playlist
+        .lines()
+        .find_map(|line| hls_attr_value(line, "URI"))
+        .expect("real playlist should include map URI");
+    let shim_map_uri = shim_playlist
+        .lines()
+        .find_map(|line| hls_attr_value(line, "URI"))
+        .expect("shim playlist should include map URI");
+    assert_eq!(real_map_uri, "init_0.mp4");
+    assert_eq!(shim_map_uri, "init_0.mp4");
+
+    let real_segment = real_playlist
+        .lines()
+        .find(|line| line.ends_with(".m4s"))
+        .expect("real playlist should include a segment");
+    let shim_segment = shim_playlist
+        .lines()
+        .find(|line| line.ends_with(".m4s"))
+        .expect("shim playlist should include a segment");
+    assert_eq!(real_segment, expected_segment);
+    assert_eq!(shim_segment, expected_segment);
+
+    assert!(
+        real_playlist.contains(&format!("#EXT-X-MEDIA-SEQUENCE:{start_number}")),
+        "real playlist should carry media sequence"
+    );
+    assert!(
+        shim_playlist.contains(&format!("#EXT-X-MEDIA-SEQUENCE:{start_number}")),
+        "shim playlist should carry media sequence"
     );
 }
 
