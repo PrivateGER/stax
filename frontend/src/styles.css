@@ -275,6 +275,21 @@ code {
   border-color: var(--accent);
 }
 
+.name-input-row {
+  display: flex;
+  gap: 0.4rem;
+}
+
+.name-input-row input {
+  flex: 1;
+  min-width: 0;
+}
+
+.name-input-row .ghost-button {
+  padding: 0.55rem 0.9rem;
+  font-size: 0.85rem;
+}
+
 /* ========== Library page ========== */
 
 .library-page {
@@ -736,14 +751,198 @@ code {
   min-width: 0;
   overflow: hidden;
   flex: 1;
+  display: flex;
 }
 
-.player-video {
-  display: block;
+/* ========== Mediabunny player ========== */
+
+.mb-surface {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  background: #000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  color: #fff;
+}
+
+.mb-canvas {
   width: 100%;
   height: 100%;
-  background: #000;
   object-fit: contain;
+  display: block;
+}
+
+.mb-audio-only,
+.mb-loading {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  pointer-events: none;
+}
+
+.mb-gesture-overlay {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: rgba(0, 0, 0, 0.25);
+  color: #fff;
+  border: 0;
+  cursor: pointer;
+  padding: 0;
+}
+
+.mb-gesture-overlay svg {
+  width: 96px;
+  height: 96px;
+  filter: drop-shadow(0 6px 20px rgba(0, 0, 0, 0.5));
+}
+
+.mb-controls {
+  position: absolute;
+  left: 0.75rem;
+  right: 0.75rem;
+  bottom: 0.75rem;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.45rem 0.65rem;
+  background: rgba(11, 13, 18, 0.78);
+  color: #fff;
+  border-radius: 10px;
+  backdrop-filter: blur(8px);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 180ms ease;
+}
+
+.mb-controls.visible {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.mb-controls-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  background: transparent;
+  color: inherit;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 120ms ease;
+}
+
+.mb-controls-button:hover {
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.mb-controls-button svg {
+  width: 20px;
+  height: 20px;
+}
+
+.mb-time {
+  font-variant-numeric: tabular-nums;
+  font-size: 0.8rem;
+  min-width: 3.5rem;
+  text-align: center;
+  color: rgba(255, 255, 255, 0.85);
+}
+
+.mb-progress {
+  flex: 1;
+  height: 10px;
+  position: relative;
+  padding: 4px 0;
+  cursor: pointer;
+  touch-action: none;
+}
+
+.mb-progress::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  height: 3px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.25);
+}
+
+.mb-progress-fill {
+  position: absolute;
+  left: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  height: 3px;
+  border-radius: 999px;
+  background: var(--accent);
+  z-index: 1;
+}
+
+.mb-progress-handle {
+  position: absolute;
+  right: 0;
+  top: 50%;
+  transform: translate(50%, -50%);
+  width: 12px;
+  height: 12px;
+  border-radius: 999px;
+  background: var(--accent);
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+.mb-progress:hover .mb-progress-handle,
+.mb-controls.visible .mb-progress-handle {
+  opacity: 1;
+}
+
+.mb-volume {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+.mb-volume-track {
+  width: 60px;
+  height: 10px;
+  position: relative;
+  padding: 4px 0;
+  cursor: pointer;
+  touch-action: none;
+}
+
+.mb-volume-track::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  height: 3px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.25);
+}
+
+.mb-volume-fill {
+  position: absolute;
+  left: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  height: 3px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.85);
+  z-index: 1;
 }
 
 /* ========== Tracks menu ========== */

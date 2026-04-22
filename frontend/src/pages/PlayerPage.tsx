@@ -1,17 +1,15 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 
 import { api } from "../api";
 import { displayMediaTitle } from "../format";
+import { PlayerSurface } from "../player/mediabunny/PlayerSurface";
+import { useMediabunnyController } from "../player/mediabunny/useMediabunnyController";
 import { SessionMenu } from "../player/SessionMenu";
 import { TracksMenu } from "../player/TracksMenu";
 import { UnplayableNotice } from "../player/UnplayableNotice";
-import { deriveSubtitleSources } from "../player/subtitleSources";
-import { useAudioTracks } from "../player/useAudioTracks";
-import { useRoomSync } from "../player/useRoomSync";
 import { navigate } from "../router";
 import type { MediaItem, Room } from "../types";
 import { useRoomSocket } from "../useRoomSocket";
-import { usePlayerSource } from "../usePlayerSource";
 import { useStreamCopyProgress } from "../useStreamCopyProgress";
 import { useWatchTogether } from "../useWatchTogether";
 
@@ -32,8 +30,6 @@ export function PlayerPage({
   onRefresh,
   onRoomCreated,
 }: Props) {
-  const videoRef = useRef<HTMLVideoElement | null>(null);
-  const [selectedSubtitleIndex, setSelectedSubtitleIndex] = useState<number | null>(null);
   const [playerError, setPlayerError] = useState<string | null>(null);
   const [creatingStreamCopy, setCreatingStreamCopy] = useState(false);
   const [streamCopyError, setStreamCopyError] = useState<string | null>(null);
@@ -42,7 +38,6 @@ export function PlayerPage({
   const currentItemId = item?.id ?? null;
   if (currentItemId !== prevItemId) {
     setPrevItemId(currentItemId);
-    setSelectedSubtitleIndex(null);
     setPlayerError(null);
     setStreamCopyError(null);
   }
@@ -56,22 +51,18 @@ export function PlayerPage({
 
   const socket = useRoomSocket(roomId, clientName);
   const watchTogether = useWatchTogether(item, onRoomCreated);
-  const audio = useAudioTracks(videoRef, item);
-  useRoomSync({
-    videoRef,
-    socket,
-    item,
-    onAutoplayBlocked: setPlayerError,
-  });
 
-  usePlayerSource(videoRef, item);
-  const playable =
-    item?.preparationState === "direct" || item?.preparationState === "prepared";
-  const subtitleSources = item ? deriveSubtitleSources(item) : [];
+  const { controllerRef, canvasRef, state } = useMediabunnyController(
+    item,
+    setPlayerError,
+  );
+
+  // TracksMenu still mounts; the audio + subtitle lists are wired up in M4/M3.
+  const emptyAudio = { tracks: [], selectedId: null, select: () => {} };
 
   // If the room is anchored to a different media item than what's in the URL,
-  // follow the room to its canonical media. This is what makes shared
-  // Watch Together links robust.
+  // follow the room to its canonical media. Keeps shared Watch Together links
+  // robust even after the host switches titles.
   useEffect(() => {
     if (!roomId || !socket.room) return;
     const roomMediaId = socket.room.mediaId;
@@ -79,16 +70,6 @@ export function PlayerPage({
     if (item && roomMediaId === item.id) return;
     navigate({ name: "watch", mediaId: roomMediaId, roomId });
   }, [item, roomId, socket.room]);
-
-  useEffect(() => {
-    const video = videoRef.current;
-    if (!video) return;
-
-    for (let index = 0; index < video.textTracks.length; index += 1) {
-      const track = video.textTracks[index]!;
-      track.mode = selectedSubtitleIndex === index ? "showing" : "disabled";
-    }
-  }, [item, selectedSubtitleIndex]);
 
   async function handleCreateStreamCopy() {
     if (!item) return;
@@ -131,6 +112,8 @@ export function PlayerPage({
   }
 
   const title = displayMediaTitle(item);
+  const playable =
+    item.preparationState === "direct" || item.preparationState === "prepared";
 
   if (!playable) {
     return (
@@ -158,12 +141,12 @@ export function PlayerPage({
 
         <div className="player-bar-right">
           <TracksMenu
-            audioTracks={audio.tracks}
-            onSelectAudio={audio.select}
-            onSelectSubtitle={setSelectedSubtitleIndex}
-            selectedAudioId={audio.selectedId}
-            selectedSubtitleIndex={selectedSubtitleIndex}
-            subtitleSources={subtitleSources}
+            audioTracks={emptyAudio.tracks}
+            onSelectAudio={emptyAudio.select}
+            onSelectSubtitle={() => {}}
+            selectedAudioId={emptyAudio.selectedId}
+            selectedSubtitleIndex={null}
+            subtitleSources={[]}
           />
 
           {roomId ? (
@@ -190,31 +173,19 @@ export function PlayerPage({
         <p className="error player-error">{watchTogether.error}</p>
       ) : null}
       {playerError ? <p className="error player-error">{playerError}</p> : null}
+      {state.warning ? (
+        <p className="error player-error">{state.warning}</p>
+      ) : null}
       {socket.error ? (
         <p className="error player-error">{socket.error}</p>
       ) : null}
 
-      <div className="player-stage">
-        <video
-          autoPlay={!roomId}
-          className="player-video"
-          controls
-          key={item.id}
-          onError={() => setPlayerError("The browser could not load this file.")}
-          playsInline
-          preload="metadata"
-          ref={videoRef}
-        >
-          {subtitleSources.map((track) => (
-            <track
-              key={track.key}
-              kind="subtitles"
-              label={track.label}
-              src={track.src}
-              srcLang={track.language}
-            />
-          ))}
-        </video>
+      <div className="player-stage" key={item.id}>
+        <PlayerSurface
+          canvasRef={canvasRef}
+          controllerRef={controllerRef}
+          state={state}
+        />
       </div>
     </div>
   );
