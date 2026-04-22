@@ -93,6 +93,10 @@ pub(crate) struct SegmentPlan {
     boundaries: Vec<f64>,
     total_duration: f64,
     target_duration_secs: u32,
+    /// `true` when `total_duration` is known and the playlist can be safely
+    /// synthesized as a fixed VOD list. `false` means we must follow ffmpeg's
+    /// rolling variant playlist because we do not know the final boundary.
+    bounded: bool,
 }
 
 impl SegmentPlan {
@@ -103,10 +107,16 @@ impl SegmentPlan {
     /// session behaves as today's linear encoder).
     fn single(total_duration: f64) -> Self {
         let total_duration = total_duration.max(0.0);
+        let bounded = total_duration > 0.0;
         Self {
             boundaries: vec![0.0],
             total_duration,
-            target_duration_secs: total_duration.ceil().max(1.0) as u32,
+            target_duration_secs: if bounded {
+                total_duration.ceil().max(1.0) as u32
+            } else {
+                HLS_TARGET_SEGMENT_SECONDS
+            },
+            bounded,
         }
     }
 
@@ -140,6 +150,7 @@ impl SegmentPlan {
             boundaries,
             total_duration,
             target_duration_secs: HLS_TARGET_SEGMENT_SECONDS,
+            bounded: true,
         }
     }
 
@@ -190,6 +201,7 @@ impl SegmentPlan {
             boundaries,
             total_duration,
             target_duration_secs: target,
+            bounded: true,
         }
     }
 
@@ -210,6 +222,10 @@ impl SegmentPlan {
 
     fn segment_count(&self) -> u32 {
         self.boundaries.len() as u32
+    }
+
+    fn is_bounded(&self) -> bool {
+        self.bounded
     }
 
     fn start_time_of(&self, index: u32) -> f64 {
@@ -300,6 +316,10 @@ pub(crate) fn parse_video_segment_filename(filename: &str) -> Option<u32> {
 ///    a fresh `init_0.mp4` that nobody reads, avoiding any partial-write
 ///    race with the client's MAP fetch.
 pub(crate) fn build_variant_playlist(plan: &SegmentPlan) -> String {
+    debug_assert!(
+        plan.is_bounded(),
+        "bounded synthetic playlist expected for this path"
+    );
     let mut out = String::new();
     out.push_str("#EXTM3U\n");
     out.push_str("#EXT-X-VERSION:7\n");
@@ -826,6 +846,23 @@ impl HlsSessionManager {
         // file path works for it.
         if filename == VIDEO_VARIANT_FILENAME {
             self.wait_for_ready(&session).await?;
+            // Unknown-duration sessions follow ffmpeg's own rolling variant
+            // playlist. We only synthesize a static VOD variant when the plan
+            // is bounded and all segment URIs are known up-front.
+            if !session.plan.is_bounded() {
+                let path = session.dir.join(filename);
+                if !fs::try_exists(&path).await.unwrap_or(false) {
+                    self.wait_for_file(&path).await?;
+                }
+                session.in_flight.fetch_add(1, Ordering::Relaxed);
+                return Ok(HlsServeResult {
+                    body: HlsServeBody::File(path),
+                    content_type: content_type_for_filename(filename),
+                    _guard: InFlightGuard {
+                        session: session.clone(),
+                    },
+                });
+            }
             session.in_flight.fetch_add(1, Ordering::Relaxed);
             let body = build_variant_playlist(&session.plan).into_bytes();
             return Ok(HlsServeResult {
@@ -843,12 +880,12 @@ impl HlsSessionManager {
         // waiting. Without this, a seek to minute 45 would block until
         // ffmpeg linearly transcoded all 45 minutes first.
         if let Some(segment_index) = parse_video_segment_filename(filename) {
+            if session.plan.is_bounded() && segment_index >= session.plan.segment_count() {
+                return Err(HlsError::NotFound);
+            }
             // Reject impossible segment indices up-front. Without this check a
             // request like seg_0_99999 can trigger a useless respawn at EOF
             // and then time out waiting for a segment that can never exist.
-            if segment_index >= session.plan.segment_count() {
-                return Err(HlsError::NotFound);
-            }
             let path = session.dir.join(filename);
             // Already on disk from an earlier spawn → serve directly.
             if fs::try_exists(&path).await.unwrap_or(false) {
@@ -864,7 +901,8 @@ impl HlsSessionManager {
             // Not on disk yet — decide whether the current encoder will
             // ever produce this segment within the catch-up window, or we
             // need to respawn at the seek target.
-            if self.should_respawn_for_segment(&session, segment_index) {
+            if session.plan.is_bounded() && self.should_respawn_for_segment(&session, segment_index)
+            {
                 info!(
                     session = %session.media_id,
                     segment = segment_index,
@@ -1472,11 +1510,14 @@ async fn watch_readiness(session: Arc<HlsSession>) {
 
             if !readiness_reached {
                 readiness_reached = true;
-                // Freeze the init segment on first readiness. Subsequent
-                // respawns will overwrite `init_0.mp4`, but the synthesized
-                // playlist's MAP points at the locked copy, so in-flight
-                // clients never see a partial write.
-                freeze_init_segment(&session.dir).await;
+                if session.plan.is_bounded() {
+                    // Freeze the init segment on first readiness for bounded
+                    // synthetic playlists. Unknown-duration sessions serve
+                    // ffmpeg's own variant playlist, which references
+                    // `init_0.mp4` directly, so we leave the raw init name in
+                    // place there.
+                    freeze_init_segment(&session.dir).await;
+                }
                 let elapsed = spawn_instant.elapsed();
                 info!(
                     session = %session.media_id,
@@ -2417,6 +2458,12 @@ mod tests {
         // duration (audio-track only); it should be silently skipped.
         let plan = SegmentPlan::from_keyframes(10.0, &[0.0, 5.0, 15.0]);
         assert_eq!(plan.boundaries, vec![0.0, 5.0]);
+    }
+
+    #[test]
+    fn segment_plan_single_is_unbounded_when_duration_missing() {
+        let plan = SegmentPlan::single(0.0);
+        assert!(!plan.is_bounded());
     }
 
     #[test]

@@ -2543,6 +2543,91 @@ async fn hls_segment_is_real_fmp4_bytes() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn hls_unknown_duration_serves_ffmpeg_variant_playlist() {
+    if !external_av_tools_available() {
+        eprintln!("skipping: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+
+    let temp_dir = TempDir::new().unwrap();
+    let root = temp_dir.path().join("library");
+    fs::create_dir_all(&root).unwrap();
+    generate_h264_ac3_mkv(&root.join("movie.mkv"));
+
+    // Duration intentionally omitted to exercise the unknown-duration path.
+    let probe = write_probe_script(
+        &temp_dir,
+        "probe-unknown-duration.sh",
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+cat <<'JSON'
+{
+  "format": { "format_name": "matroska,webm" },
+  "streams": [
+    { "codec_type": "video", "codec_name": "h264", "width": 320, "height": 240 },
+    { "codec_type": "audio", "codec_name": "ac3" }
+  ]
+}
+JSON
+"#,
+    );
+
+    let library = LibraryConfig::from_paths(vec![root]).with_probe_command(probe);
+    let hls_config = HlsConfig {
+        cache_dir: temp_dir.path().join("hls-cache"),
+        max_concurrent: 4,
+        idle_secs: 60,
+        ffmpeg_command: Some(PathBuf::from("ffmpeg")),
+        hw_accel: Default::default(),
+        vaapi_device: None,
+    };
+
+    let server = TestServer::spawn_with_library_and_hls(library, hls_config).await;
+    server.scan_library().await;
+    let library = server.wait_for_probes_complete().await;
+    let item = library
+        .items
+        .into_iter()
+        .next()
+        .expect("scanned media item");
+
+    assert!(item.duration_seconds.is_none());
+    assert!(item.playback_mode.is_hls());
+
+    // Kick session startup first.
+    let master = server
+        .client
+        .get(format!(
+            "{}/api/media/{}/hls/master.m3u8",
+            server.base_url, item.id
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(master.status(), StatusCode::OK);
+
+    let variant = server
+        .client
+        .get(format!(
+            "{}/api/media/{}/hls/stream_0.m3u8",
+            server.base_url, item.id
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(variant.status(), StatusCode::OK);
+    let body = variant.text().await.unwrap();
+
+    // Unknown-duration sessions should follow ffmpeg's variant directly,
+    // which references the raw init name, not the synthesized locked init.
+    assert!(
+        body.contains("#EXT-X-MAP:URI=\"init_0.mp4\""),
+        "expected ffmpeg variant MAP for unknown-duration session: {body}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn hls_concurrent_master_requests_share_one_session() {
     if !external_av_tools_available() {
         eprintln!("skipping: ffmpeg/ffprobe not on PATH");
