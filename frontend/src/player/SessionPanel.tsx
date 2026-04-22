@@ -1,6 +1,5 @@
-import { formatSignedDelta, formatTimeCode } from "../format";
 import type { Room } from "../types";
-import { deriveExpectedPosition, type RoomSocketApi } from "../useRoomSocket";
+import type { RoomSocketApi } from "../useRoomSocket";
 
 type Props = {
   socket: RoomSocketApi;
@@ -9,7 +8,6 @@ type Props = {
   onCatchUp: () => void;
   onLeave: () => void;
   rooms: Room[];
-  clockTickMs: number;
 };
 
 export function SessionPanel({
@@ -19,7 +17,6 @@ export function SessionPanel({
   onCatchUp,
   onLeave,
   rooms,
-  clockTickMs,
 }: Props) {
   const live = socket.connectionState === "live";
 
@@ -65,36 +62,6 @@ export function SessionPanel({
 
       <p className="muted session-activity">{socket.activity}</p>
       {socket.error ? <p className="error">{socket.error}</p> : null}
-
-      <details className="session-debug">
-        <summary>Diagnostics</summary>
-        <dl>
-          <div>
-            <dt>Room clock</dt>
-            <dd>
-              {formatTimeCode(
-                deriveExpectedPosition(
-                  socket.room,
-                  socket.authoritativeReceiptAtMs,
-                  clockTickMs,
-                ),
-              )}
-            </dd>
-          </div>
-          <div>
-            <dt>Last drift</dt>
-            <dd>
-              {socket.lastCorrection
-                ? `${formatSignedDelta(socket.lastCorrection.deltaSeconds)}s`
-                : "n/a"}
-            </dd>
-          </div>
-          <div>
-            <dt>Correction</dt>
-            <dd>{socket.lastCorrection?.suggestedAction ?? "—"}</dd>
-          </div>
-        </dl>
-      </details>
 
       <div className="session-footer">
         <button className="link-button" onClick={onLeave} type="button">

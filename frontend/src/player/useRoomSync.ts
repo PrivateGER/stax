@@ -21,7 +21,6 @@ type Options = {
 const SEEK_ECHO_TOLERANCE_SECONDS = 0.5;
 
 export type UseRoomSync = {
-  clockTickMs: number;
   catchUp: () => void;
 };
 
@@ -222,5 +221,5 @@ export function useRoomSync({
     }
   }, [socket.room, socket.authoritativeReceiptAtMs, videoRef, onAutoplayBlocked]);
 
-  return { clockTickMs, catchUp };
+  return { catchUp };
 }

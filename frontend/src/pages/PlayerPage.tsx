@@ -65,7 +65,7 @@ export function PlayerPage({
   const socket = useRoomSocket(roomId, clientName);
   const watchTogether = useWatchTogether(item, onRoomCreated);
   const audio = useAudioTracks(videoRef, item);
-  const { clockTickMs, catchUp } = useRoomSync({
+  const { catchUp } = useRoomSync({
     videoRef,
     socket,
     item,
@@ -227,7 +227,6 @@ export function PlayerPage({
         {roomId && showSessionPanel ? (
           <SessionPanel
             clientName={clientName}
-            clockTickMs={clockTickMs}
             onCatchUp={catchUp}
             onClientNameChange={onClientNameChange}
             onLeave={() => navigate({ name: "watch", mediaId: item.id, roomId: null })}

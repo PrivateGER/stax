@@ -878,38 +878,6 @@ code {
   border-radius: 6px;
 }
 
-.session-debug {
-  border-top: 1px solid var(--border);
-  padding-top: 1rem;
-}
-
-.session-debug summary {
-  cursor: pointer;
-  font-size: 0.85rem;
-  color: var(--text-muted);
-}
-
-.session-debug dl {
-  margin: 0.75rem 0 0;
-  display: grid;
-  gap: 0.4rem;
-}
-
-.session-debug dl > div {
-  display: grid;
-  grid-template-columns: 110px 1fr;
-  font-size: 0.82rem;
-  font-family: "JetBrains Mono", ui-monospace, monospace;
-}
-
-.session-debug dt {
-  color: var(--text-muted);
-}
-
-.session-debug dd {
-  margin: 0;
-}
-
 .session-footer {
   border-top: 1px solid var(--border);
   padding-top: 0.75rem;
