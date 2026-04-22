@@ -58,8 +58,15 @@ export const api = {
     return response.json();
   },
 
-  getStreamCopy: (mediaId: string) =>
-    getJson<StreamCopySummary>(`/api/media/${mediaId}/stream-copy`),
+  getStreamCopy: async (mediaId: string): Promise<StreamCopySummary | null> => {
+    const response = await fetch(`/api/media/${mediaId}/stream-copy`);
+    if (response.status === 404) return null;
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({}) as { error?: string });
+      throw new Error(body.error ?? `Request failed with status ${response.status}`);
+    }
+    return response.json() as Promise<StreamCopySummary>;
+  },
 
   createStreamCopy: async (
     mediaId: string,

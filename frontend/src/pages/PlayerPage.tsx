@@ -11,6 +11,7 @@ import {
   formatTimeCode,
 } from "../format";
 import { navigate } from "../router";
+import { StreamCopyProgress } from "../streamCopyProgress";
 import type { MediaItem, Room } from "../types";
 import {
   deriveExpectedPosition,
@@ -18,6 +19,7 @@ import {
   useRoomSocket,
 } from "../useRoomSocket";
 import { usePlayerSource } from "../usePlayerSource";
+import { useStreamCopyProgress } from "../useStreamCopyProgress";
 
 type Props = {
   item: MediaItem | null;
@@ -71,6 +73,13 @@ export function PlayerPage({
   const [streamCopyError, setStreamCopyError] = useState<string | null>(null);
   const [clockTickMs, setClockTickMs] = useState<number>(monotonicNow());
   const [showSessionPanel, setShowSessionPanel] = useState<boolean>(Boolean(roomId));
+
+  const { summary: liveStreamCopy, seedFromCreate: seedLiveStreamCopy } =
+    useStreamCopyProgress({
+      mediaId: item?.id ?? null,
+      fallback: item?.streamCopy ?? null,
+      onRefresh,
+    });
 
   const socket = useRoomSocket(roomId, clientName);
   const live = socket.connectionState === "live";
@@ -390,7 +399,7 @@ export function PlayerPage({
     try {
       setCreatingStreamCopy(true);
       setStreamCopyError(null);
-      await api.createStreamCopy(item.id, {
+      const response = await api.createStreamCopy(item.id, {
         audioStreamIndex:
           item.audioStreams.find((stream) => stream.default)?.index ??
           item.audioStreams[0]?.index ??
@@ -398,6 +407,7 @@ export function PlayerPage({
         subtitleMode: "off",
         subtitle: null,
       });
+      seedLiveStreamCopy(response);
       onRefresh();
     } catch (error) {
       setStreamCopyError(
@@ -426,31 +436,41 @@ export function PlayerPage({
   const title = displayMediaTitle(item);
 
   if (!playable) {
+    const liveActive =
+      liveStreamCopy?.status === "queued" || liveStreamCopy?.status === "running";
+    const isPreparing = liveActive || item.preparationState === "preparing";
+    const liveFailed = liveStreamCopy?.status === "failed";
+    const message = isPreparing
+      ? "A stream copy is still being prepared for this title."
+      : liveFailed || item.preparationState === "failed"
+        ? liveStreamCopy?.error ??
+          item.streamCopy?.error ??
+          "The last stream copy attempt failed. Create a new one to try again."
+        : item.preparationState === "unsupported"
+          ? "This title is not supported for browser playback."
+          : "This title needs a stream copy before it can be played.";
+
     return (
       <section className="title-missing">
         <h1>{title}</h1>
-        <p className="muted">
-          {item.preparationState === "preparing"
-            ? "A stream copy is still being prepared for this title."
-            : item.preparationState === "failed"
-              ? item.streamCopy?.error ??
-                "The last stream copy attempt failed. Create a new one to try again."
-              : item.preparationState === "unsupported"
-                ? "This title is not supported for browser playback."
-                : "This title needs a stream copy before it can be played."}
-        </p>
+        <p className="muted">{message}</p>
+        <StreamCopyProgress summary={liveStreamCopy} />
         {item.playbackMode === "needsPreparation" ? (
           <button
             className="primary-button"
-            disabled={creatingStreamCopy || item.preparationState === "preparing"}
+            disabled={creatingStreamCopy || isPreparing}
             onClick={() => void handleCreateStreamCopy()}
             type="button"
           >
-            {item.preparationState === "preparing"
-              ? "Preparing…"
-              : creatingStreamCopy
-                ? "Submitting…"
-                : "Create stream copy"}
+            {liveStreamCopy?.status === "queued"
+              ? "Queued…"
+              : liveStreamCopy?.status === "running"
+                ? "Preparing…"
+                : isPreparing
+                  ? "Preparing…"
+                  : creatingStreamCopy
+                    ? "Submitting…"
+                    : "Create stream copy"}
           </button>
         ) : null}
         {streamCopyError ? <p className="error">{streamCopyError}</p> : null}

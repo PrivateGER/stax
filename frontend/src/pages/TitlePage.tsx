@@ -13,14 +13,17 @@ import {
   rootFolderName,
 } from "../format";
 import { navigate } from "../router";
+import { StreamCopyProgress, isActiveStreamCopy } from "../streamCopyProgress";
 import type {
   CreateStreamCopyRequest,
   MediaItem,
   Room,
   StreamCopySubtitleSelection,
+  StreamCopySummary,
   SubtitleMode,
   SubtitleSourceKind,
 } from "../types";
+import { useStreamCopyProgress } from "../useStreamCopyProgress";
 
 type Props = {
   item: MediaItem | null;
@@ -44,6 +47,13 @@ export function TitlePage({ item, rooms, onRoomCreated, onRefresh }: Props) {
   const [audioStreamIndex, setAudioStreamIndex] = useState<number | null>(null);
   const [subtitleMode, setSubtitleMode] = useState<SubtitleMode>("off");
   const [subtitleSelection, setSubtitleSelection] = useState<string>("");
+
+  const { summary: liveStreamCopy, seedFromCreate: seedLiveStreamCopy } =
+    useStreamCopyProgress({
+      mediaId: item?.id ?? null,
+      fallback: item?.streamCopy ?? null,
+      onRefresh,
+    });
 
   const audioOptions = useMemo(
     () =>
@@ -149,7 +159,8 @@ export function TitlePage({ item, rooms, onRoomCreated, onRefresh }: Props) {
     try {
       setCreatingStreamCopy(true);
       setStreamCopyError(null);
-      await api.createStreamCopy(item.id, request);
+      const response = await api.createStreamCopy(item.id, request);
+      seedLiveStreamCopy(response);
       onRefresh();
     } catch (creationError) {
       setStreamCopyError(
@@ -234,8 +245,13 @@ export function TitlePage({ item, rooms, onRoomCreated, onRefresh }: Props) {
             <div className="title-stream-copy">
               <h2>Stream copy</h2>
               <p className="muted">
-                {streamCopyDescription(item.preparationState, item.streamCopy?.error)}
+                {streamCopyDescription(
+                  liveStreamCopy,
+                  item.preparationState,
+                )}
               </p>
+
+              <StreamCopyProgress summary={liveStreamCopy} />
 
               <label className="input-stack">
                 <span className="label-text">Audio track</span>
@@ -296,18 +312,17 @@ export function TitlePage({ item, rooms, onRoomCreated, onRefresh }: Props) {
                   className="ghost-button"
                   disabled={
                     creatingStreamCopy ||
+                    isActiveStreamCopy(liveStreamCopy) ||
                     (subtitleMode !== "off" && subtitleOptions.length === 0)
                   }
                   onClick={() => void handleCreateStreamCopy()}
                   type="button"
                 >
-                  {creatingStreamCopy
-                    ? "Submitting…"
-                    : item.preparationState === "prepared"
-                      ? "Recreate stream copy"
-                      : item.preparationState === "preparing"
-                        ? "Refresh stream copy state"
-                        : "Create stream copy"}
+                  {streamCopyButtonLabel({
+                    submitting: creatingStreamCopy,
+                    summary: liveStreamCopy,
+                    preparationState: item.preparationState,
+                  })}
                 </button>
               </div>
 
@@ -424,19 +439,48 @@ function playbackLabel(state: MediaItem["preparationState"]) {
 }
 
 function streamCopyDescription(
-  state: MediaItem["preparationState"],
-  error: string | null | undefined,
+  summary: StreamCopySummary | null,
+  preparationState: MediaItem["preparationState"],
 ) {
-  switch (state) {
+  if (summary) {
+    switch (summary.status) {
+      case "queued":
+        return "A stream copy is queued and will start shortly.";
+      case "running":
+        return "A stream copy is being prepared in the background.";
+      case "ready":
+        return "A prepared stream copy is ready and will be used for browser playback.";
+      case "failed":
+        return summary.error ?? "The last stream copy attempt failed.";
+    }
+  }
+
+  switch (preparationState) {
     case "prepared":
       return "A prepared stream copy is ready and will be used for browser playback.";
     case "preparing":
       return "A stream copy is being prepared in the background.";
     case "failed":
-      return error ?? "The last stream copy attempt failed.";
+      return "The last stream copy attempt failed.";
     case "needsPreparation":
       return "This file is not browser-safe as-is. Create a stream copy to play it.";
     default:
       return "This title can already be streamed directly.";
   }
 }
+
+function streamCopyButtonLabel(args: {
+  submitting: boolean;
+  summary: StreamCopySummary | null;
+  preparationState: MediaItem["preparationState"];
+}) {
+  if (args.submitting) return "Submitting…";
+  if (args.summary?.status === "queued") return "Queued…";
+  if (args.summary?.status === "running") return "Preparing…";
+  if (args.summary?.status === "ready") return "Recreate stream copy";
+  if (args.summary?.status === "failed") return "Retry stream copy";
+  if (args.preparationState === "prepared") return "Recreate stream copy";
+  if (args.preparationState === "failed") return "Retry stream copy";
+  return "Create stream copy";
+}
+

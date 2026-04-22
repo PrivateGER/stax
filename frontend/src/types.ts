@@ -60,6 +60,8 @@ export type StreamCopySummary = {
   subtitleUrl: string | null;
   error: string | null;
   updatedAt: string;
+  progressRatio?: number | null;
+  progressSpeed?: number | null;
 };
 
 export type CreateStreamCopyRequest = {

@@ -35,3 +35,4 @@ backend/target/
 backend/*.db
 backend/*.db-*
 backend/syncplay-thumbnails/
+backend/syncplay-stream-copies/

@@ -633,6 +633,52 @@ code {
   margin-top: 0.25rem;
 }
 
+.stream-copy-progress {
+  display: grid;
+  gap: 0.4rem;
+}
+
+.stream-copy-progress-bar {
+  position: relative;
+  height: 8px;
+  overflow: hidden;
+  background: var(--border);
+  border-radius: 999px;
+}
+
+.stream-copy-progress-fill {
+  height: 100%;
+  background: var(--accent, #4f8cff);
+  border-radius: inherit;
+  transition: width 250ms ease-out;
+}
+
+.stream-copy-progress-fill.indeterminate {
+  width: 40%;
+  animation: stream-copy-progress-indeterminate 1.4s ease-in-out infinite;
+}
+
+@keyframes stream-copy-progress-indeterminate {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(250%);
+  }
+}
+
+.stream-copy-progress-meta {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.85rem;
+  color: var(--text-muted);
+}
+
+.stream-copy-progress-meta .percent {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
 .detail-grid {
   margin: 0;
   display: grid;
