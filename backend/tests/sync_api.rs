@@ -2680,3 +2680,75 @@ async fn hls_rejects_invalid_filenames() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn hls_out_of_range_segment_returns_404_without_respawn() {
+    if !external_av_tools_available() {
+        eprintln!("skipping: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+
+    let temp_dir = TempDir::new().unwrap();
+    let (server, item) = hls_test_setup(&temp_dir).await;
+    let manager = server.hls.as_ref().expect("hls manager handle");
+
+    // First request boots the session and spawns ffmpeg once.
+    let master = server
+        .client
+        .get(format!(
+            "{}/api/media/{}/hls/master.m3u8",
+            server.base_url, item.id
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(master.status(), StatusCode::OK);
+    assert_eq!(manager.total_spawn_count().await, 1);
+
+    // Deliberately impossible segment index for a tiny test clip.
+    let out_of_range = server
+        .client
+        .get(format!(
+            "{}/api/media/{}/hls/seg_0_99999.m4s",
+            server.base_url, item.id
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(out_of_range.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        manager.total_spawn_count().await,
+        1,
+        "out-of-range segment must not trigger a respawn"
+    );
+
+    // Sanity: valid segment fetch still works and still without extra spawns.
+    let variant = server
+        .client
+        .get(format!(
+            "{}/api/media/{}/hls/stream_0.m3u8",
+            server.base_url, item.id
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(variant.status(), StatusCode::OK);
+    let variant_body = variant.text().await.unwrap();
+    let first_segment = variant_body
+        .lines()
+        .find(|line| line.ends_with(".m4s"))
+        .expect("variant should list at least one segment");
+
+    let ok_segment = server
+        .client
+        .get(format!(
+            "{}/api/media/{}/hls/{}",
+            server.base_url, item.id, first_segment
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok_segment.status(), StatusCode::OK);
+    assert_eq!(manager.total_spawn_count().await, 1);
+}

@@ -596,6 +596,9 @@ struct HlsSession {
     media_id: Uuid,
     dir: PathBuf,
     child: Mutex<Option<Child>>,
+    /// Number of ffmpeg spawns attempted for this session (initial spawn +
+    /// any deep-seek respawns). Primarily a test/observability hook.
+    spawn_count: AtomicU32,
     last_access_ms: AtomicU64,
     in_flight: AtomicU32,
     ready: Notify,
@@ -762,11 +765,21 @@ impl HlsSessionManager {
         &self.inner.config
     }
 
-    /// Number of currently active sessions. Each session corresponds to exactly one
-    /// ffmpeg spawn (idempotent under the per-session startup mutex), so this also
-    /// answers "how many ffmpeg processes have been spawned and not yet evicted?".
+    /// Number of currently active HLS sessions.
     pub async fn session_count(&self) -> usize {
         self.inner.sessions.lock().await.len()
+    }
+
+    /// Total ffmpeg spawn count across all currently-active sessions.
+    ///
+    /// This includes respawns triggered by deep seeks and is mainly used by
+    /// integration tests to verify respawn behavior.
+    pub async fn total_spawn_count(&self) -> u32 {
+        let sessions = self.inner.sessions.lock().await;
+        sessions
+            .values()
+            .map(|session| session.spawn_count.load(Ordering::Acquire))
+            .sum()
     }
 
     pub async fn shutdown(&self) {
@@ -827,6 +840,12 @@ impl HlsSessionManager {
         // waiting. Without this, a seek to minute 45 would block until
         // ffmpeg linearly transcoded all 45 minutes first.
         if let Some(segment_index) = parse_video_segment_filename(filename) {
+            // Reject impossible segment indices up-front. Without this check a
+            // request like seg_0_99999 can trigger a useless respawn at EOF
+            // and then time out waiting for a segment that can never exist.
+            if segment_index >= session.plan.segment_count() {
+                return Err(HlsError::NotFound);
+            }
             let path = session.dir.join(filename);
             // Already on disk from an earlier spawn → serve directly.
             if fs::try_exists(&path).await.unwrap_or(false) {
@@ -1012,6 +1031,7 @@ impl HlsSessionManager {
             media_id: item.id,
             dir: session_dir.clone(),
             child: Mutex::new(None),
+            spawn_count: AtomicU32::new(0),
             last_access_ms: AtomicU64::new(now_ms()),
             in_flight: AtomicU32::new(0),
             ready: Notify::new(),
@@ -1148,6 +1168,7 @@ impl HlsSessionManager {
         let mut child = command
             .spawn()
             .map_err(|error| HlsError::SpawnFailed(format!("could not start ffmpeg: {error}")))?;
+        session.spawn_count.fetch_add(1, Ordering::Release);
         *session.spawned_at.lock().await = Some(spawn_instant);
 
         // Spawn a background reader for stderr so it doesn't block the child.
