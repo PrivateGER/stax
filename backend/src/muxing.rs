@@ -605,6 +605,9 @@ struct HlsSession {
     is_ready: AtomicU32,
     startup: Mutex<StartupState>,
     spawn_error: Mutex<Option<String>>,
+    /// Recent ffmpeg stderr lines captured during startup/encoding. Used to
+    /// surface actionable startup failures instead of opaque timeouts.
+    stderr_tail: Mutex<String>,
     /// Wall-clock `Instant` of the ffmpeg `spawn()` call. Used solely for the
     /// "session became ready in N.Ns" log line — that number is the single
     /// best signal we have for whether the encoder is pacing realtime, since
@@ -1038,6 +1041,7 @@ impl HlsSessionManager {
             is_ready: AtomicU32::new(0),
             startup: Mutex::new(StartupState { started: false }),
             spawn_error: Mutex::new(None),
+            stderr_tail: Mutex::new(String::new()),
             spawned_at: Mutex::new(None),
             plan,
             encoder: std::sync::Mutex::new(None),
@@ -1078,6 +1082,11 @@ impl HlsSessionManager {
         if startup.started && start_segment == 0 {
             return Ok(());
         }
+
+        // New spawn attempt, clear any stale failure state from an earlier
+        // encoder process in this session.
+        *session.spawn_error.lock().await = None;
+        session.stderr_tail.lock().await.clear();
 
         let ffmpeg_command = self
             .inner
@@ -1186,8 +1195,7 @@ impl HlsSessionManager {
         // the log.
         if let Some(stderr) = child.stderr.take() {
             let media_id = session.media_id;
-            let spawn_error = Arc::new(Mutex::new(String::new()));
-            let spawn_error_clone = spawn_error.clone();
+            let session_for_stderr = session.clone();
             tokio::spawn(async move {
                 use tokio::io::AsyncReadExt;
                 let mut reader = stderr;
@@ -1202,10 +1210,10 @@ impl HlsSessionManager {
                                     if !line.is_empty() {
                                         let text = String::from_utf8_lossy(&line).into_owned();
                                         warn!(session = %media_id, "ffmpeg: {text}");
-                                        let mut buffer = spawn_error_clone.lock().await;
-                                        if buffer.len() < 4096 {
-                                            buffer.push_str(&text);
-                                            buffer.push('\n');
+                                        let mut tail = session_for_stderr.stderr_tail.lock().await;
+                                        if tail.len() < 4096 {
+                                            tail.push_str(&text);
+                                            tail.push('\n');
                                         }
                                         line.clear();
                                     }
@@ -1221,11 +1229,13 @@ impl HlsSessionManager {
                 if !line.is_empty() {
                     let text = String::from_utf8_lossy(&line).into_owned();
                     warn!(session = %media_id, "ffmpeg: {text}");
+                    let mut tail = session_for_stderr.stderr_tail.lock().await;
+                    if tail.len() < 4096 {
+                        tail.push_str(&text);
+                        tail.push('\n');
+                    }
                 }
             });
-            // Persist the latest stderr buffer in the session so failed startup can surface it.
-            // We do this by polling the buffer when readiness fails (not exposed yet — kept simple).
-            let _ = spawn_error;
         }
 
         *session.child.lock().await = Some(child);
@@ -1501,9 +1511,16 @@ async fn watch_readiness(session: Arc<HlsSession>) {
         // the file and exited cleanly.
         if child_has_exited(&session).await {
             if !readiness_reached {
+                let stderr_excerpt = session.stderr_tail.lock().await.trim().to_string();
                 let mut buffer = session.spawn_error.lock().await;
                 if buffer.is_none() {
-                    *buffer = Some("ffmpeg exited before producing a manifest".into());
+                    *buffer = if stderr_excerpt.is_empty() {
+                        Some("ffmpeg exited before producing a manifest".into())
+                    } else {
+                        Some(format!(
+                            "ffmpeg exited before producing a manifest: {stderr_excerpt}"
+                        ))
+                    };
                 }
                 session.ready.notify_waiters();
             }
@@ -3022,6 +3039,82 @@ seg_0_00100.m4s\n";
         assert_eq!(format_seconds(42.5), "42.500");
         // Arbitrary floats that arise from keyframe PTS round to 3 dp.
         assert_eq!(format_seconds(198.23199999999997), "198.232");
+    }
+
+    #[tokio::test]
+    async fn serve_surfaces_ffmpeg_stderr_when_startup_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let input_dir = tmp.path().join("library");
+        std::fs::create_dir_all(&input_dir).expect("create input dir");
+        let input_path = input_dir.join("movie.mkv");
+        std::fs::write(&input_path, b"not-real-media").expect("write input");
+
+        let ffmpeg_stub = tmp.path().join("ffmpeg-fail.sh");
+        std::fs::write(
+            &ffmpeg_stub,
+            "#!/usr/bin/env bash\nset -euo pipefail\necho \"synthetic ffmpeg startup failure\" >&2\nexit 1\n",
+        )
+        .expect("write ffmpeg stub");
+        let mut perms = std::fs::metadata(&ffmpeg_stub)
+            .expect("metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&ffmpeg_stub, perms).expect("chmod");
+
+        let manager = HlsSessionManager::new(HlsConfig {
+            cache_dir: tmp.path().join("hls-cache"),
+            max_concurrent: 1,
+            idle_secs: 60,
+            ffmpeg_command: Some(ffmpeg_stub),
+            hw_accel: HwAccel::None,
+            vaapi_device: None,
+        });
+
+        let item = MediaItem {
+            id: Uuid::new_v4(),
+            root_path: input_dir.to_string_lossy().to_string(),
+            relative_path: "movie.mkv".into(),
+            file_name: "movie.mkv".into(),
+            extension: Some("mkv".into()),
+            size_bytes: 1,
+            modified_at: String::new(),
+            indexed_at: String::new(),
+            content_type: None,
+            duration_seconds: Some(10.0),
+            container_name: Some("matroska".into()),
+            video_codec: Some("h264".into()),
+            audio_codec: Some("aac".into()),
+            width: None,
+            height: None,
+            probed_at: None,
+            probe_error: None,
+            subtitle_tracks: Vec::new(),
+            thumbnail_generated_at: None,
+            thumbnail_error: None,
+            playback_mode: PlaybackMode::HlsRemux,
+            video_profile: None,
+            video_level: None,
+            video_pix_fmt: None,
+            video_bit_depth: None,
+            audio_streams: vec![audio(0, "aac", Some("eng"), true)],
+            subtitle_streams: Vec::new(),
+            hls_master_url: None,
+        };
+
+        let result = manager
+            .serve(&item, MASTER_FILENAME, BrowserHint::Generic)
+            .await;
+        match result {
+            Err(HlsError::SpawnFailed(message)) => {
+                assert!(
+                    message.contains("synthetic ffmpeg startup failure"),
+                    "spawn failure should include stderr excerpt: {message}"
+                );
+            }
+            other => panic!("expected SpawnFailed, got {other:?}"),
+        }
     }
 
     #[test]
