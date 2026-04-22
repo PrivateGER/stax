@@ -5,6 +5,7 @@ import { AdminPage } from "./pages/AdminPage";
 import { LibraryPage } from "./pages/LibraryPage";
 import { PlayerPage } from "./pages/PlayerPage";
 import { TitlePage } from "./pages/TitlePage";
+import { randomName } from "./randomName";
 import { navigate, toHash, useRoute } from "./router";
 import type {
   HealthResponse,
@@ -25,14 +26,18 @@ export default function App() {
   const [scanning, setScanning] = useState(false);
   const [libraryError, setLibraryError] = useState<string | null>(null);
   const [clientName, setClientNameState] = useState<string>(() => {
-    if (typeof window === "undefined") return "Browser Viewer";
-    return window.localStorage.getItem(CLIENT_NAME_KEY) ?? "Browser Viewer";
+    if (typeof window === "undefined") return randomName();
+    const stored = window.localStorage.getItem(CLIENT_NAME_KEY);
+    if (stored && stored.trim().length > 0) return stored;
+    const fresh = randomName();
+    window.localStorage.setItem(CLIENT_NAME_KEY, fresh);
+    return fresh;
   });
 
   const setClientName = useCallback((name: string) => {
     setClientNameState(name);
     if (typeof window !== "undefined") {
-      window.localStorage.setItem(CLIENT_NAME_KEY, name.trim() || "Browser Viewer");
+      window.localStorage.setItem(CLIENT_NAME_KEY, name);
     }
   }, []);
 

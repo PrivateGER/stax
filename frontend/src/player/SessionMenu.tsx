@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 
+import { randomName } from "../randomName";
 import type { RoomSocketApi } from "../useRoomSocket";
 
 type Props = {
@@ -88,11 +89,21 @@ export function SessionMenu({
 
           <label className="input-stack">
             <span className="label-text">Your name</span>
-            <input
-              onChange={(event) => onClientNameChange(event.target.value)}
-              placeholder="Browser Viewer"
-              value={clientName}
-            />
+            <div className="name-input-row">
+              <input
+                onChange={(event) => onClientNameChange(event.target.value)}
+                placeholder="Browser Viewer"
+                value={clientName}
+              />
+              <button
+                className="ghost-button"
+                onClick={() => onClientNameChange(randomName())}
+                title="Pick a random name"
+                type="button"
+              >
+                Shuffle
+              </button>
+            </div>
           </label>
 
           <button className="link-button" onClick={onLeave} type="button">
