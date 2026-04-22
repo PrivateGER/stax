@@ -196,11 +196,7 @@ impl SegmentPlan {
     /// Highest-level entry point: pick the right constructor for a given
     /// playback mode. `keyframes` is only consulted for copy modes; pass
     /// an empty slice when it's not available yet.
-    pub(crate) fn for_session(
-        mode: PlaybackMode,
-        total_duration: f64,
-        keyframes: &[f64],
-    ) -> Self {
+    pub(crate) fn for_session(mode: PlaybackMode, total_duration: f64, keyframes: &[f64]) -> Self {
         match mode {
             PlaybackMode::HlsFullTranscode => Self::fixed_grid(total_duration),
             PlaybackMode::HlsRemux | PlaybackMode::HlsAudioTranscode => {
@@ -314,9 +310,7 @@ pub(crate) fn build_variant_playlist(plan: &SegmentPlan) -> String {
     out.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
     out.push_str("#EXT-X-PLAYLIST-TYPE:VOD\n");
     out.push_str("#EXT-X-INDEPENDENT-SEGMENTS\n");
-    out.push_str(&format!(
-        "#EXT-X-MAP:URI=\"{INIT_SEGMENT_FROZEN}\"\n"
-    ));
+    out.push_str(&format!("#EXT-X-MAP:URI=\"{INIT_SEGMENT_FROZEN}\"\n"));
     for i in 0..plan.segment_count() {
         // EXTINF requires 3-decimal precision for reliable playback in
         // hls.js — integer EXTINFs are accepted but confuse seek math
@@ -517,6 +511,57 @@ fn is_safari_user_agent(ua: &str) -> bool {
         && !lower.contains("firefox")
 }
 
+/// HLS session compatibility bucket.
+///
+/// Most playback modes are browser-agnostic at the transcoder level, but
+/// `HlsFullTranscode` has a Safari-specific fast path (`-c:v copy`) while
+/// non-Safari clients need full video transcode. If both buckets shared one
+/// session keyed only by media id, the first requester would pin behavior for
+/// everyone else.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum SessionFlavor {
+    Default,
+    SafariPassthrough,
+}
+
+impl SessionFlavor {
+    fn for_request(item: &MediaItem, browser: BrowserHint) -> Self {
+        if matches!(item.playback_mode, PlaybackMode::HlsFullTranscode)
+            && matches!(browser, BrowserHint::Safari)
+        {
+            Self::SafariPassthrough
+        } else {
+            Self::Default
+        }
+    }
+
+    fn as_dir_token(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::SafariPassthrough => "safari-copy",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct SessionKey {
+    media_id: Uuid,
+    flavor: SessionFlavor,
+}
+
+impl SessionKey {
+    fn for_request(item: &MediaItem, browser: BrowserHint) -> Self {
+        Self {
+            media_id: item.id,
+            flavor: SessionFlavor::for_request(item, browser),
+        }
+    }
+
+    fn dir_name(self) -> String {
+        format!("{}-{}", self.media_id, self.flavor.as_dir_token())
+    }
+}
+
 #[derive(Debug)]
 struct StartupState {
     /// `true` once at least one ffmpeg has been spawned for this session.
@@ -657,7 +702,7 @@ pub struct HlsSessionManager {
 
 #[derive(Debug)]
 struct Inner {
-    sessions: Mutex<HashMap<Uuid, Arc<HlsSession>>>,
+    sessions: Mutex<HashMap<SessionKey, Arc<HlsSession>>>,
     semaphore: Arc<Semaphore>,
     config: HlsConfig,
     scan_gate: ScanGate,
@@ -809,7 +854,8 @@ impl HlsSessionManager {
             // the existing frontier) for the segment to land on disk.
             self.wait_for_ready(&session).await?;
             let path = session.dir.join(filename);
-            self.wait_for_segment(&session, segment_index, &path).await?;
+            self.wait_for_segment(&session, segment_index, &path)
+                .await?;
             session.in_flight.fetch_add(1, Ordering::Relaxed);
             return Ok(HlsServeResult {
                 body: HlsServeBody::File(path),
@@ -852,11 +898,7 @@ impl HlsSessionManager {
     ///   backwards seek past the active range, nothing to wait for, OR
     /// * The requested segment is further ahead of the frontier than
     ///   `CATCHUP_WINDOW_SECS` worth of video.
-    fn should_respawn_for_segment(
-        &self,
-        session: &Arc<HlsSession>,
-        segment_index: u32,
-    ) -> bool {
+    fn should_respawn_for_segment(&self, session: &Arc<HlsSession>, segment_index: u32) -> bool {
         let guard = session.encoder.lock().expect("encoder mutex poisoned");
         let Some(state) = guard.as_ref() else {
             return true;
@@ -895,8 +937,7 @@ impl HlsSessionManager {
         let ahead_segments = segment_index.saturating_sub(frontier);
         let ahead_secs =
             (f64::from(ahead_segments) * f64::from(HLS_TARGET_SEGMENT_SECONDS)).max(0.0) * 2.0;
-        let deadline_secs =
-            (READINESS_DEADLINE_SECS as f64).max(ahead_secs) as u64;
+        let deadline_secs = (READINESS_DEADLINE_SECS as f64).max(ahead_secs) as u64;
         let deadline = Instant::now() + Duration::from_secs(deadline_secs);
         loop {
             if fs::try_exists(path).await.unwrap_or(false) {
@@ -914,10 +955,11 @@ impl HlsSessionManager {
         item: &MediaItem,
         browser: BrowserHint,
     ) -> Result<Arc<HlsSession>, HlsError> {
+        let session_key = SessionKey::for_request(item, browser);
         // Fast path: existing session.
         {
             let sessions = self.inner.sessions.lock().await;
-            if let Some(existing) = sessions.get(&item.id) {
+            if let Some(existing) = sessions.get(&session_key) {
                 return Ok(existing.clone());
             }
         }
@@ -933,11 +975,11 @@ impl HlsSessionManager {
 
         // Re-check under lock (another caller may have raced).
         let mut sessions = self.inner.sessions.lock().await;
-        if let Some(existing) = sessions.get(&item.id) {
+        if let Some(existing) = sessions.get(&session_key) {
             return Ok(existing.clone());
         }
 
-        let session_dir = self.inner.config.cache_dir.join(item.id.to_string());
+        let session_dir = self.inner.config.cache_dir.join(session_key.dir_name());
         fs::create_dir_all(&session_dir).await?;
         // Clean any stale files from a prior run.
         clean_directory(&session_dir).await;
@@ -985,7 +1027,7 @@ impl HlsSessionManager {
             _permit: permit,
             _scan_gate_guard: self.inner.scan_gate.hold(),
         });
-        sessions.insert(item.id, session.clone());
+        sessions.insert(session_key, session.clone());
         drop(sessions);
 
         // Per-session startup: spawn ffmpeg under the session's startup lock so concurrent
@@ -1045,9 +1087,11 @@ impl HlsSessionManager {
             let audio_streams_for_master = effective_audio_streams(&item.audio_streams);
             let master_body = build_master_playlist(item, browser, &audio_streams_for_master);
             let master_path = session.dir.join(MASTER_FILENAME);
-            fs::write(&master_path, master_body).await.map_err(|error| {
-                HlsError::SpawnFailed(format!("could not write master playlist: {error}"))
-            })?;
+            fs::write(&master_path, master_body)
+                .await
+                .map_err(|error| {
+                    HlsError::SpawnFailed(format!("could not write master playlist: {error}"))
+                })?;
 
             // Note: we intentionally do NOT write the synthesized variant
             // playlist (`stream_0.m3u8`) to disk here. ffmpeg's HLS muxer
@@ -1101,9 +1145,9 @@ impl HlsSessionManager {
         );
 
         let spawn_instant = Instant::now();
-        let mut child = command.spawn().map_err(|error| {
-            HlsError::SpawnFailed(format!("could not start ffmpeg: {error}"))
-        })?;
+        let mut child = command
+            .spawn()
+            .map_err(|error| HlsError::SpawnFailed(format!("could not start ffmpeg: {error}")))?;
         *session.spawned_at.lock().await = Some(spawn_instant);
 
         // Spawn a background reader for stderr so it doesn't block the child.
@@ -1173,10 +1217,7 @@ impl HlsSessionManager {
         // currently-running ffmpeg covers a given request (and, if not,
         // whether to respawn again).
         {
-            let mut encoder = session
-                .encoder
-                .lock()
-                .expect("encoder mutex poisoned");
+            let mut encoder = session.encoder.lock().expect("encoder mutex poisoned");
             *encoder = Some(EncoderState {
                 start_segment,
                 start_offset_secs,
@@ -1296,7 +1337,6 @@ impl HlsSessionManager {
             sleep(Duration::from_millis(READINESS_POLL_MS)).await;
         }
     }
-
 }
 
 /// Background ticker that evicts idle sessions. Exits once the manager's
@@ -1320,7 +1360,7 @@ async fn evict_idle(inner: &Inner) {
     let idle_threshold = Duration::from_secs(inner.config.idle_secs);
     let mut sessions = inner.sessions.lock().await;
     let now = Instant::now();
-    let to_evict: Vec<Uuid> = sessions
+    let to_evict: Vec<SessionKey> = sessions
         .iter()
         .filter(|(_, session)| {
             session.in_flight.load(Ordering::Relaxed) == 0
@@ -2049,10 +2089,7 @@ fn build_var_stream_map(audio: &[EffectiveAudioStream]) -> String {
         if let Some(lang) = &stream.language {
             entry.push_str(&format!(",language:{}", sanitize_token(lang)));
         }
-        entry.push_str(&format!(
-            ",name:{}",
-            sanitize_token(&audio_display_name_raw(stream))
-        ));
+        entry.push_str(&format!(",name:{}", audio_rendition_name_token(stream)));
         if stream.default && !default_set {
             entry.push_str(",default:yes");
             default_set = true;
@@ -2081,14 +2118,26 @@ fn audio_display_name_raw(stream: &EffectiveAudioStream) -> String {
         .unwrap_or_else(|| format!("Track {}", stream.local_index + 1))
 }
 
+/// Collision-proof rendition token for `-var_stream_map name:X`.
+///
+/// Human labels are not unique in real libraries (two "English" tracks is
+/// common: theatrical + commentary, or duplicate tags). Prefixing the
+/// 0-based local index guarantees uniqueness while preserving readability.
+fn audio_rendition_name_token(stream: &EffectiveAudioStream) -> String {
+    let raw = sanitize_token(&audio_display_name_raw(stream));
+    let suffix = if raw.is_empty() {
+        "track".to_string()
+    } else {
+        raw
+    };
+    format!("a{}_{}", stream.local_index, suffix)
+}
+
 /// Filename of the audio variant playlist ffmpeg will write for this stream.
 /// Must match ffmpeg's `-var_stream_map name:X` output (`stream_X.m3u8`) byte-
 /// for-byte — the master we synthesize references it by this exact name.
 fn audio_variant_filename(stream: &EffectiveAudioStream) -> String {
-    format!(
-        "stream_{}.m3u8",
-        sanitize_token(&audio_display_name_raw(stream))
-    )
+    format!("stream_{}.m3u8", audio_rendition_name_token(stream))
 }
 
 /// Filename of the video variant playlist ffmpeg writes for the first video
@@ -2285,7 +2334,11 @@ mod tests {
         // so the remainder is absorbed into the last segment.
         let plan = SegmentPlan::fixed_grid(10.5);
         assert_eq!(plan.segment_count(), 5);
-        assert!((plan.duration_of(4) - 2.5).abs() < 1e-9, "got {}", plan.duration_of(4));
+        assert!(
+            (plan.duration_of(4) - 2.5).abs() < 1e-9,
+            "got {}",
+            plan.duration_of(4)
+        );
     }
 
     #[test]
@@ -2336,11 +2389,7 @@ mod tests {
 
     #[test]
     fn segment_plan_for_session_uses_keyframes_for_copy_mode() {
-        let plan = SegmentPlan::for_session(
-            PlaybackMode::HlsRemux,
-            10.0,
-            &[0.0, 3.5, 7.0],
-        );
+        let plan = SegmentPlan::for_session(PlaybackMode::HlsRemux, 10.0, &[0.0, 3.5, 7.0]);
         assert_eq!(plan.boundaries, vec![0.0, 3.5, 7.0]);
     }
 
@@ -2384,7 +2433,10 @@ mod tests {
         assert!(body.contains("#EXT-X-TARGETDURATION:2"));
         // All 5 segments listed with 3-decimal EXTINFs.
         for i in 0..5 {
-            assert!(body.contains(&video_segment_filename(i)), "missing segment {i}");
+            assert!(
+                body.contains(&video_segment_filename(i)),
+                "missing segment {i}"
+            );
         }
         assert!(body.contains("#EXTINF:2.000,"));
     }
@@ -2480,6 +2532,23 @@ mod tests {
     }
 
     #[test]
+    fn var_stream_map_names_are_unique_when_labels_collide() {
+        let mut first = audio(0, "aac", Some("eng"), true);
+        first.title = Some("English".into());
+        let mut second = audio(1, "aac", Some("eng"), false);
+        second.title = Some("English".into());
+        let streams = effective_audio_streams(&[first, second]);
+        let map = build_var_stream_map(&streams);
+
+        assert!(map.contains("name:a0_English"), "map: {map}");
+        assert!(map.contains("name:a1_English"), "map: {map}");
+        assert_ne!(
+            audio_variant_filename(&streams[0]),
+            audio_variant_filename(&streams[1])
+        );
+    }
+
+    #[test]
     fn master_playlist_contains_video_stream_inf_for_remux_with_audio_group() {
         // This is the invariant that silently broke under ffmpeg's master
         // writer: when it couldn't compute a bandwidth for the video variant
@@ -2520,11 +2589,11 @@ mod tests {
         // what `-var_stream_map name:X` will cause ffmpeg to write. A drift
         // between the two is an immediate 404 on the audio playlist fetch.
         assert!(
-            master.contains(r#"URI="stream_eng.m3u8""#),
+            master.contains(r#"URI="stream_a0_eng.m3u8""#),
             "english audio URI must match ffmpeg's filename: {master}"
         );
         assert!(
-            master.contains(r#"URI="stream_jpn.m3u8""#),
+            master.contains(r#"URI="stream_a1_jpn.m3u8""#),
             "japanese audio URI must match ffmpeg's filename: {master}"
         );
         assert!(master.contains(r#"AUDIO="aud""#), "master: {master}");
@@ -2648,10 +2717,7 @@ mod tests {
         )
     }
 
-    fn build_args_for_offset(
-        mode: PlaybackMode,
-        offset: SpawnOffset,
-    ) -> Vec<String> {
+    fn build_args_for_offset(mode: PlaybackMode, offset: SpawnOffset) -> Vec<String> {
         build_ffmpeg_args(
             &make_item(mode),
             BrowserHint::Generic,
@@ -2797,7 +2863,10 @@ mod tests {
         // seek, not a slow pre-decode discard) and `-start_number N` lands
         // in the output section so on-disk filenames align with the
         // synthesized playlist URIs.
-        let offset = SpawnOffset { segment: 99, start_secs: 198.0 };
+        let offset = SpawnOffset {
+            segment: 99,
+            start_secs: 198.0,
+        };
         let args = build_args_for_offset(PlaybackMode::HlsRemux, offset);
 
         let input_pos = args.iter().position(|a| a == "-i").expect("-i");
@@ -2887,7 +2956,9 @@ seg_0_00100.m4s\n";
         let tmp = tempfile::tempdir().expect("tempdir");
         let raw = tmp.path().join(INIT_SEGMENT_RAW);
         let frozen = tmp.path().join(INIT_SEGMENT_FROZEN);
-        tokio::fs::write(&raw, b"init-bytes").await.expect("write init");
+        tokio::fs::write(&raw, b"init-bytes")
+            .await
+            .expect("write init");
 
         freeze_init_segment(tmp.path()).await;
 
@@ -2905,8 +2976,12 @@ seg_0_00100.m4s\n";
         let tmp = tempfile::tempdir().expect("tempdir");
         let raw = tmp.path().join(INIT_SEGMENT_RAW);
         let frozen = tmp.path().join(INIT_SEGMENT_FROZEN);
-        tokio::fs::write(&frozen, b"locked-v1").await.expect("write frozen");
-        tokio::fs::write(&raw, b"ffmpeg-rewrite").await.expect("write raw");
+        tokio::fs::write(&frozen, b"locked-v1")
+            .await
+            .expect("write frozen");
+        tokio::fs::write(&raw, b"ffmpeg-rewrite")
+            .await
+            .expect("write raw");
 
         freeze_init_segment(tmp.path()).await;
 
@@ -2938,10 +3013,7 @@ seg_0_00100.m4s\n";
         assert_eq!(HwAccel::from_env_value("nvidia"), Some(HwAccel::Nvenc));
         assert_eq!(HwAccel::from_env_value("vaapi"), Some(HwAccel::Vaapi));
         assert_eq!(HwAccel::from_env_value("qsv"), Some(HwAccel::Qsv));
-        assert_eq!(
-            HwAccel::from_env_value("quicksync"),
-            Some(HwAccel::Qsv)
-        );
+        assert_eq!(HwAccel::from_env_value("quicksync"), Some(HwAccel::Qsv));
         assert_eq!(
             HwAccel::from_env_value("videotoolbox"),
             Some(HwAccel::VideoToolbox)

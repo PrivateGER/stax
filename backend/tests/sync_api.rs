@@ -77,10 +77,7 @@ impl TestServer {
         Self::spawn_with_app(app).await
     }
 
-    async fn spawn_with_library_and_hls(
-        config: LibraryConfig,
-        hls_config: HlsConfig,
-    ) -> Self {
+    async fn spawn_with_library_and_hls(config: LibraryConfig, hls_config: HlsConfig) -> Self {
         let persistence = Persistence::open_in_memory().await.unwrap();
         let state = load_state_with_library_and_hls(persistence, config, hls_config)
             .await
@@ -196,10 +193,7 @@ impl TestServer {
                 return library;
             }
             if std::time::Instant::now() >= deadline {
-                panic!(
-                    "{} item(s) still have no probe outcome after 5s",
-                    pending
-                );
+                panic!("{} item(s) still have no probe outcome after 5s", pending);
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
@@ -336,7 +330,10 @@ async fn create_room_with_known_media_id_anchors_room_to_that_item() {
 
     let room: Room = response.json().await.unwrap();
     assert_eq!(room.media_id, Some(media_item.id));
-    assert_eq!(room.media_title.as_deref(), Some(media_item.file_name.as_str()));
+    assert_eq!(
+        room.media_title.as_deref(),
+        Some(media_item.file_name.as_str())
+    );
 
     // A restart should preserve the room-to-media link.
     let restored = server
@@ -727,7 +724,8 @@ async fn library_rescan_skips_ffprobe_for_unchanged_files() {
     server.wait_for_probes_complete().await;
     let after_second = count_probe_invocations(&counter);
     assert_eq!(
-        after_second, 3,
+        after_second,
+        3,
         "second scan with no changes must reuse cached probe metadata (saw {} new probes)",
         after_second - after_first
     );
@@ -2168,11 +2166,27 @@ fn external_av_tools_available() -> bool {
 fn generate_h264_ac3_mkv(path: &Path) {
     let output = std::process::Command::new("ffmpeg")
         .args([
-            "-y", "-loglevel", "error",
-            "-f", "lavfi", "-i", "testsrc=duration=2:size=320x240:rate=30",
-            "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
-            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
-            "-c:a", "ac3", "-b:a", "128k",
+            "-y",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=duration=2:size=320x240:rate=30",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=2",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "ac3",
+            "-b:a",
+            "128k",
             "-shortest",
         ])
         .arg(path)
@@ -2190,11 +2204,27 @@ fn generate_h264_ac3_mkv(path: &Path) {
 fn generate_h264_aac_mp4(path: &Path) {
     let output = std::process::Command::new("ffmpeg")
         .args([
-            "-y", "-loglevel", "error",
-            "-f", "lavfi", "-i", "testsrc=duration=2:size=320x240:rate=30",
-            "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
-            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-b:a", "96k",
+            "-y",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=duration=2:size=320x240:rate=30",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=2",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "96k",
             "-shortest",
         ])
         .arg(path)
@@ -2208,9 +2238,7 @@ fn generate_h264_aac_mp4(path: &Path) {
 }
 
 #[cfg(unix)]
-async fn hls_test_setup(
-    temp_dir: &TempDir,
-) -> (TestServer, syncplay_backend::protocol::MediaItem) {
+async fn hls_test_setup(temp_dir: &TempDir) -> (TestServer, syncplay_backend::protocol::MediaItem) {
     let root = temp_dir.path().join("library");
     fs::create_dir_all(&root).unwrap();
     generate_h264_ac3_mkv(&root.join("movie.mkv"));
@@ -2233,7 +2261,11 @@ async fn hls_test_setup(
     // Probe runs in the background after the walk; HLS tests need
     // playback_mode populated, which only lands after probe completes.
     let library = server.wait_for_probes_complete().await;
-    let item = library.items.into_iter().next().expect("scanned media item");
+    let item = library
+        .items
+        .into_iter()
+        .next()
+        .expect("scanned media item");
     (server, item)
 }
 
@@ -2520,10 +2552,7 @@ async fn hls_concurrent_master_requests_share_one_session() {
     let temp_dir = TempDir::new().unwrap();
     let (server, item) = hls_test_setup(&temp_dir).await;
 
-    let url = format!(
-        "{}/api/media/{}/hls/master.m3u8",
-        server.base_url, item.id
-    );
+    let url = format!("{}/api/media/{}/hls/master.m3u8", server.base_url, item.id);
     let (a, b) = tokio::join!(
         server.client.get(&url).send(),
         server.client.get(&url).send()
@@ -2539,6 +2568,93 @@ async fn hls_concurrent_master_requests_share_one_session() {
         manager.session_count().await,
         1,
         "concurrent callers should share a single HLS session"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn hls_full_transcode_uses_separate_sessions_for_safari_and_non_safari() {
+    if !external_av_tools_available() {
+        eprintln!("skipping: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+
+    let temp_dir = TempDir::new().unwrap();
+    let root = temp_dir.path().join("library");
+    fs::create_dir_all(&root).unwrap();
+    generate_h264_ac3_mkv(&root.join("movie.mkv"));
+
+    // Force `HlsFullTranscode` classification regardless of the synthetic
+    // source file so we can verify browser-specific session splitting:
+    // Safari should get the passthrough bucket, non-Safari the transcode one.
+    let probe = write_probe_script(
+        &temp_dir,
+        "probe-full-transcode.sh",
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+cat <<'JSON'
+{
+  "format": { "format_name": "matroska,webm", "duration": "2.0" },
+  "streams": [
+    { "codec_type": "video", "codec_name": "hevc", "width": 320, "height": 240 },
+    { "codec_type": "audio", "codec_name": "ac3" }
+  ]
+}
+JSON
+"#,
+    );
+
+    let library = LibraryConfig::from_paths(vec![root]).with_probe_command(probe);
+    let hls_config = HlsConfig {
+        cache_dir: temp_dir.path().join("hls-cache"),
+        max_concurrent: 4,
+        idle_secs: 60,
+        ffmpeg_command: Some(PathBuf::from("ffmpeg")),
+        hw_accel: Default::default(),
+        vaapi_device: None,
+    };
+
+    let server = TestServer::spawn_with_library_and_hls(library, hls_config).await;
+    server.scan_library().await;
+    let library = server.wait_for_probes_complete().await;
+    let item = library
+        .items
+        .into_iter()
+        .next()
+        .expect("scanned media item");
+
+    assert_eq!(
+        item.playback_mode,
+        syncplay_backend::protocol::PlaybackMode::HlsFullTranscode
+    );
+
+    let url = format!("{}/api/media/{}/hls/master.m3u8", server.base_url, item.id);
+    let safari_ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 12_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Safari/605.1.15";
+    let chrome_ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+
+    let safari_response = server
+        .client
+        .get(&url)
+        .header("user-agent", safari_ua)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(safari_response.status(), StatusCode::OK);
+
+    let chrome_response = server
+        .client
+        .get(&url)
+        .header("user-agent", chrome_ua)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(chrome_response.status(), StatusCode::OK);
+
+    let manager = server.hls.as_ref().expect("hls manager handle");
+    assert_eq!(
+        manager.session_count().await,
+        2,
+        "incompatible browser pipelines should not share one HLS session"
     );
 }
 
