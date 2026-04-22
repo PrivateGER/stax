@@ -533,7 +533,6 @@ async fn scan_library(
             state.thumbnails.enqueue(ThumbnailJob {
                 media_id: item.id,
                 media_path: std::path::PathBuf::from(&item.root_path).join(&item.relative_path),
-                root_path: std::path::PathBuf::from(&item.root_path),
                 video_codec: item.video_codec.clone(),
                 duration_seconds: item.duration_seconds,
             });

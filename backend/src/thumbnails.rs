@@ -12,12 +12,13 @@
 //! falling back to a video frame:
 //!   1. **Sidecar art** (Plex/Jellyfin convention: `poster.jpg`,
 //!      `cover.jpg`, `folder.jpg`, plus per-file `<basename>.jpg` and
-//!      `<basename>-poster.jpg`). Walks up to the library root so an
-//!      ancestor `poster.jpg` covers everything beneath it.
+//!      `<basename>-poster.jpg`). Limited to the file's own directory so a
+//!      whole series doesn't inherit one ancestor poster for every episode.
 //!   2. **Embedded `attached_pic`** (mkv/mp4/m4a cover art).
 //!   3. **Decoded video frame** via ffmpeg's `thumbnail` filter, which
 //!      scores 100 candidate frames and picks the most representative one
-//!      — strictly better than a fixed seek-and-grab.
+//!      from a later point in the file, avoiding the "every episode gets
+//!      the same 30-second cold-open frame" problem.
 
 use std::{
     env, fs,
@@ -89,7 +90,6 @@ impl ThumbnailConfig {
 pub struct ThumbnailJob {
     pub media_id: Uuid,
     pub media_path: PathBuf,
-    pub root_path: PathBuf,
     pub video_codec: Option<String>,
     pub duration_seconds: Option<f64>,
 }
@@ -102,7 +102,6 @@ impl ThumbnailJob {
         Self {
             media_id: pending.media_id,
             media_path,
-            root_path,
             video_codec: pending.video_codec,
             duration_seconds: pending.duration_seconds,
         }
@@ -291,7 +290,7 @@ async fn generate(job: &ThumbnailJob, config: &ThumbnailConfig) -> ThumbnailOutc
     }
 
     // Source 1: sidecar art (cheapest — a single file copy/scale).
-    if let Some(sidecar) = find_sidecar_art(&job.media_path, &job.root_path) {
+    if let Some(sidecar) = find_sidecar_art(&job.media_path) {
         if let Some(ffmpeg) = config.ffmpeg_command.as_deref() {
             debug!(
                 media_id = %job.media_id,
@@ -439,9 +438,9 @@ async fn render_from_frame(
 ) -> Result<(), String> {
     let seek = thumbnail_seek_seconds(duration_seconds);
     // `thumbnail=100` scores the next 100 frames after the seek and picks
-    // the most representative one; strictly better than the old "grab the
-    // first frame after seeking to 10%". The trailing scale keeps the
-    // cached jpeg width consistent with the other sources.
+    // the most representative one. We intentionally sample later in the
+    // file so episodic content doesn't collapse onto the same opening
+    // credits frame across a whole season.
     let result = Command::new(ffmpeg)
         .arg("-y")
         .arg("-loglevel")
@@ -491,9 +490,10 @@ fn classify_ffmpeg_result(
     }
 }
 
-/// Walk from the media file's directory up to the library root looking for
-/// recognized sidecar art. Returns the first match in priority order.
-fn find_sidecar_art(media_path: &Path, root_path: &Path) -> Option<PathBuf> {
+/// Look for sidecar art only in the media file's own directory. This keeps
+/// curated per-movie posters working while avoiding a single ancestor
+/// `poster.jpg` from flattening an entire show to one repeated image.
+fn find_sidecar_art(media_path: &Path) -> Option<PathBuf> {
     let parent = media_path.parent()?;
     let stem = media_path.file_stem()?.to_string_lossy().to_string();
 
@@ -507,22 +507,14 @@ fn find_sidecar_art(media_path: &Path, root_path: &Path) -> Option<PathBuf> {
         }
     }
 
-    // Per-folder art, walking up to (and including) the library root.
-    let mut current = Some(parent);
-    while let Some(dir) = current {
-        for basename in SIDECAR_BASENAMES {
-            for extension in SIDECAR_EXTENSIONS {
-                let candidate = dir.join(format!("{basename}.{extension}"));
-                if candidate.is_file() {
-                    return Some(candidate);
-                }
+    // Per-folder art, but only for the immediate directory.
+    for basename in SIDECAR_BASENAMES {
+        for extension in SIDECAR_EXTENSIONS {
+            let candidate = parent.join(format!("{basename}.{extension}"));
+            if candidate.is_file() {
+                return Some(candidate);
             }
         }
-
-        if dir == root_path {
-            break;
-        }
-        current = dir.parent();
     }
 
     None
@@ -555,13 +547,12 @@ pub fn thumbnail_is_up_to_date(
     thumbnail_modified >= media_modified
 }
 
-/// Skip the first ~5% of the file before letting the `thumbnail` filter
-/// score frames — avoids logos / black title cards while keeping the
-/// scoring window close enough to the start that we don't pay for a long
-/// decode walk.
+/// Sample a later point in the file before letting the `thumbnail` filter
+/// score frames. Using 20% avoids the repeated "30 second mark" thumbnails
+/// that long episodic content used to get from the old hard clamp.
 pub fn thumbnail_seek_seconds(duration_seconds: Option<f64>) -> f64 {
     match duration_seconds {
-        Some(duration) if duration > 0.0 => (duration * 0.05).clamp(0.0, 30.0),
+        Some(duration) if duration > 0.0 => duration * 0.20,
         _ => 0.0,
     }
 }
@@ -604,7 +595,7 @@ mod tests {
         let poster = root.join("movie-poster.jpg");
         fs::write(&poster, b"img").unwrap();
 
-        assert_eq!(find_sidecar_art(&media, root), Some(poster));
+        assert_eq!(find_sidecar_art(&media), Some(poster));
     }
 
     #[test]
@@ -616,7 +607,7 @@ mod tests {
         let cover = root.join("movie.png");
         fs::write(&cover, b"img").unwrap();
 
-        assert_eq!(find_sidecar_art(&media, root), Some(cover));
+        assert_eq!(find_sidecar_art(&media), Some(cover));
     }
 
     #[test]
@@ -630,11 +621,11 @@ mod tests {
         let folder_art = nested.join("folder.jpg");
         fs::write(&folder_art, b"img").unwrap();
 
-        assert_eq!(find_sidecar_art(&media, root), Some(folder_art));
+        assert_eq!(find_sidecar_art(&media), Some(folder_art));
     }
 
     #[test]
-    fn walks_up_to_root_for_ancestor_poster() {
+    fn does_not_use_ancestor_poster() {
         let temp = TempDir::new().unwrap();
         let root = temp.path();
         let nested = root.join("series").join("season-1");
@@ -644,11 +635,11 @@ mod tests {
         let ancestor_art = root.join("series").join("poster.jpg");
         fs::write(&ancestor_art, b"img").unwrap();
 
-        assert_eq!(find_sidecar_art(&media, root), Some(ancestor_art));
+        assert_eq!(find_sidecar_art(&media), None);
     }
 
     #[test]
-    fn does_not_walk_above_root() {
+    fn does_not_walk_above_immediate_directory() {
         let temp = TempDir::new().unwrap();
         let outside = temp.path().join("outside");
         fs::create_dir_all(&outside).unwrap();
@@ -659,13 +650,14 @@ mod tests {
         let media = root.join("movie.mkv");
         fs::write(&media, b"x").unwrap();
 
-        assert_eq!(find_sidecar_art(&media, &root), None);
+        assert_eq!(find_sidecar_art(&media), None);
     }
 
     #[test]
-    fn seek_seconds_clamps_to_thirty() {
-        assert_eq!(thumbnail_seek_seconds(Some(7200.0)), 30.0);
-        assert_eq!(thumbnail_seek_seconds(Some(60.0)), 3.0);
+    fn seek_seconds_uses_later_point_without_thirty_second_cap() {
+        assert_eq!(thumbnail_seek_seconds(Some(7200.0)), 1440.0);
+        assert_eq!(thumbnail_seek_seconds(Some(60.0)), 12.0);
+        assert_eq!(thumbnail_seek_seconds(Some(1500.0)), 300.0);
         assert_eq!(thumbnail_seek_seconds(Some(0.0)), 0.0);
         assert_eq!(thumbnail_seek_seconds(None), 0.0);
     }

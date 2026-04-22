@@ -186,7 +186,6 @@ async fn process_job(
         thumbnails.enqueue(ThumbnailJob {
             media_id,
             media_path: job.media_path,
-            root_path: job.root_path,
             video_codec,
             duration_seconds,
         });
