@@ -8,55 +8,56 @@ import type {
   StreamCopySummary,
 } from "./types";
 
-async function getJson<T>(url: string): Promise<T> {
-  const response = await fetch(url);
+type RequestOptions = {
+  method?: "GET" | "POST";
+  body?: unknown;
+  fallbackMessage?: string;
+};
 
-  if (!response.ok) {
-    const body = await response.json().catch(() => ({}) as { error?: string });
-    throw new Error(body.error ?? `Request failed with status ${response.status}`);
+async function request<T>(url: string, options: RequestOptions = {}): Promise<T> {
+  const init: RequestInit = { method: options.method ?? "GET" };
+  if (options.body !== undefined) {
+    init.headers = { "Content-Type": "application/json" };
+    init.body = JSON.stringify(options.body);
   }
 
+  const response = await fetch(url, init);
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}) as { error?: string });
+    throw new Error(
+      body.error ??
+        options.fallbackMessage ??
+        `Request failed with status ${response.status}`,
+    );
+  }
   return response.json() as Promise<T>;
 }
 
 export const api = {
-  health: () => getJson<HealthResponse>("/api/health"),
-  library: () => getJson<LibraryResponse>("/api/library"),
-  rooms: () => getJson<RoomsResponse>("/api/rooms"),
+  health: () => request<HealthResponse>("/api/health"),
+  library: () => request<LibraryResponse>("/api/library"),
+  rooms: () => request<RoomsResponse>("/api/rooms"),
 
-  scan: async (): Promise<LibraryScanResponse> => {
-    const response = await fetch("/api/library/scan", { method: "POST" });
+  scan: () =>
+    request<LibraryScanResponse>("/api/library/scan", {
+      method: "POST",
+      fallbackMessage: "Failed to scan library.",
+    }),
 
-    if (!response.ok) {
-      const body = await response.json().catch(() => ({}) as { error?: string });
-      throw new Error(body.error ?? "Failed to scan library.");
-    }
-
-    return response.json();
-  },
-
-  createRoom: async (input: {
+  createRoom: (input: {
     name: string;
     mediaId: string | null;
     mediaTitle?: string | null;
-  }): Promise<Room> => {
-    const response = await fetch("/api/rooms", {
+  }) =>
+    request<Room>("/api/rooms", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
+      body: {
         name: input.name,
         mediaId: input.mediaId,
         mediaTitle: input.mediaTitle ?? null,
-      }),
-    });
-
-    if (!response.ok) {
-      const body = await response.json().catch(() => ({}) as { error?: string });
-      throw new Error(body.error ?? "Failed to create room.");
-    }
-
-    return response.json();
-  },
+      },
+      fallbackMessage: "Failed to create room.",
+    }),
 
   getStreamCopy: async (mediaId: string): Promise<StreamCopySummary | null> => {
     const response = await fetch(`/api/media/${mediaId}/stream-copy`);
@@ -68,27 +69,12 @@ export const api = {
     return response.json() as Promise<StreamCopySummary>;
   },
 
-  createStreamCopy: async (
-    mediaId: string,
-    input: CreateStreamCopyRequest,
-  ): Promise<StreamCopySummary> => {
-    const response = await fetch(`/api/media/${mediaId}/stream-copy`, {
+  createStreamCopy: (mediaId: string, input: CreateStreamCopyRequest) =>
+    request<StreamCopySummary>(`/api/media/${mediaId}/stream-copy`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        audioStreamIndex: input.audioStreamIndex,
-        subtitleMode: input.subtitleMode,
-        subtitle: input.subtitle,
-      }),
-    });
-
-    if (!response.ok) {
-      const body = await response.json().catch(() => ({}) as { error?: string });
-      throw new Error(body.error ?? "Failed to create stream copy.");
-    }
-
-    return response.json();
-  },
+      body: input,
+      fallbackMessage: "Failed to create stream copy.",
+    }),
 };
 
 export function streamUrl(mediaId: string) {

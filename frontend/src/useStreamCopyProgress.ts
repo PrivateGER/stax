@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { api } from "./api";
+import { isActiveStreamCopy } from "./streamCopyProgress";
 import type { StreamCopySummary } from "./types";
 
 const POLL_INTERVAL_MS = 750;
@@ -16,10 +17,6 @@ export type UseStreamCopyProgress = {
   seedFromCreate: (summary: StreamCopySummary) => void;
 };
 
-function isActive(summary: StreamCopySummary | null): boolean {
-  return summary?.status === "queued" || summary?.status === "running";
-}
-
 export function useStreamCopyProgress({
   mediaId,
   fallback,
@@ -34,7 +31,7 @@ export function useStreamCopyProgress({
   }, [mediaId]);
 
   const summary = liveSummary ?? fallback;
-  const shouldPoll = Boolean(mediaId) && isActive(summary);
+  const shouldPoll = Boolean(mediaId) && isActiveStreamCopy(summary);
 
   useEffect(() => {
     if (!shouldPoll || !mediaId) return;
