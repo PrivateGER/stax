@@ -10,6 +10,8 @@ Monorepo with two independent projects:
 - `frontend/` — React 19 + TypeScript + Vite SPA
 - `docs/architecture.md` and `docs/product-direction.md` — target system design, phased roadmap, and UX guardrails. Read these before making architectural changes; they also distinguish v1 non-goals (auth, native apps, transcoding) from what belongs in scope.
 
+This project uses jujutsu VCS. Use it directly, rather than git.
+
 ## Common Commands
 
 Backend (run from `backend/`):
