@@ -116,7 +116,11 @@ export function TitlePage({ item, rooms, onRoomCreated, onRefresh }: Props) {
   }
 
   const title = displayMediaTitle(item);
-  const relatedRooms = rooms.filter((room) => room.mediaId === item.id);
+  const relatedRooms = rooms
+    .filter((room) => room.mediaId === item.id)
+    .slice()
+    .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+  const joinableRoom = relatedRooms[0] ?? null;
   const canPlay = item.preparationState === "direct" || item.preparationState === "prepared";
   const subtitleSourceCount = item.subtitleTracks.length + item.subtitleStreams.length;
 
@@ -205,14 +209,36 @@ export function TitlePage({ item, rooms, onRoomCreated, onRefresh }: Props) {
             >
               {canPlay ? "▶ Play" : "Needs stream copy"}
             </button>
-            <button
-              className="ghost-button"
-              disabled={watchTogether.creating}
-              onClick={() => void watchTogether.start()}
-              type="button"
-            >
-              {watchTogether.creating ? "Starting…" : "Watch Together"}
-            </button>
+            {joinableRoom ? (
+              <button
+                className="ghost-button"
+                onClick={() =>
+                  navigate({ name: "watch", mediaId: item.id, roomId: joinableRoom.id })
+                }
+                type="button"
+              >
+                Join session
+              </button>
+            ) : (
+              <button
+                className="ghost-button"
+                disabled={watchTogether.creating}
+                onClick={() => void watchTogether.start()}
+                type="button"
+              >
+                {watchTogether.creating ? "Starting…" : "Watch Together"}
+              </button>
+            )}
+            {joinableRoom ? (
+              <button
+                className="link-button"
+                disabled={watchTogether.creating}
+                onClick={() => void watchTogether.start()}
+                type="button"
+              >
+                {watchTogether.creating ? "Starting…" : "Start a new session"}
+              </button>
+            ) : null}
           </div>
 
           {watchTogether.error ? <p className="error">{watchTogether.error}</p> : null}
