@@ -39,9 +39,12 @@ Backend reads from env vars (see `main.rs` and `library.rs`):
 - `SYNCPLAY_API_ADDR` — bind address, defaults to `127.0.0.1:3001`
 - `SYNCPLAY_DATABASE_PATH` — SQLite file, defaults to `backend/syncplay.db`
 - `SYNCPLAY_LIBRARY_ROOTS` — colon-separated list of media directories to index
+- `SYNCPLAY_WALK_WORKERS` — concurrent directory listings during the scan walk (default `8`). Tune higher when indexing high-latency mounts (SMB, sshfs) where each `read_dir` round-trips over the network. The walk is the synchronous portion of `POST /api/library/scan`; probes and thumbnails happen afterwards in the background pools.
 - `SYNCPLAY_FFPROBE_BIN` — override the `ffprobe` binary used for probing
+- `SYNCPLAY_PROBE_WORKERS` — concurrent `ffprobe` invocations the background probe pool runs in parallel (default `4`). The scan walk only persists rows; ffprobe runs asynchronously and the frontend polls until `probed_at` / `probe_error` lands. Scans reuse persisted probe results when a file's `(size_bytes, modified_at)` is unchanged, so a re-scan of a stable library issues zero probes.
 - `SYNCPLAY_FFMPEG_BIN` — override the `ffmpeg` binary used for thumbnail generation (empty string disables)
 - `SYNCPLAY_THUMBNAIL_DIR` — cache directory for generated thumbnails (default `syncplay-thumbnails`)
+- `SYNCPLAY_THUMBNAIL_WORKERS` — concurrent ffmpeg processes the background thumbnail pool will run (default `2`). Generation is asynchronous: scans return immediately and workers fill in `thumbnail_generated_at` / `thumbnail_error` as they complete.
 - `SYNCPLAY_FRONTEND_ORIGIN` — tightens CORS to a specific origin (default: Any)
 - `SYNCPLAY_HLS_HW_ACCEL` — hardware accelerator for the HLS full-transcode tier; one of `none` (default), `nvenc`, `vaapi`, `qsv`, `videotoolbox`. Unknown values warn and fall back to `none`. Only the `HlsFullTranscode` tier is affected — `HlsRemux` and `HlsAudioTranscode` always use `-c:v copy`.
 - `SYNCPLAY_HLS_VAAPI_DEVICE` — DRM render node for VAAPI (default `/dev/dri/renderD128`).
@@ -59,6 +62,7 @@ The backend owns the playback clock for every room. Clients send *intent* (`play
 - `protocol.rs` — all HTTP request/response and WebSocket event types (serde)
 - `clock.rs` — `AuthoritativePlaybackClock`, drift math, timestamp formatting
 - `library.rs` — library roots, recursive scanning, `ffprobe` metadata, sidecar subtitle discovery
+- `thumbnails.rs` — background `ThumbnailWorkerPool` (semaphore-bounded), source-aware generation pipeline (sidecar art → embedded `attached_pic` → `ffmpeg thumbnail` filter)
 - `streaming.rs` — HTTP range responses for media, on-the-fly SRT → WebVTT conversion for subtitles
 - `persistence.rs` — SQLx/SQLite access, migrations in `backend/migrations/*.sql`
 

@@ -14,7 +14,11 @@ export function formatDuration(durationSeconds: number) {
     return `${hours}h ${minutes}m`;
   }
 
-  return `${minutes}m`;
+  if (minutes > 0) {
+    return `${minutes}m`;
+  }
+
+  return `${totalSeconds}s`;
 }
 
 export function formatTimeCode(seconds: number) {

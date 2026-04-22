@@ -46,7 +46,21 @@ export function usePlayerSource(
         return;
       }
 
-      hls = new Hls();
+      // hls.js defaults give up after ~15s of manifest retries. For the
+      // transcode tier the first segment can take noticeably longer than that
+      // on modest hardware (e.g. 10-bit HEVC → h264_vaapi), during which the
+      // backend returns 503 so hls.js can back off and try again. Widen the
+      // retry window so we keep polling until the backend's readiness watcher
+      // flips `is_ready`, rather than surfacing a fatal error the user has to
+      // manually retry through.
+      hls = new Hls({
+        manifestLoadingMaxRetry: 8,
+        manifestLoadingRetryDelay: 1000,
+        manifestLoadingMaxRetryTimeout: 8000,
+        levelLoadingMaxRetry: 8,
+        levelLoadingRetryDelay: 1000,
+        levelLoadingMaxRetryTimeout: 8000,
+      });
       hls.on(Hls.Events.ERROR, (_event, data) => {
         if (!data.fatal) return;
         if (data.response?.code === 415) {

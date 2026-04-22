@@ -1,22 +1,32 @@
 use std::{
     collections::{BTreeSet, HashMap},
     env, fs,
+    future::Future,
     path::{Path, PathBuf},
-    process::Command,
+    pin::Pin,
+    sync::Arc,
+    time::Instant,
 };
 
 use serde::Deserialize;
 use time::OffsetDateTime;
-use tokio::task;
-use tracing::warn;
+use tokio::{process::Command, sync::Semaphore, task::{self, JoinSet}};
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::{
     clock::{format_timestamp, round_to},
-    persistence::{LibrarySnapshot, Persistence, PersistenceError},
+    persistence::{
+        CachedMediaRecord, CachedProbeFields, LibrarySnapshot, Persistence, PersistenceError,
+        ProbeOutcome, WalkRecord,
+    },
     protocol::{
         AudioStream, LibraryResponse, LibraryScanResponse, MediaItem, PlaybackMode, SubtitleStream,
         SubtitleTrack,
+    },
+    thumbnails::{
+        default_ffmpeg_command, default_thumbnail_cache_dir, ffmpeg_command_from_env,
+        thumbnail_cache_dir_from_env, thumbnail_is_up_to_date, thumbnail_path_for,
     },
 };
 
@@ -24,8 +34,9 @@ const SUPPORTED_MEDIA_EXTENSIONS: &[&str] = &[
     "mp4", "mkv", "webm", "mov", "m4v", "avi", "mp3", "flac", "wav", "m4a", "aac", "ogg",
 ];
 const SUPPORTED_SUBTITLE_EXTENSIONS: &[&str] = &["vtt", "srt"];
-const DEFAULT_THUMBNAIL_CACHE_DIR: &str = "syncplay-thumbnails";
-const THUMBNAIL_WIDTH: u32 = 480;
+
+const DEFAULT_PROBE_WORKERS: usize = 4;
+const DEFAULT_WALK_WORKERS: usize = 8;
 
 #[derive(Clone, Debug)]
 pub struct LibraryConfig {
@@ -33,6 +44,8 @@ pub struct LibraryConfig {
     probe_command: Option<PathBuf>,
     ffmpeg_command: Option<PathBuf>,
     thumbnail_cache_dir: Option<PathBuf>,
+    probe_workers: usize,
+    walk_workers: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -41,82 +54,15 @@ pub struct LibraryService {
     persistence: Persistence,
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct ScannedMediaItem {
-    pub id: Uuid,
-    pub root_path: String,
-    pub relative_path: String,
-    pub file_name: String,
-    pub extension: Option<String>,
-    pub size_bytes: u64,
-    pub modified_at: String,
-    pub indexed_at: String,
-    pub content_type: Option<String>,
-    pub duration_seconds: Option<f64>,
-    pub container_name: Option<String>,
-    pub video_codec: Option<String>,
-    pub audio_codec: Option<String>,
-    pub width: Option<u32>,
-    pub height: Option<u32>,
-    pub probed_at: Option<String>,
-    pub probe_error: Option<String>,
-    pub subtitle_tracks: Vec<SubtitleTrack>,
-    pub thumbnail_generated_at: Option<String>,
-    pub thumbnail_error: Option<String>,
-    pub playback_mode: PlaybackMode,
-    pub video_profile: Option<String>,
-    pub video_level: Option<u32>,
-    pub video_pix_fmt: Option<String>,
-    pub video_bit_depth: Option<u8>,
-    pub audio_streams: Vec<AudioStream>,
-    pub subtitle_streams: Vec<SubtitleStream>,
-}
-
-#[derive(Clone, Debug, Default)]
-struct ThumbnailOutcome {
-    generated_at: Option<String>,
-    error: Option<String>,
-}
-
-#[derive(Clone, Debug)]
-struct ProbeMetadata {
-    duration_seconds: Option<f64>,
-    container_name: Option<String>,
-    video_codec: Option<String>,
-    audio_codec: Option<String>,
-    width: Option<u32>,
-    height: Option<u32>,
-    probed_at: Option<String>,
-    probe_error: Option<String>,
-    playback_mode: PlaybackMode,
-    video_profile: Option<String>,
-    video_level: Option<u32>,
-    video_pix_fmt: Option<String>,
-    video_bit_depth: Option<u8>,
-    audio_streams: Vec<AudioStream>,
-    subtitle_streams: Vec<SubtitleStream>,
-}
-
-impl Default for ProbeMetadata {
-    fn default() -> Self {
-        Self {
-            duration_seconds: None,
-            container_name: None,
-            video_codec: None,
-            audio_codec: None,
-            width: None,
-            height: None,
-            probed_at: None,
-            probe_error: None,
-            playback_mode: PlaybackMode::Direct,
-            video_profile: None,
-            video_level: None,
-            video_pix_fmt: None,
-            video_bit_depth: None,
-            audio_streams: Vec::new(),
-            subtitle_streams: Vec::new(),
-        }
-    }
+/// Outcome of the walk stage for one library root. Used so the scan
+/// handler in `lib.rs` can enqueue probes/thumbnails for the freshly-
+/// inserted rows without a second pass over the database.
+#[derive(Debug, Default)]
+pub struct WalkOutcome {
+    pub total: usize,
+    pub cached: usize,
+    pub pending: usize,
+    pub elapsed_ms: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -160,6 +106,8 @@ impl Default for LibraryConfig {
             probe_command: default_probe_command(),
             ffmpeg_command: default_ffmpeg_command(),
             thumbnail_cache_dir: Some(default_thumbnail_cache_dir()),
+            probe_workers: DEFAULT_PROBE_WORKERS,
+            walk_workers: DEFAULT_WALK_WORKERS,
         }
     }
 }
@@ -173,6 +121,8 @@ impl LibraryConfig {
         config.probe_command = probe_command_from_env();
         config.ffmpeg_command = ffmpeg_command_from_env();
         config.thumbnail_cache_dir = thumbnail_cache_dir_from_env();
+        config.probe_workers = probe_workers_from_env();
+        config.walk_workers = walk_workers_from_env();
         config
     }
 
@@ -190,6 +140,8 @@ impl LibraryConfig {
             probe_command: default_probe_command(),
             ffmpeg_command: default_ffmpeg_command(),
             thumbnail_cache_dir: Some(default_thumbnail_cache_dir()),
+            probe_workers: DEFAULT_PROBE_WORKERS,
+            walk_workers: DEFAULT_WALK_WORKERS,
         }
     }
 
@@ -233,6 +185,24 @@ impl LibraryConfig {
     pub fn thumbnail_cache_dir(&self) -> Option<&Path> {
         self.thumbnail_cache_dir.as_deref()
     }
+
+    pub fn with_probe_workers(mut self, probe_workers: usize) -> Self {
+        self.probe_workers = probe_workers.max(1);
+        self
+    }
+
+    pub fn probe_workers(&self) -> usize {
+        self.probe_workers.max(1)
+    }
+
+    pub fn with_walk_workers(mut self, walk_workers: usize) -> Self {
+        self.walk_workers = walk_workers.max(1);
+        self
+    }
+
+    pub fn walk_workers(&self) -> usize {
+        self.walk_workers.max(1)
+    }
 }
 
 impl LibraryService {
@@ -270,34 +240,46 @@ impl LibraryService {
             .map(|dir| thumbnail_path_for(dir, media_id))
     }
 
+    /// Stage 1 of the staged scan pipeline: walk every configured library
+    /// root, upsert one row per discovered file, and prune rows for files
+    /// that are no longer on disk. Returns once the database is consistent
+    /// with the filesystem; callers should then enqueue probes/thumbnails
+    /// for the rows still missing metadata (the `WalkOutcome` per root
+    /// reports the count). The actual probe work happens on the background
+    /// `ProbeWorkerPool` — see `crate::probes`.
     pub async fn scan(&self) -> Result<LibraryScanResponse, PersistenceError> {
         self.sync_config().await?;
 
         let scanned_at = format_timestamp(OffsetDateTime::now_utc());
-        let probe_command = self.config.probe_command().map(Path::to_path_buf);
-        let ffmpeg_command = self.config.ffmpeg_command().map(Path::to_path_buf);
         let thumbnail_cache_dir = self.config.thumbnail_cache_dir().map(Path::to_path_buf);
+        let walk_workers = self.config.walk_workers();
 
         for root_path in self.config.root_paths() {
             let root_path_string = root_path.to_string_lossy().to_string();
-            let existing_ids = self
+            let existing_records = self
                 .persistence
-                .existing_media_ids(&root_path_string)
+                .existing_media_records(&root_path_string)
                 .await?;
 
-            match scan_root(
+            match walk_root(
                 root_path.clone(),
-                probe_command.clone(),
-                ffmpeg_command.clone(),
                 thumbnail_cache_dir.clone(),
-                existing_ids,
+                existing_records,
+                walk_workers,
+                self.persistence.clone(),
             )
             .await
             {
-                Ok(items) => {
-                    self.persistence
-                        .replace_library_scan(&root_path_string, &items)
-                        .await?;
+                Ok(outcome) => {
+                    info!(
+                        root = %root_path_string,
+                        total = outcome.total,
+                        cached = outcome.cached,
+                        pending = outcome.pending,
+                        elapsed_ms = outcome.elapsed_ms,
+                        "library walk complete"
+                    );
+                    self.persistence.mark_root_scanned(&root_path_string).await?;
                 }
                 Err(error) => {
                     warn!(path = %root_path_string, %error, "library root scan failed");
@@ -332,134 +314,352 @@ impl LibrarySnapshot {
     }
 }
 
-async fn scan_root(
-    root_path: PathBuf,
-    probe_command: Option<PathBuf>,
-    ffmpeg_command: Option<PathBuf>,
-    thumbnail_cache_dir: Option<PathBuf>,
-    existing_ids: HashMap<String, Uuid>,
-) -> Result<Vec<ScannedMediaItem>, String> {
-    task::spawn_blocking(move || {
-        scan_root_blocking(
-            &root_path,
-            probe_command.as_deref(),
-            ffmpeg_command.as_deref(),
-            thumbnail_cache_dir.as_deref(),
-            &existing_ids,
-        )
-    })
-    .await
-    .map_err(|error| format!("scan worker failed: {error}"))?
+/// One file's worth of metadata produced by the per-directory blocking
+/// scan. The `metadata` is `fs::Metadata` so we can compute the modified
+/// timestamp and size without a second stat. Subtitles are pre-attached
+/// per matching media stem so the recursive walker doesn't need a second
+/// `read_dir` per media file (the dominant cost on SMB).
+#[derive(Debug)]
+struct DirMediaCandidate {
+    relative_path: String,
+    file_name: String,
+    extension: Option<String>,
+    size_bytes: u64,
+    modified_at: String,
+    modified_system: Option<std::time::SystemTime>,
+    subtitle_tracks: Vec<SubtitleTrack>,
 }
 
-fn scan_root_blocking(
-    root_path: &Path,
-    probe_command: Option<&Path>,
-    ffmpeg_command: Option<&Path>,
-    thumbnail_cache_dir: Option<&Path>,
-    existing_ids: &HashMap<String, Uuid>,
-) -> Result<Vec<ScannedMediaItem>, String> {
-    let root_metadata = fs::metadata(root_path).map_err(|error| {
+#[derive(Debug, Default)]
+struct DirContents {
+    subdirs: Vec<PathBuf>,
+    media: Vec<DirMediaCandidate>,
+}
+
+/// Shared state passed down the recursive walk. Cloning is cheap (only
+/// `Arc`s and small fields).
+#[derive(Clone)]
+struct WalkContext {
+    root_path: Arc<PathBuf>,
+    root_path_string: Arc<String>,
+    persistence: Persistence,
+    existing_records: Arc<HashMap<String, CachedMediaRecord>>,
+    indexed_at: Arc<String>,
+    thumbnail_cache_dir: Option<Arc<PathBuf>>,
+    semaphore: Arc<Semaphore>,
+}
+
+async fn walk_root(
+    root_path: PathBuf,
+    thumbnail_cache_dir: Option<PathBuf>,
+    existing_records: HashMap<String, CachedMediaRecord>,
+    walk_workers: usize,
+    persistence: Persistence,
+) -> Result<WalkOutcome, String> {
+    let metadata = fs::metadata(&root_path).map_err(|error| {
         format!(
             "could not read library root '{}': {error}",
             root_path.display()
         )
     })?;
-
-    if !root_metadata.is_dir() {
+    if !metadata.is_dir() {
         return Err(format!(
             "library root '{}' is not a directory",
             root_path.display()
         ));
     }
 
-    let indexed_at = format_timestamp(OffsetDateTime::now_utc());
+    let started = Instant::now();
     let root_path_string = root_path.to_string_lossy().to_string();
-    let mut items = Vec::new();
-
-    collect_media_items(
-        root_path,
-        root_path,
-        probe_command,
-        ffmpeg_command,
-        thumbnail_cache_dir,
-        existing_ids,
-        &root_path_string,
-        &indexed_at,
-        &mut items,
-    );
-    items.sort_unstable_by(|left, right| {
-        left.root_path
-            .cmp(&right.root_path)
-            .then_with(|| left.relative_path.cmp(&right.relative_path))
-    });
-
-    Ok(items)
-}
-
-fn collect_media_items(
-    root_path: &Path,
-    current_path: &Path,
-    probe_command: Option<&Path>,
-    ffmpeg_command: Option<&Path>,
-    thumbnail_cache_dir: Option<&Path>,
-    existing_ids: &HashMap<String, Uuid>,
-    root_path_string: &str,
-    indexed_at: &str,
-    items: &mut Vec<ScannedMediaItem>,
-) {
-    let Ok(entries) = fs::read_dir(current_path) else {
-        warn!(path = %current_path.display(), "skipping unreadable directory during library scan");
-        return;
+    let context = WalkContext {
+        root_path: Arc::new(root_path.clone()),
+        root_path_string: Arc::new(root_path_string.clone()),
+        persistence: persistence.clone(),
+        existing_records: Arc::new(existing_records),
+        indexed_at: Arc::new(format_timestamp(OffsetDateTime::now_utc())),
+        thumbnail_cache_dir: thumbnail_cache_dir.map(Arc::new),
+        semaphore: Arc::new(Semaphore::new(walk_workers.max(1))),
     };
 
-    let mut entries = entries.filter_map(Result::ok).collect::<Vec<_>>();
-    entries.sort_unstable_by_key(|entry| entry.path());
+    let stats = walk_dir(context.clone(), root_path).await?;
 
-    for entry in entries {
+    persistence
+        .prune_missing_paths(&root_path_string, &stats.kept_ids)
+        .await
+        .map_err(|error| format!("prune failed: {error}"))?;
+
+    Ok(WalkOutcome {
+        total: stats.kept_ids.len(),
+        cached: stats.cached,
+        pending: stats.pending,
+        elapsed_ms: started.elapsed().as_millis() as u64,
+    })
+}
+
+#[derive(Debug, Default)]
+struct WalkStats {
+    kept_ids: Vec<Uuid>,
+    cached: usize,
+    pending: usize,
+}
+
+impl WalkStats {
+    fn merge(&mut self, other: WalkStats) {
+        self.kept_ids.extend(other.kept_ids);
+        self.cached += other.cached;
+        self.pending += other.pending;
+    }
+}
+
+/// Recursive parallel directory walk. Each `read_dir` is dispatched to
+/// `spawn_blocking` (so blocking SMB I/O doesn't starve the runtime) and
+/// gated by the shared semaphore (so we don't fork-bomb the network with
+/// thousands of in-flight directory listings). Subdirectories are
+/// recursed into in parallel via `JoinSet`.
+fn walk_dir(
+    context: WalkContext,
+    dir: PathBuf,
+) -> Pin<Box<dyn Future<Output = Result<WalkStats, String>> + Send>> {
+    Box::pin(async move {
+        let permit = context
+            .semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("walk semaphore should not close");
+        let dir_for_blocking = dir.clone();
+        let root_for_blocking = Arc::clone(&context.root_path);
+        let indexed_at_for_blocking = Arc::clone(&context.indexed_at);
+        let contents = task::spawn_blocking(move || {
+            classify_directory(&root_for_blocking, &dir_for_blocking, &indexed_at_for_blocking)
+        })
+        .await
+        .map_err(|error| format!("walker task panicked: {error}"))?;
+        // Release the permit before recursing so child tasks can grab it.
+        drop(permit);
+
+        let DirContents { subdirs, media } = contents;
+
+        // Fan out subdirectory scans in parallel.
+        let mut joinset = JoinSet::new();
+        for subdir in subdirs {
+            let context = context.clone();
+            joinset.spawn(walk_dir(context, subdir));
+        }
+
+        let mut stats = WalkStats::default();
+
+        // Persist this directory's media files. Writes go to a single
+        // SQLite connection so parallelism here would just queue at the
+        // pool — process serially to keep the code simple.
+        for candidate in media {
+            match build_walk_record(&context, candidate) {
+                Ok((record, is_cached)) => {
+                    let media_id = record.id;
+                    if let Err(error) = context.persistence.upsert_walk_record(&record).await {
+                        warn!(%media_id, %error, "failed to upsert walk record");
+                        continue;
+                    }
+                    stats.kept_ids.push(media_id);
+                    if is_cached {
+                        stats.cached += 1;
+                    } else {
+                        stats.pending += 1;
+                    }
+                }
+                Err(error) => warn!(%error, "skipping media file with malformed walk record"),
+            }
+        }
+
+        while let Some(result) = joinset.join_next().await {
+            match result {
+                Ok(Ok(child)) => stats.merge(child),
+                Ok(Err(error)) => warn!(%error, "subdirectory walk failed"),
+                Err(error) => warn!(%error, "subdirectory walker panicked"),
+            }
+        }
+
+        Ok(stats)
+    })
+}
+
+/// Build a `WalkRecord` from a discovered candidate. Decides cache hit
+/// vs. miss based on `(size_bytes, modified_at)` against the prior row.
+/// Returns `(record, is_cache_hit)` so callers can tally cached vs.
+/// pending counts.
+fn build_walk_record(
+    context: &WalkContext,
+    candidate: DirMediaCandidate,
+) -> Result<(WalkRecord, bool), String> {
+    let prior = context.existing_records.get(&candidate.relative_path);
+    let media_id = prior.map(|record| record.id).unwrap_or_else(Uuid::new_v4);
+
+    // Cache reuse: same size + same mtime + last probe didn't error.
+    // Failed probes always retry (the file may have been fixed); a
+    // successful probe sticks until the file changes.
+    let cached = prior.and_then(|record| {
+        let unchanged = record.size_bytes == candidate.size_bytes
+            && record.modified_at == candidate.modified_at
+            && record.probe_error.is_none()
+            && record.probed_at.is_some();
+        if unchanged {
+            Some(CachedProbeFields {
+                probed_at: record.probed_at.clone(),
+                probe_error: record.probe_error.clone(),
+                duration_seconds: record.duration_seconds,
+                container_name: record.container_name.clone(),
+                video_codec: record.video_codec.clone(),
+                audio_codec: record.audio_codec.clone(),
+                width: record.width,
+                height: record.height,
+                playback_mode: record.playback_mode,
+                video_profile: record.video_profile.clone(),
+                video_level: record.video_level,
+                video_pix_fmt: record.video_pix_fmt.clone(),
+                video_bit_depth: record.video_bit_depth,
+                audio_streams: record.audio_streams.clone(),
+                subtitle_streams: record.subtitle_streams.clone(),
+            })
+        } else {
+            None
+        }
+    });
+    let is_cache_hit = cached.is_some();
+
+    // Only carry the cached thumbnail outcome through if both the file is
+    // unchanged AND the cached jpeg on disk is still up to date with the
+    // source. Otherwise leave it blank so the thumbnail pool re-runs.
+    let cached_thumbnail = if is_cache_hit {
+        let on_disk_fresh = context
+            .thumbnail_cache_dir
+            .as_deref()
+            .map(|dir| thumbnail_path_for(dir, media_id))
+            .map(|path| thumbnail_is_up_to_date(&path, candidate.modified_system))
+            .unwrap_or(false);
+
+        if on_disk_fresh {
+            // Mark fresh; future loads can stream it directly.
+            Some((
+                Some(format_timestamp(OffsetDateTime::now_utc())),
+                None,
+            ))
+        } else {
+            // Re-queue thumbnail generation by leaving the columns NULL.
+            Some((None, None))
+        }
+    } else {
+        None
+    };
+
+    let content_type = candidate
+        .extension
+        .as_deref()
+        .and_then(content_type_for_extension)
+        .map(str::to_string);
+
+    Ok((
+        WalkRecord {
+            id: media_id,
+            root_path: context.root_path_string.as_ref().clone(),
+            relative_path: candidate.relative_path,
+            file_name: candidate.file_name,
+            extension: candidate.extension,
+            size_bytes: candidate.size_bytes,
+            modified_at: candidate.modified_at,
+            indexed_at: context.indexed_at.as_ref().clone(),
+            content_type,
+            subtitle_tracks: candidate.subtitle_tracks,
+            cached_probe: cached,
+            cached_thumbnail,
+        },
+        is_cache_hit,
+    ))
+}
+
+/// Single-`read_dir` partition of a directory's children into
+/// subdirectories, media candidates, and sidecar subtitles. Sidecars are
+/// matched to media files by stem in-place so the caller doesn't need to
+/// re-list the directory per media file. This is the optimization that
+/// kills the N×directory-listing cost the previous implementation had on
+/// high-latency filesystems.
+fn classify_directory(
+    root_path: &Path,
+    dir: &Path,
+    indexed_at: &str,
+) -> DirContents {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            warn!(path = %dir.display(), %error, "skipping unreadable directory during library scan");
+            return DirContents::default();
+        }
+    };
+
+    let mut subdirs = Vec::new();
+    let mut media_entries: Vec<(PathBuf, fs::Metadata, String, String)> = Vec::new();
+    // (path, stem, extension)
+    let mut subtitle_entries: Vec<(PathBuf, String, String)> = Vec::new();
+
+    for entry in entries.filter_map(Result::ok) {
         let path = entry.path();
-        let Ok(file_type) = entry.file_type() else {
-            warn!(path = %path.display(), "skipping path with unreadable file type during library scan");
-            continue;
+        let file_type = match entry.file_type() {
+            Ok(value) => value,
+            Err(error) => {
+                warn!(path = %path.display(), %error, "skipping path with unreadable file type during library scan");
+                continue;
+            }
         };
 
         if file_type.is_symlink() {
             continue;
         }
-
         if file_type.is_dir() {
-            collect_media_items(
-                root_path,
-                &path,
-                probe_command,
-                ffmpeg_command,
-                thumbnail_cache_dir,
-                existing_ids,
-                root_path_string,
-                indexed_at,
-                items,
-            );
+            subdirs.push(path);
+            continue;
+        }
+        if !file_type.is_file() {
             continue;
         }
 
-        if !file_type.is_file() || !is_supported_media_path(&path) {
-            continue;
-        }
-
-        let Ok(metadata) = entry.metadata() else {
-            warn!(path = %path.display(), "skipping unreadable file during library scan");
+        let Some(extension) = normalized_extension(&path) else {
             continue;
         };
+        let stem = path
+            .file_stem()
+            .map(|value| value.to_string_lossy().to_string())
+            .unwrap_or_default();
 
-        let modified_at = metadata
-            .modified()
-            .ok()
+        if SUPPORTED_MEDIA_EXTENSIONS.contains(&extension.as_str()) {
+            let metadata = match entry.metadata() {
+                Ok(value) => value,
+                Err(error) => {
+                    warn!(path = %path.display(), %error, "skipping unreadable file during library scan");
+                    continue;
+                }
+            };
+            media_entries.push((path, metadata, stem, extension));
+        } else if SUPPORTED_SUBTITLE_EXTENSIONS.contains(&extension.as_str()) {
+            subtitle_entries.push((path, stem, extension));
+        }
+    }
+
+    subdirs.sort_unstable();
+    media_entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+    let mut media = Vec::with_capacity(media_entries.len());
+    for (path, metadata, media_stem, extension) in media_entries {
+        let modified_system = metadata.modified().ok();
+        let modified_at = modified_system
             .map(OffsetDateTime::from)
             .map(format_timestamp)
             .unwrap_or_else(|| indexed_at.to_string());
 
         let Some(relative_path) = normalize_relative_path(path.strip_prefix(root_path).ok()) else {
-            warn!(path = %path.display(), root = %root_path.display(), "skipping file outside library root");
+            warn!(
+                path = %path.display(),
+                root = %root_path.display(),
+                "skipping file outside library root"
+            );
             continue;
         };
 
@@ -467,135 +667,60 @@ fn collect_media_items(
             .file_name()
             .map(|value| value.to_string_lossy().to_string())
             .unwrap_or_else(|| relative_path.clone());
-        let extension = normalized_extension(&path);
-        let probe_metadata = probe_media_metadata(&path, extension.as_deref(), probe_command);
-        let subtitle_tracks = discover_sidecar_subtitles(root_path, &path);
-        let media_id = existing_ids
-            .get(&relative_path)
-            .copied()
-            .unwrap_or_else(Uuid::new_v4);
-        let thumbnail = generate_thumbnail(
-            &path,
-            media_id,
-            metadata.modified().ok(),
-            probe_metadata.video_codec.as_deref(),
-            probe_metadata.duration_seconds,
-            ffmpeg_command,
-            thumbnail_cache_dir,
-        );
 
-        items.push(ScannedMediaItem {
-            id: media_id,
-            root_path: root_path_string.to_string(),
+        let mut subtitle_tracks: Vec<SubtitleTrack> = subtitle_entries
+            .iter()
+            .filter_map(|(sub_path, sub_stem, sub_ext)| {
+                build_sidecar_track(root_path, &media_stem, sub_path, sub_stem, sub_ext)
+            })
+            .collect();
+        subtitle_tracks
+            .sort_unstable_by(|left, right| left.relative_path.cmp(&right.relative_path));
+
+        media.push(DirMediaCandidate {
             relative_path,
             file_name,
-            extension: extension.clone(),
+            extension: Some(extension),
             size_bytes: metadata.len(),
             modified_at,
-            indexed_at: indexed_at.to_string(),
-            content_type: extension
-                .as_deref()
-                .and_then(content_type_for_extension)
-                .map(str::to_string),
-            duration_seconds: probe_metadata.duration_seconds,
-            container_name: probe_metadata.container_name,
-            video_codec: probe_metadata.video_codec,
-            audio_codec: probe_metadata.audio_codec,
-            width: probe_metadata.width,
-            height: probe_metadata.height,
-            probed_at: probe_metadata.probed_at,
-            probe_error: probe_metadata.probe_error,
+            modified_system,
             subtitle_tracks,
-            thumbnail_generated_at: thumbnail.generated_at,
-            thumbnail_error: thumbnail.error,
-            playback_mode: probe_metadata.playback_mode,
-            video_profile: probe_metadata.video_profile,
-            video_level: probe_metadata.video_level,
-            video_pix_fmt: probe_metadata.video_pix_fmt,
-            video_bit_depth: probe_metadata.video_bit_depth,
-            audio_streams: probe_metadata.audio_streams,
-            subtitle_streams: probe_metadata.subtitle_streams,
         });
     }
+
+    DirContents { subdirs, media }
 }
 
-fn discover_sidecar_subtitles(root_path: &Path, media_path: &Path) -> Vec<SubtitleTrack> {
-    let Some(parent) = media_path.parent() else {
-        return Vec::new();
-    };
-    let Some(media_stem) = media_path
-        .file_stem()
-        .map(|value| value.to_string_lossy().to_string())
-    else {
-        return Vec::new();
-    };
-
-    let Ok(entries) = fs::read_dir(parent) else {
-        warn!(
-            path = %parent.display(),
-            "skipping subtitle discovery in unreadable directory during library scan"
-        );
-        return Vec::new();
-    };
-
-    let mut tracks = entries
-        .filter_map(Result::ok)
-        .filter_map(|entry| subtitle_track_from_entry(root_path, &media_stem, entry))
-        .collect::<Vec<_>>();
-
-    tracks.sort_unstable_by(|left, right| left.relative_path.cmp(&right.relative_path));
-    tracks
-}
-
-fn subtitle_track_from_entry(
+/// Build a `SubtitleTrack` for a sidecar file if its stem matches the
+/// media stem. Returns None if the subtitle doesn't pair with this
+/// media file.
+fn build_sidecar_track(
     root_path: &Path,
     media_stem: &str,
-    entry: fs::DirEntry,
+    sub_path: &Path,
+    sub_stem: &str,
+    sub_extension: &str,
 ) -> Option<SubtitleTrack> {
-    let path = entry.path();
-    let Ok(file_type) = entry.file_type() else {
-        warn!(
-            path = %path.display(),
-            "skipping subtitle path with unreadable file type during library scan"
-        );
-        return None;
+    let suffix = if sub_stem == media_stem {
+        String::new()
+    } else {
+        sub_stem
+            .strip_prefix(media_stem)
+            .and_then(|rest| rest.strip_prefix('.'))
+            .map(str::to_string)?
     };
 
-    if file_type.is_symlink() || !file_type.is_file() {
-        return None;
-    }
-
-    let extension = normalized_extension(&path)?;
-
-    if !SUPPORTED_SUBTITLE_EXTENSIONS.contains(&extension.as_str()) {
-        return None;
-    }
-
-    let suffix = subtitle_suffix_for_media(&path, media_stem)?;
-    let relative_path = normalize_relative_path(path.strip_prefix(root_path).ok())?;
-    let file_name = path.file_name()?.to_string_lossy().to_string();
+    let relative_path = normalize_relative_path(sub_path.strip_prefix(root_path).ok())?;
+    let file_name = sub_path.file_name()?.to_string_lossy().to_string();
     let (label, language) = subtitle_presentation(&suffix);
 
     Some(SubtitleTrack {
         file_name,
         relative_path,
-        extension,
+        extension: sub_extension.to_string(),
         label,
         language,
     })
-}
-
-fn subtitle_suffix_for_media(path: &Path, media_stem: &str) -> Option<String> {
-    let subtitle_stem = path.file_stem()?.to_string_lossy();
-
-    if subtitle_stem == media_stem {
-        return Some(String::new());
-    }
-
-    subtitle_stem
-        .strip_prefix(media_stem)
-        .and_then(|suffix| suffix.strip_prefix('.'))
-        .map(str::to_string)
 }
 
 fn subtitle_presentation(suffix: &str) -> (String, Option<String>) {
@@ -674,16 +799,20 @@ fn infer_language_code(token: &str) -> Option<&str> {
     None
 }
 
-fn probe_media_metadata(
+/// Run ffprobe against `path` and turn its JSON output into a
+/// `ProbeOutcome` ready to be persisted by the probe pool. `probe_command`
+/// is required — pool callers check for it upfront and skip enqueueing if
+/// disabled, so this function never silently no-ops.
+pub(crate) async fn probe_media_metadata(
     path: &Path,
     file_extension: Option<&str>,
     probe_command: Option<&Path>,
-) -> ProbeMetadata {
+) -> ProbeOutcome {
+    let probed_at = format_timestamp(OffsetDateTime::now_utc());
     let Some(probe_command) = probe_command else {
-        return ProbeMetadata::default();
+        return probe_outcome_with_error(probed_at, "no ffprobe configured");
     };
 
-    let probed_at = format_timestamp(OffsetDateTime::now_utc());
     let output = Command::new(probe_command)
         .arg("-v")
         .arg("error")
@@ -695,17 +824,14 @@ fn probe_media_metadata(
         .arg("-of")
         .arg("json")
         .arg(path)
-        .output();
+        .output()
+        .await;
 
     match output {
         Ok(output) if output.status.success() => {
             match parse_probe_output(&output.stdout, file_extension, probed_at.clone()) {
                 Ok(metadata) => metadata,
-                Err(error) => ProbeMetadata {
-                    probed_at: Some(probed_at),
-                    probe_error: Some(error),
-                    ..ProbeMetadata::default()
-                },
+                Err(error) => probe_outcome_with_error(probed_at, &error),
             }
         }
         Ok(output) => {
@@ -715,18 +841,135 @@ fn probe_media_metadata(
             } else {
                 format!("ffprobe failed: {stderr}")
             };
-
-            ProbeMetadata {
-                probed_at: Some(probed_at),
-                probe_error: Some(error),
-                ..ProbeMetadata::default()
-            }
+            probe_outcome_with_error(probed_at, &error)
         }
-        Err(error) => ProbeMetadata {
-            probed_at: Some(probed_at),
-            probe_error: Some(format!("ffprobe could not start: {error}")),
-            ..ProbeMetadata::default()
-        },
+        Err(error) => probe_outcome_with_error(
+            probed_at,
+            &format!("ffprobe could not start: {error}"),
+        ),
+    }
+}
+
+/// Run ffprobe a second time to extract the PTS offset of every keyframe
+/// in the first video stream. HLS copy-mode needs this: ffmpeg can only
+/// start a new fmp4 segment at a source keyframe (there's no way to force
+/// one without re-encoding), so the HLS session consults this list when
+/// deciding where to place segment boundaries and where to seek on a
+/// respawn.
+///
+/// Output format: `pts_time,flags` per packet, one line per row. We filter
+/// for lines whose flags column contains `K` (the keyframe flag) — ffprobe
+/// emits `K__` for keyframes, `___` for predicted frames, optionally with a
+/// `D` appended for the discardable marker.
+///
+/// Returns `Ok(vec![])` for non-video files and for files whose video stream
+/// ffprobe can't find — callers treat an empty index as "no keyframe-aware
+/// segmentation available" and fall back to a single-segment plan. Any
+/// ffprobe failure is surfaced as `Err(String)` so the probe pool can log
+/// it; the main probe outcome is already persisted independently, so a
+/// keyframe-probe failure does not poison the row.
+pub(crate) async fn probe_video_keyframes(
+    path: &Path,
+    probe_command: Option<&Path>,
+) -> Result<Vec<f64>, String> {
+    let Some(probe_command) = probe_command else {
+        return Err("no ffprobe configured".into());
+    };
+
+    // `-select_streams v:0` binds to the first video stream — the same one
+    // the main probe reports on. `packet=pts_time,flags` is the minimum
+    // needed to decide "is this row a keyframe and when does it start";
+    // other packet fields (size, pos, duration) would blow up stdout on
+    // long films without adding signal.
+    //
+    // `-of csv=p=0` omits the section-name prefix ffprobe otherwise
+    // prepends to each row, so we parse `pts,flags` directly.
+    let output = Command::new(probe_command)
+        .arg("-v")
+        .arg("error")
+        .arg("-select_streams")
+        .arg("v:0")
+        .arg("-show_entries")
+        .arg("packet=pts_time,flags")
+        .arg("-of")
+        .arg("csv=p=0")
+        .arg(path)
+        .output()
+        .await
+        .map_err(|error| format!("ffprobe could not start: {error}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            format!("ffprobe exited with status {}", output.status)
+        } else {
+            format!("ffprobe failed: {stderr}")
+        });
+    }
+
+    parse_keyframe_csv(&output.stdout)
+}
+
+/// Parse ffprobe's `-of csv=p=0 -show_entries packet=pts_time,flags` stdout
+/// into a sorted list of keyframe PTS offsets (seconds). Split out for unit
+/// testing — `probe_video_keyframes` is the I/O wrapper.
+fn parse_keyframe_csv(stdout: &[u8]) -> Result<Vec<f64>, String> {
+    let text = std::str::from_utf8(stdout)
+        .map_err(|error| format!("ffprobe returned non-UTF-8 output: {error}"))?;
+    let mut offsets: Vec<f64> = Vec::new();
+    for (line_no, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut fields = line.split(',');
+        let pts_field = fields.next().unwrap_or("");
+        let flags_field = fields.next().unwrap_or("");
+        if !flags_field.contains('K') {
+            continue;
+        }
+        // `pts_time` can be "N/A" for streams with no timestamps — skip
+        // them silently; the downstream plan falls back to a single
+        // segment when the list is empty anyway.
+        if pts_field == "N/A" || pts_field.is_empty() {
+            continue;
+        }
+        let pts: f64 = pts_field.parse().map_err(|error| {
+            format!("ffprobe row {line_no} has malformed pts_time {pts_field:?}: {error}")
+        })?;
+        // Guard against the occasional negative PTS in MPEG-TS containers;
+        // the HLS muxer will clamp them to zero too (-avoid_negative_ts
+        // make_zero), so we do the same here to keep plan offsets aligned.
+        offsets.push(pts.max(0.0));
+    }
+    // ffprobe emits packets in file order, which is decode order — not
+    // presentation order for B-frame containers. Sort to guarantee the
+    // strict ascending invariant that SegmentPlan relies on.
+    offsets.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    offsets.dedup();
+    Ok(offsets)
+}
+
+/// Build an error-only `ProbeOutcome`. Centralized so every fallback path
+/// produces a consistent NULL set with playback_mode=Direct as the
+/// non-null sentinel.
+fn probe_outcome_with_error(probed_at: String, error: &str) -> ProbeOutcome {
+    ProbeOutcome {
+        probed_at,
+        probe_error: Some(error.to_string()),
+        duration_seconds: None,
+        container_name: None,
+        video_codec: None,
+        audio_codec: None,
+        width: None,
+        height: None,
+        playback_mode: PlaybackMode::Direct,
+        video_profile: None,
+        video_level: None,
+        video_pix_fmt: None,
+        video_bit_depth: None,
+        audio_streams: Vec::new(),
+        subtitle_streams: Vec::new(),
     }
 }
 
@@ -734,7 +977,7 @@ fn parse_probe_output(
     output: &[u8],
     file_extension: Option<&str>,
     probed_at: String,
-) -> Result<ProbeMetadata, String> {
+) -> Result<ProbeOutcome, String> {
     let parsed: FfprobeOutput = serde_json::from_slice(output)
         .map_err(|error| format!("ffprobe returned invalid JSON: {error}"))?;
 
@@ -823,7 +1066,7 @@ fn parse_probe_output(
         &audio_streams,
     );
 
-    Ok(ProbeMetadata {
+    Ok(ProbeOutcome {
         duration_seconds: parsed
             .format
             .as_ref()
@@ -835,7 +1078,7 @@ fn parse_probe_output(
         audio_codec: audio_streams.first().and_then(|stream| stream.codec.clone()),
         width: video_stream.and_then(|stream| stream.width),
         height: video_stream.and_then(|stream| stream.height),
-        probed_at: Some(probed_at),
+        probed_at,
         probe_error: None,
         playback_mode,
         video_profile,
@@ -1040,155 +1283,20 @@ fn probe_command_from_env() -> Option<PathBuf> {
     }
 }
 
-fn default_ffmpeg_command() -> Option<PathBuf> {
-    Some(PathBuf::from("ffmpeg"))
+fn probe_workers_from_env() -> usize {
+    env::var("SYNCPLAY_PROBE_WORKERS")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_PROBE_WORKERS)
 }
 
-fn ffmpeg_command_from_env() -> Option<PathBuf> {
-    match env::var_os("SYNCPLAY_FFMPEG_BIN") {
-        Some(value) if value.is_empty() => None,
-        Some(value) => Some(PathBuf::from(value)),
-        None => default_ffmpeg_command(),
-    }
-}
-
-fn default_thumbnail_cache_dir() -> PathBuf {
-    PathBuf::from(DEFAULT_THUMBNAIL_CACHE_DIR)
-}
-
-fn thumbnail_cache_dir_from_env() -> Option<PathBuf> {
-    match env::var_os("SYNCPLAY_THUMBNAIL_DIR") {
-        Some(value) if value.is_empty() => None,
-        Some(value) => Some(PathBuf::from(value)),
-        None => Some(default_thumbnail_cache_dir()),
-    }
-}
-
-pub(crate) fn thumbnail_path_for(cache_dir: &Path, media_id: Uuid) -> PathBuf {
-    cache_dir.join(format!("{media_id}.jpg"))
-}
-
-fn generate_thumbnail(
-    media_path: &Path,
-    media_id: Uuid,
-    media_modified_at: Option<std::time::SystemTime>,
-    video_codec: Option<&str>,
-    duration_seconds: Option<f64>,
-    ffmpeg_command: Option<&Path>,
-    thumbnail_cache_dir: Option<&Path>,
-) -> ThumbnailOutcome {
-    if video_codec.is_none() {
-        return ThumbnailOutcome::default();
-    }
-
-    let Some(ffmpeg_command) = ffmpeg_command else {
-        return ThumbnailOutcome::default();
-    };
-    let Some(cache_dir) = thumbnail_cache_dir else {
-        return ThumbnailOutcome::default();
-    };
-
-    let output_path = thumbnail_path_for(cache_dir, media_id);
-
-    if thumbnail_is_up_to_date(&output_path, media_modified_at) {
-        return ThumbnailOutcome {
-            generated_at: Some(format_timestamp(OffsetDateTime::now_utc())),
-            error: None,
-        };
-    }
-
-    if let Err(error) = fs::create_dir_all(cache_dir) {
-        return ThumbnailOutcome {
-            generated_at: None,
-            error: Some(format!(
-                "could not create thumbnail directory '{}': {error}",
-                cache_dir.display()
-            )),
-        };
-    }
-
-    let seek_seconds = thumbnail_seek_seconds(duration_seconds);
-    let generated_at = format_timestamp(OffsetDateTime::now_utc());
-    let output = Command::new(ffmpeg_command)
-        .arg("-y")
-        .arg("-loglevel")
-        .arg("error")
-        .arg("-ss")
-        .arg(format!("{seek_seconds:.3}"))
-        .arg("-i")
-        .arg(media_path)
-        .arg("-frames:v")
-        .arg("1")
-        .arg("-vf")
-        .arg(format!("scale={THUMBNAIL_WIDTH}:-2"))
-        .arg("-q:v")
-        .arg("4")
-        .arg(&output_path)
-        .output();
-
-    match output {
-        Ok(output) if output.status.success() => {
-            if output_path.exists() {
-                ThumbnailOutcome {
-                    generated_at: Some(generated_at),
-                    error: None,
-                }
-            } else {
-                ThumbnailOutcome {
-                    generated_at: None,
-                    error: Some("ffmpeg reported success but no thumbnail file was produced".into()),
-                }
-            }
-        }
-        Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            let error = if stderr.is_empty() {
-                format!("ffmpeg exited with status {}", output.status)
-            } else {
-                format!("ffmpeg failed: {stderr}")
-            };
-            let _ = fs::remove_file(&output_path);
-
-            ThumbnailOutcome {
-                generated_at: None,
-                error: Some(error),
-            }
-        }
-        Err(error) => ThumbnailOutcome {
-            generated_at: None,
-            error: Some(format!("ffmpeg could not start: {error}")),
-        },
-    }
-}
-
-fn thumbnail_is_up_to_date(
-    thumbnail_path: &Path,
-    media_modified_at: Option<std::time::SystemTime>,
-) -> bool {
-    let Ok(metadata) = fs::metadata(thumbnail_path) else {
-        return false;
-    };
-
-    if !metadata.is_file() || metadata.len() == 0 {
-        return false;
-    }
-
-    let (Some(media_modified), Ok(thumbnail_modified)) = (media_modified_at, metadata.modified())
-    else {
-        return false;
-    };
-
-    thumbnail_modified >= media_modified
-}
-
-fn thumbnail_seek_seconds(duration_seconds: Option<f64>) -> f64 {
-    match duration_seconds {
-        Some(duration) if duration > 0.0 => {
-            let fraction = duration * 0.10;
-            fraction.clamp(0.0, 30.0)
-        }
-        _ => 0.0,
-    }
+fn walk_workers_from_env() -> usize {
+    env::var("SYNCPLAY_WALK_WORKERS")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_WALK_WORKERS)
 }
 
 fn normalize_root_path(path: PathBuf, current_dir: Option<&Path>) -> Option<PathBuf> {
@@ -1239,14 +1347,6 @@ fn normalized_extension(path: &Path) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn is_supported_media_path(path: &Path) -> bool {
-    let Some(extension) = normalized_extension(path) else {
-        return false;
-    };
-
-    SUPPORTED_MEDIA_EXTENSIONS.contains(&extension.as_str())
-}
-
 fn content_type_for_extension(extension: &str) -> Option<&'static str> {
     match extension {
         "mp4" | "m4v" => Some("video/mp4"),
@@ -1282,8 +1382,29 @@ mod tests {
         assert_eq!(normalized_absolute, root);
     }
 
+    /// Synchronous test helper: recursively classify every directory
+    /// under `root` and flatten the resulting media candidates. The
+    /// production walker does this in parallel via tokio; these tests
+    /// just need a deterministic flattened list to assert against.
+    fn flat_walk(root: &Path) -> Vec<DirMediaCandidate> {
+        fn recurse(root: &Path, dir: &Path, out: &mut Vec<DirMediaCandidate>) {
+            let contents = classify_directory(root, dir, "1970-01-01T00:00:00Z");
+            for media in contents.media {
+                out.push(media);
+            }
+            for subdir in contents.subdirs {
+                recurse(root, &subdir, out);
+            }
+        }
+
+        let mut out = Vec::new();
+        recurse(root, root, &mut out);
+        out.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+        out
+    }
+
     #[test]
-    fn scan_root_filters_unsupported_files_and_nested_symlinks() {
+    fn classify_directory_filters_unsupported_files_and_nested_symlinks() {
         let temp_dir = TempDir::new().unwrap();
         let root = temp_dir.path().join("library");
         let nested = root.join("nested");
@@ -1295,34 +1416,46 @@ mod tests {
         #[cfg(unix)]
         std::os::unix::fs::symlink(root.join("movie.mp4"), root.join("movie-link.mp4")).unwrap();
 
-        let items = scan_root_blocking(&root, None, None, None, &HashMap::new()).unwrap();
+        let candidates = flat_walk(&root);
 
-        assert_eq!(items.len(), 2);
-        assert_eq!(items[0].relative_path, "movie.mp4");
-        assert_eq!(items[1].relative_path, "nested/song.flac");
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].relative_path, "movie.mp4");
+        assert_eq!(candidates[1].relative_path, "nested/song.flac");
     }
 
     #[test]
-    fn scan_root_matches_supported_extensions_case_insensitively() {
+    fn classify_directory_matches_supported_extensions_case_insensitively() {
         let temp_dir = TempDir::new().unwrap();
         let root = temp_dir.path().join("library");
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("FEATURE.MP4"), b"movie").unwrap();
         fs::write(root.join("concert.FlAc"), b"audio").unwrap();
 
-        let items = scan_root_blocking(&root, None, None, None, &HashMap::new()).unwrap();
-        let relative_paths = items
+        let candidates = flat_walk(&root);
+        let relative_paths = candidates
             .iter()
             .map(|item| item.relative_path.as_str())
             .collect::<Vec<_>>();
 
         assert_eq!(relative_paths, vec!["FEATURE.MP4", "concert.FlAc"]);
-        assert_eq!(items[0].content_type.as_deref(), Some("video/mp4"));
-        assert_eq!(items[1].content_type.as_deref(), Some("audio/flac"));
+        assert_eq!(
+            candidates[0]
+                .extension
+                .as_deref()
+                .and_then(content_type_for_extension),
+            Some("video/mp4"),
+        );
+        assert_eq!(
+            candidates[1]
+                .extension
+                .as_deref()
+                .and_then(content_type_for_extension),
+            Some("audio/flac"),
+        );
     }
 
     #[test]
-    fn scan_root_discovers_sidecar_subtitles_for_matching_media() {
+    fn classify_directory_discovers_sidecar_subtitles_for_matching_media() {
         let temp_dir = TempDir::new().unwrap();
         let root = temp_dir.path().join("library");
         fs::create_dir_all(root.join("nested")).unwrap();
@@ -1339,10 +1472,10 @@ mod tests {
         .unwrap();
         fs::write(root.join("movie-night.en.srt"), b"ignore").unwrap();
 
-        let items = scan_root_blocking(&root, None, None, None, &HashMap::new()).unwrap();
-        let subtitle_tracks = &items[0].subtitle_tracks;
+        let candidates = flat_walk(&root);
+        let subtitle_tracks = &candidates[0].subtitle_tracks;
 
-        assert_eq!(items.len(), 1);
+        assert_eq!(candidates.len(), 1);
         assert_eq!(subtitle_tracks.len(), 2);
         assert_eq!(subtitle_tracks[0].relative_path, "movie.en.srt");
         assert_eq!(subtitle_tracks[0].label, "EN");
@@ -1384,6 +1517,42 @@ mod tests {
         assert_eq!(metadata.width, Some(1920));
         assert_eq!(metadata.height, Some(1080));
         assert_eq!(metadata.probe_error, None);
+    }
+
+    #[test]
+    fn parse_keyframe_csv_extracts_only_keyframe_rows_sorted_ascending() {
+        // Mixed keyframe/non-keyframe rows, out of order (ffprobe emits in
+        // decode order for B-frame streams), with a stray blank line and
+        // an N/A row that should be skipped silently.
+        let stdout = b"0.000000,K__\n\
+                       1.041667,___\n\
+                       2.083333,K__\n\
+                       \n\
+                       N/A,K__\n\
+                       1.562500,___\n\
+                       4.166667,K__D\n";
+        let offsets = parse_keyframe_csv(stdout).unwrap();
+        assert_eq!(offsets, vec![0.0, 2.083333, 4.166667]);
+    }
+
+    #[test]
+    fn parse_keyframe_csv_returns_empty_for_no_video() {
+        assert_eq!(parse_keyframe_csv(b"").unwrap(), Vec::<f64>::new());
+    }
+
+    #[test]
+    fn parse_keyframe_csv_rejects_malformed_pts() {
+        let err = parse_keyframe_csv(b"nope,K__\n").unwrap_err();
+        assert!(err.contains("malformed pts_time"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_keyframe_csv_clamps_negative_pts_to_zero() {
+        // MPEG-TS can produce negative PTS before the stream start; the
+        // HLS muxer clamps to zero via -avoid_negative_ts, so the plan
+        // must match.
+        let offsets = parse_keyframe_csv(b"-0.040000,K__\n2.000000,K__\n").unwrap();
+        assert_eq!(offsets, vec![0.0, 2.0]);
     }
 
     #[test]

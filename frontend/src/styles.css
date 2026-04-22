@@ -332,6 +332,44 @@ code {
   color: var(--danger);
 }
 
+.breadcrumb {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.15rem;
+  margin-bottom: 1.5rem;
+  font-size: 0.92rem;
+}
+
+.breadcrumb-segment {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.15rem;
+}
+
+.breadcrumb-link {
+  padding: 0.25rem 0.5rem;
+  border-radius: 6px;
+  color: var(--text-muted);
+  transition: color 120ms ease, background 120ms ease;
+}
+
+.breadcrumb-link:hover {
+  color: var(--text);
+  background: var(--bg-hover);
+}
+
+.breadcrumb-current {
+  padding: 0.25rem 0.5rem;
+  color: var(--text);
+  font-weight: 500;
+}
+
+.breadcrumb-separator {
+  color: var(--text-muted);
+  opacity: 0.6;
+}
+
 .library-section {
   margin-bottom: 2.5rem;
 }
@@ -406,6 +444,22 @@ code {
   width: 100%;
   height: 100%;
   object-fit: cover;
+  display: block;
+}
+
+.poster-art-folder {
+  background: linear-gradient(140deg, #1f2330 0%, #161923 60%, #0f1220 100%);
+  color: rgba(255, 255, 255, 0.45);
+}
+
+.poster-card-folder:hover .poster-art-folder {
+  color: var(--accent);
+}
+
+.folder-glyph {
+  width: 44%;
+  height: auto;
+  max-width: 96px;
   display: block;
 }
 

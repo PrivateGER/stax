@@ -149,6 +149,92 @@ impl TestServer {
             .await
             .unwrap()
     }
+
+    /// Poll `/api/library` until the predicate succeeds for the first item
+    /// or the timeout elapses. Thumbnail generation is now backgrounded, so
+    /// tests that previously read scan output synchronously have to wait
+    /// for the worker pool to catch up.
+    async fn poll_first_item_until<F>(
+        &self,
+        timeout_duration: Duration,
+        mut predicate: F,
+    ) -> syncplay_backend::protocol::MediaItem
+    where
+        F: FnMut(&syncplay_backend::protocol::MediaItem) -> bool,
+    {
+        let deadline = std::time::Instant::now() + timeout_duration;
+        loop {
+            let library = self.library().await;
+            if let Some(item) = library.items.into_iter().next() {
+                if predicate(&item) {
+                    return item;
+                }
+            }
+
+            if std::time::Instant::now() >= deadline {
+                panic!("predicate did not become true within {timeout_duration:?}");
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// Wait until the background probe pool has resolved every item in the
+    /// library — either with metadata (`probed_at IS NOT NULL`) or a
+    /// recorded failure (`probe_error IS NOT NULL`). The walk now returns
+    /// before probes finish, so tests that assert on probe-derived fields
+    /// (codec, duration, dimensions, playback_mode) have to wait first.
+    async fn wait_for_probes_complete(&self) -> LibraryResponse {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let library = self.library().await;
+            let pending = library
+                .items
+                .iter()
+                .filter(|item| item.probed_at.is_none() && item.probe_error.is_none())
+                .count();
+            if pending == 0 {
+                return library;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "{} item(s) still have no probe outcome after 5s",
+                    pending
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// Same as `wait_for_probes_complete` but also waits for the thumbnail
+    /// pool to settle. Use when a test asserts on `thumbnail_generated_at`
+    /// or `thumbnail_error`.
+    async fn wait_for_library_complete(&self) -> LibraryResponse {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let library = self.library().await;
+            let probe_pending = library
+                .items
+                .iter()
+                .filter(|item| item.probed_at.is_none() && item.probe_error.is_none())
+                .count();
+            let thumb_pending = library
+                .items
+                .iter()
+                .filter(|item| {
+                    item.thumbnail_generated_at.is_none() && item.thumbnail_error.is_none()
+                })
+                .count();
+            if probe_pending == 0 && thumb_pending == 0 {
+                return library;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "library never settled: {probe_pending} probe pending, {thumb_pending} thumbnail pending"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
 }
 
 impl Drop for TestServer {
@@ -522,9 +608,13 @@ JSON
     .await;
 
     let scan = server.scan_library().await;
-    let item = &scan.items[0];
-
     assert_eq!(scan.indexed_item_count, 1);
+
+    // Probes now run in the background after the walk returns; refetch
+    // once the pool has caught up so we see the populated metadata.
+    let library = server.wait_for_probes_complete().await;
+    let item = &library.items[0];
+
     assert_eq!(item.duration_seconds, Some(95.375));
     assert_eq!(
         item.container_name.as_deref(),
@@ -560,9 +650,11 @@ exit 2
     .await;
 
     let scan = server.scan_library().await;
-    let item = &scan.items[0];
-
     assert_eq!(scan.indexed_item_count, 1);
+
+    let library = server.wait_for_probes_complete().await;
+    let item = &library.items[0];
+
     assert!(item.probed_at.is_some());
     assert_eq!(item.duration_seconds, None);
     assert!(
@@ -570,6 +662,115 @@ exit 2
             .as_deref()
             .unwrap()
             .contains("synthetic ffprobe failure")
+    );
+}
+
+/// Builds a probe script that records every invocation by appending a
+/// line to `counter_path`. Tests can read the line count to assert
+/// exactly how many `ffprobe` calls happened during a scan.
+#[cfg(unix)]
+fn write_counting_probe_script(
+    temp_dir: &TempDir,
+    name: &str,
+    counter_path: &std::path::Path,
+) -> PathBuf {
+    let counter_str = counter_path.to_string_lossy();
+    let script = format!(
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+echo "$@" >> {counter_str}
+cat <<'JSON'
+{{
+  "format": {{ "format_name": "mov,mp4,m4a,3gp,3g2,mj2", "duration": "10.0" }},
+  "streams": [
+    {{ "codec_type": "video", "codec_name": "h264", "width": 640, "height": 480 }},
+    {{ "codec_type": "audio", "codec_name": "aac" }}
+  ]
+}}
+JSON
+"#
+    );
+    write_probe_script(temp_dir, name, &script)
+}
+
+#[cfg(unix)]
+fn count_probe_invocations(counter_path: &std::path::Path) -> usize {
+    fs::read_to_string(counter_path)
+        .map(|contents| contents.lines().filter(|line| !line.is_empty()).count())
+        .unwrap_or(0)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn library_rescan_skips_ffprobe_for_unchanged_files() {
+    let temp_dir = TempDir::new().unwrap();
+    let root = temp_dir.path().join("library");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("a.mp4"), b"alpha").unwrap();
+    fs::write(root.join("b.mp4"), b"bravo").unwrap();
+    fs::write(root.join("c.mp4"), b"charlie").unwrap();
+
+    let counter = temp_dir.path().join("probe-calls.log");
+    let probe_script = write_counting_probe_script(&temp_dir, "probe-counted.sh", &counter);
+
+    let server = TestServer::spawn_with_library_config(
+        LibraryConfig::from_paths(vec![root]).with_probe_command(probe_script),
+    )
+    .await;
+
+    server.scan_library().await;
+    server.wait_for_probes_complete().await;
+    let after_first = count_probe_invocations(&counter);
+    assert_eq!(after_first, 3, "first scan should probe every file");
+
+    server.scan_library().await;
+    server.wait_for_probes_complete().await;
+    let after_second = count_probe_invocations(&counter);
+    assert_eq!(
+        after_second, 3,
+        "second scan with no changes must reuse cached probe metadata (saw {} new probes)",
+        after_second - after_first
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn library_rescan_reprobes_only_changed_files() {
+    let temp_dir = TempDir::new().unwrap();
+    let root = temp_dir.path().join("library");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("a.mp4"), b"alpha").unwrap();
+    fs::write(root.join("b.mp4"), b"bravo").unwrap();
+    fs::write(root.join("c.mp4"), b"charlie").unwrap();
+
+    let counter = temp_dir.path().join("probe-calls.log");
+    let probe_script = write_counting_probe_script(&temp_dir, "probe-counted.sh", &counter);
+
+    let server = TestServer::spawn_with_library_config(
+        LibraryConfig::from_paths(vec![root.clone()]).with_probe_command(probe_script),
+    )
+    .await;
+
+    server.scan_library().await;
+    server.wait_for_probes_complete().await;
+    let baseline = count_probe_invocations(&counter);
+    assert_eq!(baseline, 3);
+
+    // Sleep just enough that the modified-time advances at the
+    // filesystem's resolution (most modern filesystems give us
+    // sub-second mtimes, but a 1.1s sleep is portable to the few that
+    // floor to seconds).
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    fs::write(root.join("b.mp4"), b"bravo-rewritten-with-new-bytes").unwrap();
+
+    server.scan_library().await;
+    server.wait_for_probes_complete().await;
+    let after_change = count_probe_invocations(&counter);
+    assert_eq!(
+        after_change - baseline,
+        1,
+        "only the modified file should be re-probed (saw {} new probes)",
+        after_change - baseline
     );
 }
 
@@ -722,8 +923,9 @@ JSON
     )
     .await;
 
-    let first_scan = first_server.scan_library().await;
-    assert_eq!(first_scan.items[0].video_codec.as_deref(), Some("vp9"));
+    first_server.scan_library().await;
+    let probed = first_server.wait_for_probes_complete().await;
+    assert_eq!(probed.items[0].video_codec.as_deref(), Some("vp9"));
 
     drop(first_server);
 
@@ -1744,8 +1946,12 @@ printf 'STUBJPEG' > "$output"
         .with_thumbnail_cache_dir(&cache_dir);
     let server = TestServer::spawn_with_library_config(config).await;
 
-    let scan = server.scan_library().await;
-    let item = scan.items.into_iter().next().expect("indexed media");
+    let _ = server.scan_library().await;
+    let item = server
+        .poll_first_item_until(Duration::from_secs(5), |item| {
+            item.thumbnail_generated_at.is_some()
+        })
+        .await;
 
     assert!(item.thumbnail_generated_at.is_some());
     assert_eq!(item.thumbnail_error, None);
@@ -1802,8 +2008,12 @@ exit 1
         .with_thumbnail_cache_dir(&cache_dir);
     let server = TestServer::spawn_with_library_config(config).await;
 
-    let scan = server.scan_library().await;
-    let item = scan.items.into_iter().next().expect("indexed media");
+    let _ = server.scan_library().await;
+    let item = server
+        .poll_first_item_until(Duration::from_secs(5), |item| {
+            item.thumbnail_error.is_some()
+        })
+        .await;
 
     assert_eq!(item.thumbnail_generated_at, None);
     assert!(
@@ -1901,12 +2111,26 @@ printf 'STUBJPEG' > "$output"
         .with_thumbnail_cache_dir(&cache_dir);
     let server = TestServer::spawn_with_library_config(config).await;
 
-    let first = server.scan_library().await.items.into_iter().next().unwrap();
+    server.scan_library().await;
+    let first = server
+        .wait_for_library_complete()
+        .await
+        .items
+        .into_iter()
+        .next()
+        .unwrap();
 
     // Touch the source so the second scan must regenerate the thumbnail.
     fs::write(root.join("movie.mp4"), b"movie-updated").unwrap();
 
-    let second = server.scan_library().await.items.into_iter().next().unwrap();
+    server.scan_library().await;
+    let second = server
+        .wait_for_library_complete()
+        .await
+        .items
+        .into_iter()
+        .next()
+        .unwrap();
 
     assert_eq!(
         first.id, second.id,
@@ -2005,8 +2229,11 @@ async fn hls_test_setup(
     };
 
     let server = TestServer::spawn_with_library_and_hls(library, hls_config).await;
-    let scan = server.scan_library().await;
-    let item = scan.items.into_iter().next().expect("scanned media item");
+    server.scan_library().await;
+    // Probe runs in the background after the walk; HLS tests need
+    // playback_mode populated, which only lands after probe completes.
+    let library = server.wait_for_probes_complete().await;
+    let item = library.items.into_iter().next().expect("scanned media item");
     (server, item)
 }
 
@@ -2044,8 +2271,9 @@ JSON
         vaapi_device: None,
     };
     let server = TestServer::spawn_with_library_and_hls(library, hls_config).await;
-    let scan = server.scan_library().await;
-    let item = scan.items.into_iter().next().unwrap();
+    server.scan_library().await;
+    let library = server.wait_for_probes_complete().await;
+    let item = library.items.into_iter().next().unwrap();
     assert_eq!(
         item.playback_mode,
         syncplay_backend::protocol::PlaybackMode::Unsupported
@@ -2087,8 +2315,9 @@ async fn hls_master_returns_409_for_direct_playback() {
         vaapi_device: None,
     };
     let server = TestServer::spawn_with_library_and_hls(library, hls_config).await;
-    let scan = server.scan_library().await;
-    let item = scan.items.into_iter().next().unwrap();
+    server.scan_library().await;
+    let library = server.wait_for_probes_complete().await;
+    let item = library.items.into_iter().next().unwrap();
 
     assert_eq!(
         item.playback_mode,

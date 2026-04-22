@@ -29,7 +29,7 @@ export function TitlePage({ item, rooms, onRoomCreated }: Props) {
         <p className="muted">This media is not in the library anymore.</p>
         <button
           className="primary-button"
-          onClick={() => navigate({ name: "library" })}
+          onClick={() => navigate({ name: "library", folder: null })}
           type="button"
         >
           Back to library

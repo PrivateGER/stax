@@ -13,7 +13,7 @@ use axum::{
         Path, Query, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    http::{HeaderMap, HeaderValue, Method, StatusCode, header::RANGE},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, header, header::RANGE},
     response::{IntoResponse, Response},
     routing::get,
 };
@@ -30,13 +30,18 @@ pub mod clock;
 pub mod library;
 pub mod muxing;
 pub mod persistence;
+pub mod probes;
 pub mod protocol;
+pub mod scan_gate;
 pub mod streaming;
+pub mod thumbnails;
 
 use clock::{AuthoritativePlaybackClock, format_timestamp, round_to};
 use library::{LibraryConfig, LibraryService};
-use muxing::{BrowserHint, HlsConfig, HlsError, HlsSessionManager};
+use muxing::{BrowserHint, HlsConfig, HlsError, HlsServeBody, HlsSessionManager};
 use persistence::{Persistence, PersistenceError};
+use probes::{ProbeConfig, ProbeJob, ProbeWorkerPool};
+use thumbnails::{ThumbnailConfig, ThumbnailJob, ThumbnailWorkerPool};
 use protocol::{
     ClientSocketMessage, CreateRoomRequest, HealthResponse, LibraryResponse, LibraryScanResponse,
     PlaybackAction, Room, RoomSocketQuery, RoomsResponse, ServerEvent,
@@ -57,6 +62,8 @@ pub struct AppState {
     library: LibraryService,
     persistence: Persistence,
     hls: HlsSessionManager,
+    thumbnails: ThumbnailWorkerPool,
+    probes: ProbeWorkerPool,
 }
 
 impl AppState {
@@ -64,6 +71,14 @@ impl AppState {
     /// callers can inspect session state (e.g., active session count).
     pub fn hls(&self) -> HlsSessionManager {
         self.hls.clone()
+    }
+
+    pub fn thumbnails(&self) -> ThumbnailWorkerPool {
+        self.thumbnails.clone()
+    }
+
+    pub fn probes(&self) -> ProbeWorkerPool {
+        self.probes.clone()
     }
 }
 
@@ -275,8 +290,65 @@ pub async fn load_state_with_library_and_hls(
     library_config: LibraryConfig,
     hls_config: HlsConfig,
 ) -> Result<AppState, PersistenceError> {
+    let thumbnail_config = ThumbnailConfig {
+        cache_dir: library_config
+            .thumbnail_cache_dir()
+            .map(std::path::Path::to_path_buf),
+        ffmpeg_command: library_config
+            .ffmpeg_command()
+            .map(std::path::Path::to_path_buf),
+        ..ThumbnailConfig::default()
+    }
+    .with_env_overrides();
+    // Shared across HLS sessions and the background scan pools so background
+    // probe/thumbnail work pauses for the duration of any foreground HLS
+    // session. See `crate::scan_gate` for the rationale — probes and
+    // playback compete for the same (often network-backed) library mount.
+    let scan_gate = crate::scan_gate::ScanGate::new();
+    let thumbnails = ThumbnailWorkerPool::spawn(
+        thumbnail_config,
+        persistence.clone(),
+        scan_gate.clone(),
+    );
+
+    let probe_config = ProbeConfig {
+        probe_command: library_config
+            .probe_command()
+            .map(std::path::Path::to_path_buf),
+        max_concurrent: library_config.probe_workers(),
+    };
+    let probes = ProbeWorkerPool::spawn(
+        probe_config,
+        persistence.clone(),
+        thumbnails.clone(),
+        scan_gate.clone(),
+    );
+
     let library = LibraryService::new(persistence.clone(), library_config);
     library.sync_config().await?;
+
+    // Drain the persisted backlogs: any items that were pending when the
+    // process last exited (or never finished) need to be re-enqueued so
+    // workers can resume from where they left off. Probes drain first so
+    // their successful outcomes can chain into thumbnail jobs as the
+    // thumbnail pool starts processing its own backlog.
+    let pending_probes = persistence.list_pending_probes().await?;
+    if !pending_probes.is_empty() {
+        tracing::info!(
+            count = pending_probes.len(),
+            "enqueueing pending probe jobs from previous session"
+        );
+        probes.enqueue_pending(pending_probes);
+    }
+    let pending = persistence.list_pending_thumbnails().await?;
+    if !pending.is_empty() {
+        tracing::info!(
+            count = pending.len(),
+            "enqueueing pending thumbnail jobs from previous session"
+        );
+        thumbnails.enqueue_pending(pending);
+    }
+
     let mut room_records = persistence.load_rooms().await?;
 
     if room_records.is_empty() {
@@ -291,13 +363,19 @@ pub async fn load_state_with_library_and_hls(
         .map(|room| (room.id, Arc::new(RoomHub::new(room, persistence.clone()))))
         .collect();
 
-    let hls = HlsSessionManager::new(hls_config);
+    let hls = HlsSessionManager::with_scan_gate_and_persistence(
+        hls_config,
+        scan_gate,
+        Some(persistence.clone()),
+    );
 
     Ok(AppState {
         library,
         rooms: Arc::new(RwLock::new(rooms)),
         persistence,
         hls,
+        thumbnails,
+        probes,
     })
 }
 
@@ -420,10 +498,55 @@ async fn list_library(State(state): State<AppState>) -> Result<Json<LibraryRespo
 async fn scan_library(
     State(state): State<AppState>,
 ) -> Result<Json<LibraryScanResponse>, ApiError> {
-    state.library.scan().await.map(Json).map_err(|error| {
+    let response = state.library.scan().await.map_err(|error| {
         warn!(%error, "failed to scan library");
         ApiError::internal("Failed to scan library.")
-    })
+    })?;
+
+    // Stage 1 (the walk) is now finished — every discovered file has a
+    // row in `media_items`. Hand the per-item work off to the background
+    // pools so the HTTP response returns immediately:
+    //
+    // - Items with no probe yet (new or changed since last scan) go to
+    //   the probe pool. A successful probe will chain its own thumbnail
+    //   job, so we explicitly *don't* enqueue a thumbnail here — that
+    //   would race the probe and waste an ffmpeg invocation on the
+    //   wrong codec/duration assumptions.
+    // - Items that came back from cache already have probe data; if
+    //   they're missing a thumbnail (cache row was kept but thumbnail
+    //   was never generated, or generation failed and was cleared) we
+    //   enqueue a thumbnail directly.
+    let mut probes_enqueued = 0usize;
+    let mut thumbnails_enqueued = 0usize;
+    for item in &response.items {
+        let needs_probe = item.probed_at.is_none() && item.probe_error.is_none();
+        if needs_probe {
+            state.probes.enqueue(ProbeJob {
+                media_id: item.id,
+                media_path: std::path::PathBuf::from(&item.root_path).join(&item.relative_path),
+                root_path: std::path::PathBuf::from(&item.root_path),
+                extension: item.extension.clone(),
+            });
+            probes_enqueued += 1;
+        } else if item.thumbnail_generated_at.is_none() && item.thumbnail_error.is_none() {
+            state.thumbnails.enqueue(ThumbnailJob {
+                media_id: item.id,
+                media_path: std::path::PathBuf::from(&item.root_path).join(&item.relative_path),
+                root_path: std::path::PathBuf::from(&item.root_path),
+                video_codec: item.video_codec.clone(),
+                duration_seconds: item.duration_seconds,
+            });
+            thumbnails_enqueued += 1;
+        }
+    }
+    tracing::info!(
+        scanned = response.items.len(),
+        probes_enqueued,
+        thumbnails_enqueued,
+        "library scan completed; background jobs enqueued"
+    );
+
+    Ok(Json(response))
 }
 
 async fn stream_media(
@@ -573,17 +696,34 @@ async fn stream_hls_asset(
         }
     };
 
-    match streaming::stream_hls_file_response(&serve_result.path, serve_result.content_type).await {
-        Ok(response) => response,
-        Err(StreamMediaError::NotFound) => {
-            ApiError::not_found("HLS asset not found.").into_response()
+    match &serve_result.body {
+        HlsServeBody::File(path) => {
+            match streaming::stream_hls_file_response(path, serve_result.content_type).await {
+                Ok(response) => response,
+                Err(StreamMediaError::NotFound) => {
+                    ApiError::not_found("HLS asset not found.").into_response()
+                }
+                Err(StreamMediaError::Io(error)) => {
+                    warn!(%error, %media_id, "failed to stream HLS asset");
+                    ApiError::internal("Failed to stream HLS asset.").into_response()
+                }
+                Err(
+                    StreamMediaError::MalformedRange(_)
+                    | StreamMediaError::UnsatisfiableRange { .. },
+                ) => ApiError::internal("Failed to stream HLS asset.").into_response(),
+            }
         }
-        Err(StreamMediaError::Io(error)) => {
-            warn!(%error, %media_id, "failed to stream HLS asset");
-            ApiError::internal("Failed to stream HLS asset.").into_response()
-        }
-        Err(StreamMediaError::MalformedRange(_) | StreamMediaError::UnsatisfiableRange { .. }) => {
-            ApiError::internal("Failed to stream HLS asset.").into_response()
+        HlsServeBody::Inline(bytes) => {
+            // Synthesized variant playlist — return the body directly. No
+            // range support needed; hls.js never issues ranged requests for
+            // playlists, only for media segments.
+            let mut response = bytes.clone().into_response();
+            response
+                .headers_mut()
+                .insert(header::CONTENT_TYPE, HeaderValue::from_static(
+                    serve_result.content_type,
+                ));
+            response
         }
     }
 }

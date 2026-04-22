@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 
 export type Route =
-  | { name: "library" }
+  | { name: "library"; folder: string | null }
   | { name: "title"; mediaId: string }
   | { name: "watch"; mediaId: string; roomId: string | null }
   | { name: "admin" };
@@ -10,11 +10,16 @@ export function parseHash(hash: string): Route {
   const path = hash.replace(/^#\/?/, "");
 
   if (!path || path === "library") {
-    return { name: "library" };
+    return { name: "library", folder: null };
   }
 
   if (path === "admin") {
     return { name: "admin" };
+  }
+
+  const folderMatch = path.match(/^library\/folder\/(.+)$/);
+  if (folderMatch) {
+    return { name: "library", folder: decodeFolderPath(folderMatch[1]!) };
   }
 
   const titleMatch = path.match(/^title\/([^/]+)$/);
@@ -31,13 +36,13 @@ export function parseHash(hash: string): Route {
     };
   }
 
-  return { name: "library" };
+  return { name: "library", folder: null };
 }
 
 export function toHash(route: Route): string {
   switch (route.name) {
     case "library":
-      return "#/";
+      return route.folder ? `#/library/folder/${encodeFolderPath(route.folder)}` : "#/";
     case "title":
       return `#/title/${encodeURIComponent(route.mediaId)}`;
     case "watch":
@@ -67,4 +72,22 @@ export function useRoute(): Route {
   }, []);
 
   return route;
+}
+
+function encodeFolderPath(folder: string): string {
+  // Encode each segment independently so a literal "/" inside a folder name
+  // never collides with the path separator we emit.
+  return folder
+    .split("/")
+    .filter(Boolean)
+    .map(encodeURIComponent)
+    .join("/");
+}
+
+function decodeFolderPath(folder: string): string {
+  return folder
+    .split("/")
+    .filter(Boolean)
+    .map(decodeURIComponent)
+    .join("/");
 }

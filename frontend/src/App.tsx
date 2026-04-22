@@ -64,6 +64,36 @@ export default function App() {
     void refresh();
   }, [refresh]);
 
+  // The backend now runs the library scan in three stages: walk → probe
+  // → thumbnail. The walk returns synchronously with NULL probe and
+  // thumbnail columns for new/changed files; background pools fill them
+  // in afterwards. Poll until *both* stages have completed for every
+  // item, so freshly-probed metadata and freshly-generated thumbnails
+  // appear without a manual refresh. Stops itself once nothing is
+  // pending.
+  const hasPendingBackgroundWork = items.some(
+    (item) =>
+      (item.probedAt === null && item.probeError === null) ||
+      (item.thumbnailGeneratedAt === null && item.thumbnailError === null),
+  );
+
+  useEffect(() => {
+    if (!hasPendingBackgroundWork) return;
+
+    const interval = window.setInterval(async () => {
+      try {
+        const libraryResponse = await api.library();
+        setRoots(libraryResponse.roots);
+        setItems(libraryResponse.items);
+      } catch {
+        // Ignore transient polling errors — the next tick will retry, and
+        // a real outage is already surfaced by the initial refresh path.
+      }
+    }, 10_000);
+
+    return () => window.clearInterval(interval);
+  }, [hasPendingBackgroundWork]);
+
   const handleRescan = useCallback(async () => {
     try {
       setScanning(true);
@@ -99,17 +129,20 @@ export default function App() {
       <nav className="top-nav">
         <a
           className="top-nav-brand"
-          href={toHash({ name: "library" })}
+          href={toHash({ name: "library", folder: null })}
           onClick={(event) => {
             event.preventDefault();
-            navigate({ name: "library" });
+            navigate({ name: "library", folder: null });
           }}
         >
           Syncplay
         </a>
 
         <div className="top-nav-links">
-          <NavLink active={route.name === "library" || route.name === "title"} to={{ name: "library" }}>
+          <NavLink
+            active={route.name === "library" || route.name === "title"}
+            to={{ name: "library", folder: null }}
+          >
             Library
           </NavLink>
           <NavLink active={route.name === "admin"} to={{ name: "admin" }}>
@@ -130,6 +163,7 @@ export default function App() {
         {route.name === "library" ? (
           <LibraryPage
             error={libraryError}
+            folder={route.folder}
             items={items}
             loading={loading}
             onRescan={() => void handleRescan()}

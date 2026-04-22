@@ -364,7 +364,7 @@ export function PlayerPage({
         <h1>No media selected</h1>
         <button
           className="primary-button"
-          onClick={() => navigate({ name: "library" })}
+          onClick={() => navigate({ name: "library", folder: null })}
           type="button"
         >
           Back to library
