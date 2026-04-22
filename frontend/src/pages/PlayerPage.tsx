@@ -20,6 +20,7 @@ import {
 } from "../useRoomSocket";
 import { usePlayerSource } from "../usePlayerSource";
 import { useStreamCopyProgress } from "../useStreamCopyProgress";
+import { useWatchTogether } from "../useWatchTogether";
 
 type Props = {
   item: MediaItem | null;
@@ -67,8 +68,6 @@ export function PlayerPage({
   const [selectedAudioId, setSelectedAudioId] = useState<string | null>(null);
   const [tracksMenuOpen, setTracksMenuOpen] = useState(false);
   const [playerError, setPlayerError] = useState<string | null>(null);
-  const [inviteError, setInviteError] = useState<string | null>(null);
-  const [creatingRoom, setCreatingRoom] = useState(false);
   const [creatingStreamCopy, setCreatingStreamCopy] = useState(false);
   const [streamCopyError, setStreamCopyError] = useState<string | null>(null);
   const [clockTickMs, setClockTickMs] = useState<number>(monotonicNow());
@@ -82,6 +81,7 @@ export function PlayerPage({
     });
 
   const socket = useRoomSocket(roomId, clientName);
+  const watchTogether = useWatchTogether(item, onRoomCreated);
   const live = socket.connectionState === "live";
   const { fatalError: sourceError } = usePlayerSource(videoRef, item);
   const playable = item?.preparationState === "direct" || item?.preparationState === "prepared";
@@ -367,31 +367,6 @@ export function PlayerPage({
     }
   }, [socket.room, socket.authoritativeReceiptAtMs]);
 
-  async function handleInvite() {
-    if (!item) return;
-
-    try {
-      setCreatingRoom(true);
-      setInviteError(null);
-
-      const title = displayMediaTitle(item);
-      const room = await api.createRoom({
-        name: `${title} · Watch Party`,
-        mediaId: item.id,
-        mediaTitle: title,
-      });
-
-      onRoomCreated(room);
-      navigate({ name: "watch", mediaId: item.id, roomId: room.id });
-    } catch (error) {
-      setInviteError(
-        error instanceof Error ? error.message : "Could not start Watch Together.",
-      );
-    } finally {
-      setCreatingRoom(false);
-    }
-  }
-
   function handleLeaveSession() {
     if (!item) return;
     navigate({ name: "watch", mediaId: item.id, roomId: null });
@@ -602,17 +577,19 @@ export function PlayerPage({
           ) : (
             <button
               className="primary-button"
-              disabled={creatingRoom}
-              onClick={() => void handleInvite()}
+              disabled={watchTogether.creating}
+              onClick={() => void watchTogether.start()}
               type="button"
             >
-              {creatingRoom ? "Starting…" : "Watch Together"}
+              {watchTogether.creating ? "Starting…" : "Watch Together"}
             </button>
           )}
         </div>
       </header>
 
-      {inviteError ? <p className="error player-error">{inviteError}</p> : null}
+      {watchTogether.error ? (
+        <p className="error player-error">{watchTogether.error}</p>
+      ) : null}
       {playerError ? <p className="error player-error">{playerError}</p> : null}
 
       <div className={`player-layout ${roomId && showSessionPanel ? "with-session" : ""}`}>

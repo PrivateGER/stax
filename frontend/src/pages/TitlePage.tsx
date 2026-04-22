@@ -24,6 +24,7 @@ import type {
   SubtitleSourceKind,
 } from "../types";
 import { useStreamCopyProgress } from "../useStreamCopyProgress";
+import { useWatchTogether } from "../useWatchTogether";
 
 type Props = {
   item: MediaItem | null;
@@ -40,13 +41,13 @@ type SubtitleOption = {
 };
 
 export function TitlePage({ item, rooms, onRoomCreated, onRefresh }: Props) {
-  const [creating, setCreating] = useState(false);
   const [creatingStreamCopy, setCreatingStreamCopy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const [streamCopyError, setStreamCopyError] = useState<string | null>(null);
   const [audioStreamIndex, setAudioStreamIndex] = useState<number | null>(null);
   const [subtitleMode, setSubtitleMode] = useState<SubtitleMode>("off");
   const [subtitleSelection, setSubtitleSelection] = useState<string>("");
+
+  const watchTogether = useWatchTogether(item, onRoomCreated);
 
   const { summary: liveStreamCopy, seedFromCreate: seedLiveStreamCopy } =
     useStreamCopyProgress({
@@ -117,32 +118,6 @@ export function TitlePage({ item, rooms, onRoomCreated, onRefresh }: Props) {
   const relatedRooms = rooms.filter((room) => room.mediaId === item.id);
   const canPlay = item.preparationState === "direct" || item.preparationState === "prepared";
   const subtitleSourceCount = item.subtitleTracks.length + item.subtitleStreams.length;
-
-  async function handleStartWatchTogether() {
-    if (!item) return;
-
-    try {
-      setCreating(true);
-      setError(null);
-
-      const room = await api.createRoom({
-        name: `${title} · Watch Party`,
-        mediaId: item.id,
-        mediaTitle: title,
-      });
-
-      onRoomCreated(room);
-      navigate({ name: "watch", mediaId: item.id, roomId: room.id });
-    } catch (creationError) {
-      setError(
-        creationError instanceof Error
-          ? creationError.message
-          : "Could not start Watch Together.",
-      );
-    } finally {
-      setCreating(false);
-    }
-  }
 
   async function handleCreateStreamCopy() {
     if (!item) return;
@@ -231,15 +206,15 @@ export function TitlePage({ item, rooms, onRoomCreated, onRefresh }: Props) {
             </button>
             <button
               className="ghost-button"
-              disabled={creating}
-              onClick={() => void handleStartWatchTogether()}
+              disabled={watchTogether.creating}
+              onClick={() => void watchTogether.start()}
               type="button"
             >
-              {creating ? "Starting…" : "Watch Together"}
+              {watchTogether.creating ? "Starting…" : "Watch Together"}
             </button>
           </div>
 
-          {error ? <p className="error">{error}</p> : null}
+          {watchTogether.error ? <p className="error">{watchTogether.error}</p> : null}
 
           {item.playbackMode === "needsPreparation" ? (
             <div className="title-stream-copy">
