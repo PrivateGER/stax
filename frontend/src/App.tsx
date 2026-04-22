@@ -121,10 +121,6 @@ export default function App() {
   const findItem = (mediaId: string) =>
     items.find((item) => item.id === mediaId) ?? null;
 
-  const currentMediaId = route.name === "title" || route.name === "watch"
-    ? route.mediaId
-    : null;
-
   return (
     <div className="app">
       <nav className="top-nav">

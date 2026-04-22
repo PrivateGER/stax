@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 
 import { api, thumbnailUrl } from "../api";
 import {
@@ -41,12 +41,6 @@ type SubtitleOption = {
 };
 
 export function TitlePage({ item, rooms, onRoomCreated, onRefresh }: Props) {
-  const [creatingStreamCopy, setCreatingStreamCopy] = useState(false);
-  const [streamCopyError, setStreamCopyError] = useState<string | null>(null);
-  const [audioStreamIndex, setAudioStreamIndex] = useState<number | null>(null);
-  const [subtitleMode, setSubtitleMode] = useState<SubtitleMode>("off");
-  const [subtitleSelection, setSubtitleSelection] = useState<string>("");
-
   const watchTogether = useWatchTogether(item, onRoomCreated);
 
   const { summary: liveStreamCopy, seedFromCreate: seedLiveStreamCopy } =
@@ -82,21 +76,28 @@ export function TitlePage({ item, rooms, onRoomCreated, onRefresh }: Props) {
     return [...sidecarOptions, ...embeddedOptions];
   }, [item?.subtitleStreams, item?.subtitleTracks]);
 
-  // Only key the reset on `item.id`: library polls return fresh array references
-  // even when content is identical, and clobbering in-flight user selections every
-  // poll tick would wipe the form the user is still filling in.
-  useEffect(() => {
-    if (!item) return;
-    const defaultAudio =
-      item.audioStreams.find((stream) => stream.default)?.index ??
-      item.audioStreams[0]?.index ??
-      null;
-    setAudioStreamIndex(defaultAudio);
+  const [creatingStreamCopy, setCreatingStreamCopy] = useState(false);
+  const [streamCopyError, setStreamCopyError] = useState<string | null>(null);
+  const [audioStreamIndex, setAudioStreamIndex] = useState<number | null>(
+    () => defaultAudioIndex(item),
+  );
+  const [subtitleMode, setSubtitleMode] = useState<SubtitleMode>("off");
+  const [subtitleSelection, setSubtitleSelection] = useState<string>(
+    () => subtitleOptions[0]?.value ?? "",
+  );
+
+  // Reset the form when the underlying title changes. Match on `id`: library
+  // polls hand us fresh object references even when content is identical, and
+  // clobbering in-flight selections every poll would wipe the form the user
+  // is still filling in.
+  const [prevItemId, setPrevItemId] = useState<string | null>(item?.id ?? null);
+  if ((item?.id ?? null) !== prevItemId) {
+    setPrevItemId(item?.id ?? null);
+    setAudioStreamIndex(defaultAudioIndex(item));
     setSubtitleMode("off");
     setSubtitleSelection(subtitleOptions[0]?.value ?? "");
     setStreamCopyError(null);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [item?.id]);
+  }
 
   if (!item) {
     return (
@@ -380,6 +381,15 @@ export function TitlePage({ item, rooms, onRoomCreated, onRefresh }: Props) {
         ) : null}
       </section>
     </article>
+  );
+}
+
+function defaultAudioIndex(item: MediaItem | null): number | null {
+  if (!item) return null;
+  return (
+    item.audioStreams.find((stream) => stream.default)?.index ??
+    item.audioStreams[0]?.index ??
+    null
   );
 }
 

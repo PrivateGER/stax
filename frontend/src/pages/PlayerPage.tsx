@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { api } from "../api";
 import { displayMediaTitle } from "../format";
@@ -40,6 +40,20 @@ export function PlayerPage({
   const [creatingStreamCopy, setCreatingStreamCopy] = useState(false);
   const [streamCopyError, setStreamCopyError] = useState<string | null>(null);
   const [showSessionPanel, setShowSessionPanel] = useState<boolean>(Boolean(roomId));
+  const [prevItemId, setPrevItemId] = useState<string | null>(item?.id ?? null);
+  const [prevRoomId, setPrevRoomId] = useState<string | null>(roomId);
+
+  const currentItemId = item?.id ?? null;
+  if (currentItemId !== prevItemId) {
+    setPrevItemId(currentItemId);
+    setSelectedSubtitleIndex(null);
+    setPlayerError(null);
+    setStreamCopyError(null);
+  }
+  if (roomId !== prevRoomId) {
+    setPrevRoomId(roomId);
+    setShowSessionPanel(Boolean(roomId));
+  }
 
   const { summary: liveStreamCopy, seedFromCreate: seedLiveStreamCopy } =
     useStreamCopyProgress({
@@ -58,29 +72,10 @@ export function PlayerPage({
     onAutoplayBlocked: setPlayerError,
   });
 
-  const { fatalError: sourceError } = usePlayerSource(videoRef, item);
+  usePlayerSource(videoRef, item);
   const playable =
     item?.preparationState === "direct" || item?.preparationState === "prepared";
-  const subtitleSources = useMemo(
-    () => (item ? deriveSubtitleSources(item) : []),
-    [item],
-  );
-
-  useEffect(() => {
-    if (sourceError) {
-      setPlayerError(sourceError);
-    }
-  }, [sourceError]);
-
-  useEffect(() => {
-    setShowSessionPanel(Boolean(roomId));
-  }, [roomId]);
-
-  useEffect(() => {
-    setSelectedSubtitleIndex(null);
-    setPlayerError(null);
-    setStreamCopyError(null);
-  }, [item?.id]);
+  const subtitleSources = item ? deriveSubtitleSources(item) : [];
 
   // If the room is anchored to a different media item than what's in the URL,
   // follow the room to its canonical media. This is what makes shared

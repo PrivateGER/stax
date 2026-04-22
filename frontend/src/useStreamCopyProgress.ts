@@ -23,12 +23,14 @@ export function useStreamCopyProgress({
   onRefresh,
 }: Options): UseStreamCopyProgress {
   const [liveSummary, setLiveSummary] = useState<StreamCopySummary | null>(null);
+  const [prevMediaId, setPrevMediaId] = useState(mediaId);
   const onRefreshRef = useRef(onRefresh);
   onRefreshRef.current = onRefresh;
 
-  useEffect(() => {
+  if (mediaId !== prevMediaId) {
+    setPrevMediaId(mediaId);
     setLiveSummary(null);
-  }, [mediaId]);
+  }
 
   const summary = liveSummary ?? fallback;
   const shouldPoll = Boolean(mediaId) && isActiveStreamCopy(summary);

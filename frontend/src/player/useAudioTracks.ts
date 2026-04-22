@@ -38,11 +38,13 @@ export function useAudioTracks(
 ): UseAudioTracks {
   const [tracks, setTracks] = useState<AudioTrackEntry[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [prevItemId, setPrevItemId] = useState<string | null>(item?.id ?? null);
 
-  useEffect(() => {
+  if ((item?.id ?? null) !== prevItemId) {
+    setPrevItemId(item?.id ?? null);
     setTracks([]);
     setSelectedId(null);
-  }, [item?.id]);
+  }
 
   useEffect(() => {
     const video = videoRef.current;
