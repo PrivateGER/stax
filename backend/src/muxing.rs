@@ -785,6 +785,68 @@ fn now_ms() -> u64 {
         .unwrap_or_default()
 }
 
+fn cleanup_stale_cache_dirs(cache_dir: &Path) {
+    if let Err(error) = std::fs::create_dir_all(cache_dir) {
+        warn!(
+            %error,
+            cache_dir = %cache_dir.display(),
+            "failed to create HLS cache directory"
+        );
+        return;
+    }
+
+    let entries = match std::fs::read_dir(cache_dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            warn!(
+                %error,
+                cache_dir = %cache_dir.display(),
+                "failed to enumerate HLS cache directory for startup cleanup"
+            );
+            return;
+        }
+    };
+
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !is_session_cache_dir_name(&name) {
+            continue;
+        }
+        let path = entry.path();
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => info!(
+                cache_dir = %cache_dir.display(),
+                removed = %path.display(),
+                "removed stale HLS session cache directory"
+            ),
+            Err(error) => warn!(
+                %error,
+                cache_dir = %cache_dir.display(),
+                stale_dir = %path.display(),
+                "failed to remove stale HLS session cache directory"
+            ),
+        }
+    }
+}
+
+fn is_session_cache_dir_name(name: &str) -> bool {
+    [SessionFlavor::Default, SessionFlavor::SafariPassthrough]
+        .into_iter()
+        .any(|flavor| {
+            let token = flavor.as_dir_token();
+            name.strip_suffix(token)
+                .and_then(|value| value.strip_suffix('-'))
+                .is_some_and(|uuid| Uuid::parse_str(uuid).is_ok())
+        })
+}
+
 #[derive(Clone, Debug)]
 pub struct InFlightGuard {
     session: Arc<HlsSession>,
@@ -857,6 +919,9 @@ impl HlsSessionManager {
         // resolves output paths; if a relative cache_dir leaks through, the
         // session directory ends up nested under the spawn CWD.
         config.cache_dir = absolutize_path(config.cache_dir);
+        // Startup hygiene: clear stale session directories from previous runs
+        // so scratch disk usage cannot grow forever after crashes/restarts.
+        cleanup_stale_cache_dirs(&config.cache_dir);
         let semaphore = Arc::new(Semaphore::new(config.max_concurrent));
 
         let inner = Arc::new(Inner {
@@ -2596,6 +2661,35 @@ mod tests {
     fn segment_plan_for_session_picks_grid_for_transcode() {
         let plan = SegmentPlan::for_session(PlaybackMode::HlsFullTranscode, 8.0, &[]);
         assert_eq!(plan.boundaries, vec![0.0, 2.0, 4.0, 6.0]);
+    }
+
+    #[test]
+    fn session_cache_dir_name_parser_accepts_known_flavors() {
+        let id = Uuid::new_v4();
+        assert!(is_session_cache_dir_name(&format!("{id}-default")));
+        assert!(is_session_cache_dir_name(&format!("{id}-safari-copy")));
+        assert!(!is_session_cache_dir_name("not-a-session-dir"));
+        assert!(!is_session_cache_dir_name(&format!("{id}-unknown")));
+    }
+
+    #[test]
+    fn startup_cleanup_removes_only_session_cache_directories() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let stale_default = tmp.path().join(format!("{}-default", Uuid::new_v4()));
+        let stale_safari = tmp.path().join(format!("{}-safari-copy", Uuid::new_v4()));
+        let keep_custom = tmp.path().join("manual-cache");
+
+        std::fs::create_dir_all(&stale_default).expect("create stale default dir");
+        std::fs::create_dir_all(&stale_safari).expect("create stale safari dir");
+        std::fs::create_dir_all(&keep_custom).expect("create custom dir");
+        std::fs::write(stale_default.join("segment.m4s"), b"x").expect("seed stale file");
+        std::fs::write(keep_custom.join("keep.txt"), b"y").expect("seed keep file");
+
+        cleanup_stale_cache_dirs(tmp.path());
+
+        assert!(!stale_default.exists());
+        assert!(!stale_safari.exists());
+        assert!(keep_custom.exists());
     }
 
     #[test]
