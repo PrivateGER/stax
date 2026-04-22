@@ -6,7 +6,9 @@ import { PlayerSurface } from "../player/mediabunny/PlayerSurface";
 import { useMediabunnyController } from "../player/mediabunny/useMediabunnyController";
 import { SessionMenu } from "../player/SessionMenu";
 import { TracksMenu } from "../player/TracksMenu";
+import { deriveSubtitleSources } from "../player/subtitleSources";
 import { UnplayableNotice } from "../player/UnplayableNotice";
+import { useActiveSubtitleCue } from "../player/useActiveSubtitleCue";
 import { navigate } from "../router";
 import type { MediaItem, Room } from "../types";
 import { useRoomSocket } from "../useRoomSocket";
@@ -33,13 +35,20 @@ export function PlayerPage({
   const [playerError, setPlayerError] = useState<string | null>(null);
   const [creatingStreamCopy, setCreatingStreamCopy] = useState(false);
   const [streamCopyError, setStreamCopyError] = useState<string | null>(null);
+  const [selectedSubtitleIndex, setSelectedSubtitleIndex] = useState<number | null>(null);
   const [prevItemId, setPrevItemId] = useState<string | null>(item?.id ?? null);
+  const subtitleSources = item ? deriveSubtitleSources(item) : [];
 
   const currentItemId = item?.id ?? null;
   if (currentItemId !== prevItemId) {
     setPrevItemId(currentItemId);
     setPlayerError(null);
     setStreamCopyError(null);
+    setSelectedSubtitleIndex(null);
+  }
+
+  if (selectedSubtitleIndex !== null && !subtitleSources[selectedSubtitleIndex]) {
+    setSelectedSubtitleIndex(null);
   }
 
   const { summary: liveStreamCopy, seedFromCreate: seedLiveStreamCopy } =
@@ -56,9 +65,12 @@ export function PlayerPage({
     item,
     setPlayerError,
   );
-
-  // TracksMenu still mounts; the audio + subtitle lists are wired up in M4/M3.
-  const emptyAudio = { tracks: [], selectedId: null, select: () => {} };
+  const selectedSubtitleSource =
+    selectedSubtitleIndex === null ? null : subtitleSources[selectedSubtitleIndex] ?? null;
+  const { activeCues, error: subtitleError } = useActiveSubtitleCue(
+    selectedSubtitleSource,
+    state.currentTime,
+  );
 
   // If the room is anchored to a different media item than what's in the URL,
   // follow the room to its canonical media. Keeps shared Watch Together links
@@ -141,12 +153,14 @@ export function PlayerPage({
 
         <div className="player-bar-right">
           <TracksMenu
-            audioTracks={emptyAudio.tracks}
-            onSelectAudio={emptyAudio.select}
-            onSelectSubtitle={() => {}}
-            selectedAudioId={emptyAudio.selectedId}
-            selectedSubtitleIndex={null}
-            subtitleSources={[]}
+            audioTracks={state.audioTracks}
+            onSelectAudio={(trackId) => {
+              void controllerRef.current?.selectAudioTrack(trackId);
+            }}
+            onSelectSubtitle={setSelectedSubtitleIndex}
+            selectedAudioId={state.selectedAudioTrackId}
+            selectedSubtitleIndex={selectedSubtitleIndex}
+            subtitleSources={subtitleSources}
           />
 
           {roomId ? (
@@ -173,6 +187,7 @@ export function PlayerPage({
         <p className="error player-error">{watchTogether.error}</p>
       ) : null}
       {playerError ? <p className="error player-error">{playerError}</p> : null}
+      {subtitleError ? <p className="error player-error">{subtitleError}</p> : null}
       {state.warning ? (
         <p className="error player-error">{state.warning}</p>
       ) : null}
@@ -185,6 +200,7 @@ export function PlayerPage({
           canvasRef={canvasRef}
           controllerRef={controllerRef}
           state={state}
+          subtitleCues={activeCues}
         />
       </div>
     </div>

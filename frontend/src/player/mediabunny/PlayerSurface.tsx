@@ -7,11 +7,17 @@ type Props = {
   canvasRef: RefObject<HTMLCanvasElement | null>;
   controllerRef: RefObject<MediabunnyController | null>;
   state: MediabunnyState;
+  subtitleCues: string[];
 };
 
 const HIDE_CONTROLS_AFTER_MS = 2000;
 
-export function PlayerSurface({ canvasRef, controllerRef, state }: Props) {
+export function PlayerSurface({
+  canvasRef,
+  controllerRef,
+  state,
+  subtitleCues,
+}: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const [controlsVisible, setControlsVisible] = useState(true);
   const hideTimerRef = useRef<number | null>(null);
@@ -64,6 +70,15 @@ export function PlayerSurface({ canvasRef, controllerRef, state }: Props) {
       {!state.ready && !state.warning ? (
         <div className="mb-loading">
           <p className="muted">Loading…</p>
+        </div>
+      ) : null}
+      {subtitleCues.length > 0 ? (
+        <div aria-live="polite" className="mb-subtitles">
+          {subtitleCues.map((cue, index) => (
+            <p className="mb-subtitle-cue" key={`${index}-${cue}`}>
+              {cue}
+            </p>
+          ))}
         </div>
       ) : null}
       {state.ready && state.needsGesture ? (

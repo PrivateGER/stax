@@ -5,6 +5,7 @@ import { buildFolderTree, findFolder, folderPathSegments, type FolderNode } from
 import {
   displayMediaTitle,
   formatDuration,
+  mediaAspectRatio,
   mediaBadges,
   posterInitials,
 } from "../format";
@@ -318,6 +319,11 @@ function PosterCard({ item }: { item: MediaItem }) {
   const title = displayMediaTitle(item);
   const badges = mediaBadges(item);
   const hasThumbnail = item.thumbnailGeneratedAt !== null;
+  const thumbnailAspectRatio = mediaAspectRatio(item.width, item.height);
+  const posterArtStyle =
+    hasThumbnail && thumbnailAspectRatio
+      ? { aspectRatio: thumbnailAspectRatio }
+      : undefined;
 
   return (
     <button
@@ -325,7 +331,7 @@ function PosterCard({ item }: { item: MediaItem }) {
       onClick={() => navigate({ name: "title", mediaId: item.id })}
       type="button"
     >
-      <div className="poster-art">
+      <div className="poster-art" style={posterArtStyle}>
         {hasThumbnail ? (
           <img
             alt=""

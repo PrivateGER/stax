@@ -53,6 +53,7 @@ The Vite dev server listens on `http://127.0.0.1:5173` and proxies `/api` reques
 - `POST /api/library/scan`
 - `GET /api/media/:media_id/stream`
 - `GET /api/media/:media_id/subtitles/:track_index`
+- `GET /api/media/:media_id/subtitles/embedded/:stream_index`
 - `GET /api/media/:media_id/thumbnail`
 - `GET /api/rooms`
 - `POST /api/rooms`

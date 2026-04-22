@@ -13,10 +13,11 @@ use axum::{
 use tokio::{
     fs::{self, File},
     io::{AsyncReadExt, AsyncSeekExt, SeekFrom},
+    process::Command,
 };
 use tokio_util::io::ReaderStream;
 
-use crate::protocol::{MediaItem, SubtitleTrack};
+use crate::protocol::{MediaItem, SubtitleStream, SubtitleTrack};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ByteRange {
@@ -163,6 +164,55 @@ pub(crate) async fn stream_webvtt_file_response(
 
     let body = fs::read(subtitle_path).await.map_err(map_file_error)?;
     let mut response = Response::new(Body::from(body));
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("text/vtt; charset=utf-8"),
+    );
+
+    Ok(response)
+}
+
+pub(crate) async fn stream_embedded_subtitle_response(
+    ffmpeg_command: &Path,
+    media_item: &MediaItem,
+    subtitle_stream: &SubtitleStream,
+) -> Result<Response<Body>, StreamMediaError> {
+    let media_path = resolve_media_path(media_item);
+    let metadata = fs::metadata(&media_path).await.map_err(map_file_error)?;
+
+    if !metadata.is_file() {
+        return Err(StreamMediaError::NotFound);
+    }
+
+    let output = Command::new(ffmpeg_command)
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-nostdin")
+        .arg("-i")
+        .arg(&media_path)
+        .arg("-map")
+        .arg(format!("0:{}", subtitle_stream.index))
+        .arg("-f")
+        .arg("webvtt")
+        .arg("-")
+        .output()
+        .await
+        .map_err(StreamMediaError::Io)?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let message = stderr.trim();
+        return Err(StreamMediaError::Io(std::io::Error::other(format!(
+            "embedded subtitle extraction failed{}",
+            if message.is_empty() {
+                String::new()
+            } else {
+                format!(": {message}")
+            }
+        ))));
+    }
+
+    let mut response = Response::new(Body::from(output.stdout));
     response.headers_mut().insert(
         CONTENT_TYPE,
         HeaderValue::from_static("text/vtt; charset=utf-8"),

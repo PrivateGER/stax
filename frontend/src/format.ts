@@ -51,6 +51,11 @@ export function formatResolution(width: number | null, height: number | null) {
   return `${width}×${height}`;
 }
 
+export function mediaAspectRatio(width: number | null, height: number | null) {
+  if (width === null || height === null || width <= 0 || height <= 0) return null;
+  return `${width} / ${height}`;
+}
+
 export function rootFolderName(rootPath: string) {
   const normalized = rootPath.replaceAll("\\", "/");
   const parts = normalized.split("/").filter(Boolean);

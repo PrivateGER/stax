@@ -1273,6 +1273,58 @@ async fn subtitle_stream_returns_not_found_when_sidecar_disappears() {
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn embedded_subtitle_stream_converts_text_tracks_to_webvtt() {
+    let temp_dir = TempDir::new().unwrap();
+    let root = temp_dir.path().join("library");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("movie.mkv"), b"synthetic").unwrap();
+
+    let probe_script = write_probe_script(
+        &temp_dir,
+        "probe-text-subtitle.sh",
+        EMBEDDED_TEXT_PROBE_JSON,
+    );
+    let ffmpeg_stub = write_ffmpeg_stub(&temp_dir, "ffmpeg-webvtt.sh", FFMPEG_WEBVTT_OK_STUB);
+    let cache_dir = temp_dir.path().join("stream-copies");
+    let server = TestServer::spawn_with_library_config(stream_copy_config(
+        root,
+        probe_script,
+        Some(ffmpeg_stub),
+        cache_dir,
+    ))
+    .await;
+
+    server.scan_library().await;
+    let item = server
+        .wait_for_probes_complete()
+        .await
+        .items
+        .into_iter()
+        .next()
+        .unwrap();
+
+    let response = server
+        .client
+        .get(format!(
+            "{}/api/media/{}/subtitles/embedded/2",
+            server.base_url, item.id
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        "text/vtt; charset=utf-8"
+    );
+    let body = response.text().await.unwrap();
+    assert!(body.starts_with("WEBVTT"));
+    assert!(body.contains("Hello from embedded subtitle"));
+}
+
 #[tokio::test]
 async fn websocket_returns_not_found_for_unknown_room() {
     let server = TestServer::spawn().await;
@@ -2376,6 +2428,43 @@ JSON
 "#;
 
 #[cfg(unix)]
+const EMBEDDED_TEXT_PROBE_JSON: &str = r#"#!/usr/bin/env bash
+set -euo pipefail
+cat <<'JSON'
+{
+  "format": { "format_name": "matroska,webm", "duration": "120.000" },
+  "streams": [
+    {
+      "index": 0,
+      "codec_type": "video",
+      "codec_name": "h264",
+      "profile": "High",
+      "level": 40,
+      "pix_fmt": "yuv420p",
+      "bits_per_raw_sample": "8",
+      "width": 1920,
+      "height": 1080
+    },
+    {
+      "index": 1,
+      "codec_type": "audio",
+      "codec_name": "ac3",
+      "channels": 2,
+      "channel_layout": "stereo",
+      "disposition": { "default": 1 }
+    },
+    {
+      "index": 2,
+      "codec_type": "subtitle",
+      "codec_name": "subrip",
+      "tags": { "language": "eng", "title": "English" }
+    }
+  ]
+}
+JSON
+"#;
+
+#[cfg(unix)]
 const FFMPEG_STREAM_COPY_OK_STUB: &str = r#"#!/usr/bin/env bash
 set -euo pipefail
 output="${!#}"
@@ -2406,6 +2495,18 @@ progress=end
 EOF
 output="${!#}"
 printf 'STREAMCOPY' > "$output"
+"#;
+
+#[cfg(unix)]
+const FFMPEG_WEBVTT_OK_STUB: &str = r#"#!/usr/bin/env bash
+set -euo pipefail
+output="${!#}"
+body=$'WEBVTT\n\n00:00:01.000 --> 00:00:03.000\nHello from embedded subtitle\n'
+if [ "$output" = "-" ]; then
+  printf '%s' "$body"
+else
+  printf '%s' "$body" > "$output"
+fi
 "#;
 
 #[cfg(unix)]

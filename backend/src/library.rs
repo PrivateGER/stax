@@ -239,6 +239,10 @@ impl LibraryService {
         }
     }
 
+    pub fn ffmpeg_command(&self) -> Option<&Path> {
+        self.config.ffmpeg_command()
+    }
+
     pub async fn sync_config(&self) -> Result<(), PersistenceError> {
         let root_paths = self
             .config
@@ -1028,7 +1032,7 @@ pub(crate) fn classify_playback_mode(
     audio_streams: &[AudioStream],
 ) -> PlaybackMode {
     let container_ok = container
-        .map(|value| is_browser_safe_container(value, file_extension))
+        .map(|value| is_client_demuxable_container(value, file_extension))
         .unwrap_or(false);
     let has_any_stream = video.codec.is_some() || !audio_streams.is_empty();
 
@@ -1041,7 +1045,7 @@ pub(crate) fn classify_playback_mode(
             stream
                 .codec
                 .as_deref()
-                .map(is_browser_safe_audio_codec)
+                .map(is_client_decodable_audio_codec)
                 .unwrap_or(false)
         });
 
@@ -1049,11 +1053,13 @@ pub(crate) fn classify_playback_mode(
         stream
             .codec
             .as_deref()
-            .map(|codec| is_browser_safe_audio_codec(codec) || is_transcodable_audio_codec(codec))
+            .map(|codec| {
+                is_client_decodable_audio_codec(codec) || is_transcodable_audio_codec(codec)
+            })
             .unwrap_or(false)
     });
 
-    let video_browser_safe = match video.codec {
+    let video_client_decodable = match video.codec {
         None => true,
         Some(codec) => is_browser_safe_video_codec(
             codec,
@@ -1064,7 +1070,7 @@ pub(crate) fn classify_playback_mode(
         ),
     };
 
-    if video_browser_safe && audio_ok && container_ok {
+    if video_client_decodable && audio_ok && container_ok {
         return PlaybackMode::Direct;
     }
 
@@ -1075,19 +1081,19 @@ pub(crate) fn classify_playback_mode(
     PlaybackMode::NeedsPreparation
 }
 
-pub(crate) fn is_browser_safe_container(container: &str, file_extension: Option<&str>) -> bool {
+pub(crate) fn is_client_demuxable_container(container: &str, file_extension: Option<&str>) -> bool {
     // ffprobe's format_name is a comma-separated list of equivalent demuxer tags.
-    // Critically, "matroska,webm" applies to BOTH .mkv and .webm files — the extension
-    // is the only way to distinguish. When ambiguous, trust the extension.
+    // Critically, "matroska,webm" applies to BOTH .mkv and .webm files. MediaBunny
+    // can demux both, but keep trusting the extension when the format tag is ambiguous.
     let normalized_extension = file_extension.map(|value| value.to_ascii_lowercase());
     let tokens = container
         .split(',')
         .map(|token| token.trim().to_ascii_lowercase())
         .collect::<Vec<_>>();
 
-    // If the container list includes "matroska", only webm via explicit extension is safe.
+    // Matroska/WebM is not native-HTML-safe, but the MediaBunny player can demux it directly.
     if tokens.iter().any(|token| token == "matroska") {
-        return normalized_extension.as_deref() == Some("webm");
+        return matches!(normalized_extension.as_deref(), Some("mkv" | "webm"));
     }
 
     tokens.iter().any(|token| {
@@ -1145,10 +1151,39 @@ pub(crate) fn is_browser_safe_video_codec(
     }
 }
 
-pub(crate) fn is_browser_safe_audio_codec(codec: &str) -> bool {
+pub(crate) fn is_client_decodable_audio_codec(codec: &str) -> bool {
+    let codec = codec.to_ascii_lowercase();
+    let normalized = codec.replace('_', "-");
+
     matches!(
-        codec.to_ascii_lowercase().as_str(),
-        "aac" | "opus" | "mp3" | "flac" | "vorbis"
+        normalized.as_str(),
+        // Native WebCodecs / browser decode targets in the MediaBunny player.
+        "aac" | "opus" | "flac" | "vorbis"
+            // MP3 is additionally backed by the mpg123 WASM decoder when native
+            // WebCodecs support is missing.
+            | "mp3"
+            // MediaBunny has an internal PCM decoder wrapper for these variants.
+            | "pcm-s8"
+            | "pcm-u8"
+            | "pcm-s16"
+            | "pcm-s16le"
+            | "pcm-s16be"
+            | "pcm-s24"
+            | "pcm-s24le"
+            | "pcm-s24be"
+            | "pcm-s32"
+            | "pcm-s32le"
+            | "pcm-s32be"
+            | "pcm-f32"
+            | "pcm-f32le"
+            | "pcm-f32be"
+            | "pcm-f64"
+            | "pcm-f64le"
+            | "pcm-f64be"
+            | "pcm-mulaw"
+            | "pcm-alaw"
+            | "ulaw"
+            | "alaw"
     )
 }
 
@@ -1462,7 +1497,7 @@ mod tests {
     }
 
     #[test]
-    fn classifier_marks_mkv_with_safe_codecs_as_needs_preparation() {
+    fn classifier_marks_mkv_with_client_decodable_codecs_as_direct() {
         let mode = classify_playback_mode(
             Some("matroska,webm"),
             Some("mkv"),
@@ -1476,7 +1511,43 @@ mod tests {
             &[audio_stream("aac")],
         );
 
-        assert_eq!(mode, PlaybackMode::NeedsPreparation);
+        assert_eq!(mode, PlaybackMode::Direct);
+    }
+
+    #[test]
+    fn classifier_marks_mkv_with_mp3_audio_as_direct() {
+        let mode = classify_playback_mode(
+            Some("matroska,webm"),
+            Some("mkv"),
+            VideoPlaybackInfo {
+                codec: Some("h264"),
+                profile: Some("High"),
+                pix_fmt: Some("yuv420p"),
+                level: Some(40),
+                bit_depth: Some(8),
+            },
+            &[audio_stream("mp3")],
+        );
+
+        assert_eq!(mode, PlaybackMode::Direct);
+    }
+
+    #[test]
+    fn classifier_marks_mkv_with_flac_audio_as_direct() {
+        let mode = classify_playback_mode(
+            Some("matroska,webm"),
+            Some("mkv"),
+            VideoPlaybackInfo {
+                codec: Some("h264"),
+                profile: Some("High"),
+                pix_fmt: Some("yuv420p"),
+                level: Some(40),
+                bit_depth: Some(8),
+            },
+            &[audio_stream("flac")],
+        );
+
+        assert_eq!(mode, PlaybackMode::Direct);
     }
 
     #[test]
@@ -1633,6 +1704,18 @@ mod tests {
             Some("mp3"),
             VideoPlaybackInfo::default(),
             &[audio_stream("mp3")],
+        );
+
+        assert_eq!(mode, PlaybackMode::Direct);
+    }
+
+    #[test]
+    fn classifier_marks_audio_only_wav_pcm_as_direct() {
+        let mode = classify_playback_mode(
+            Some("wav"),
+            Some("wav"),
+            VideoPlaybackInfo::default(),
+            &[audio_stream("pcm_s16le")],
         );
 
         assert_eq!(mode, PlaybackMode::Direct);

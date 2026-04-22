@@ -6,6 +6,7 @@ import {
   formatAudioStreamLabel,
   formatBytes,
   formatDuration,
+  mediaAspectRatio,
   formatResolution,
   formatSubtitleStreamLabel,
   formatSubtitleTrackLabel,
@@ -123,6 +124,11 @@ export function TitlePage({ item, rooms, onRoomCreated, onRefresh }: Props) {
   const joinableRoom = relatedRooms[0] ?? null;
   const canPlay = item.preparationState === "direct" || item.preparationState === "prepared";
   const subtitleSourceCount = item.subtitleTracks.length + item.subtitleStreams.length;
+  const thumbnailAspectRatio = mediaAspectRatio(item.width, item.height);
+  const titleHeroArtStyle =
+    item.thumbnailGeneratedAt && thumbnailAspectRatio
+      ? { aspectRatio: thumbnailAspectRatio }
+      : undefined;
 
   async function handleCreateStreamCopy() {
     if (!item) return;
@@ -181,7 +187,7 @@ export function TitlePage({ item, rooms, onRoomCreated, onRefresh }: Props) {
   return (
     <article className="title-page">
       <div className="title-hero">
-        <div className="title-hero-art">
+        <div className="title-hero-art" style={titleHeroArtStyle}>
           {item.thumbnailGeneratedAt ? (
             <img alt="" className="title-hero-image" src={thumbnailUrl(item.id)} />
           ) : (
@@ -494,4 +500,3 @@ function streamCopyButtonLabel(args: {
   if (args.preparationState === "failed") return "Retry stream copy";
   return "Create stream copy";
 }
-

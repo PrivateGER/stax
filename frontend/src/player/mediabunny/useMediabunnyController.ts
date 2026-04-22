@@ -16,6 +16,8 @@ const INITIAL_STATE: MediabunnyState = {
   duration: 0,
   hasVideo: false,
   hasAudio: false,
+  audioTracks: [],
+  selectedAudioTrackId: null,
   volume: 0.7,
   muted: false,
   needsGesture: false,
@@ -55,6 +57,7 @@ export function useMediabunnyController(
       controller.on("pause", refresh),
       controller.on("seeked", refresh),
       controller.on("timeupdate", refresh),
+      controller.on("audiochange", refresh),
       controller.on("ended", refresh),
       controller.on("error", (message) => {
         onErrorRef.current(message);

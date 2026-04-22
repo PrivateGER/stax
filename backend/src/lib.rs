@@ -48,8 +48,9 @@ use protocol::{
 };
 use stream_copies::{StreamCopyConfig, StreamCopyJob, StreamCopyWorkerPool};
 use streaming::{
-    StreamMediaError, stream_file_response, stream_media_response, stream_subtitle_response,
-    stream_thumbnail_response, stream_webvtt_file_response, unsatisfiable_range_response,
+    StreamMediaError, stream_embedded_subtitle_response, stream_file_response,
+    stream_media_response, stream_subtitle_response, stream_thumbnail_response,
+    stream_webvtt_file_response, unsatisfiable_range_response,
 };
 use thumbnails::{ThumbnailConfig, ThumbnailJob, ThumbnailWorkerPool};
 
@@ -386,6 +387,10 @@ pub fn build_app(state: AppState) -> Router {
         .route(
             "/api/media/{media_id}/subtitles/{track_index}",
             get(stream_subtitle),
+        )
+        .route(
+            "/api/media/{media_id}/subtitles/embedded/{stream_index}",
+            get(stream_embedded_subtitle),
         )
         .route("/api/media/{media_id}/thumbnail", get(stream_thumbnail))
         .route("/api/rooms", get(list_rooms).post(create_room))
@@ -941,6 +946,56 @@ async fn stream_subtitle(
                 media_id = %media_item.id,
                 subtitle = %subtitle_track.relative_path,
                 "failed to stream subtitle"
+            );
+            Err(ApiError::internal("Failed to stream subtitle."))
+        }
+        Err(StreamMediaError::MalformedRange(_) | StreamMediaError::UnsatisfiableRange { .. }) => {
+            Err(ApiError::internal("Failed to stream subtitle."))
+        }
+    }
+}
+
+async fn stream_embedded_subtitle(
+    State(state): State<AppState>,
+    Path((media_id, stream_index)): Path<(Uuid, u32)>,
+) -> Result<Response, ApiError> {
+    let media_item = load_media_item(
+        &state,
+        media_id,
+        "stream_embedded_subtitle",
+        "Failed to load media.",
+    )
+    .await?;
+
+    let Some(subtitle_stream) = media_item
+        .subtitle_streams
+        .iter()
+        .find(|stream| stream.index == stream_index)
+    else {
+        return Err(ApiError::not_found("Subtitle stream not found."));
+    };
+
+    if !is_text_subtitle_codec(subtitle_stream.codec.as_deref()) {
+        return Err(ApiError::bad_request(
+            "Selected embedded subtitle stream cannot be converted to WebVTT.",
+        ));
+    }
+
+    let Some(ffmpeg_command) = state.library.ffmpeg_command() else {
+        return Err(ApiError::internal(
+            "Embedded subtitle extraction requires ffmpeg to be configured.",
+        ));
+    };
+
+    match stream_embedded_subtitle_response(ffmpeg_command, &media_item, subtitle_stream).await {
+        Ok(response) => Ok(response),
+        Err(StreamMediaError::NotFound) => Err(ApiError::not_found("Subtitle stream not found.")),
+        Err(StreamMediaError::Io(error)) => {
+            warn!(
+                %error,
+                media_id = %media_item.id,
+                stream_index,
+                "failed to stream embedded subtitle"
             );
             Err(ApiError::internal("Failed to stream subtitle."))
         }

@@ -85,6 +85,10 @@ export function subtitleUrl(mediaId: string, trackIndex: number) {
   return `/api/media/${mediaId}/subtitles/${trackIndex}`;
 }
 
+export function embeddedSubtitleUrl(mediaId: string, streamIndex: number) {
+  return `/api/media/${mediaId}/subtitles/embedded/${streamIndex}`;
+}
+
 export function thumbnailUrl(mediaId: string) {
   return `/api/media/${mediaId}/thumbnail`;
 }

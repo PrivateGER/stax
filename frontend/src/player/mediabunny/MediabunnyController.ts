@@ -10,6 +10,8 @@ import {
   type WrappedCanvas,
 } from "mediabunny";
 
+import { formatLanguageName } from "../../format";
+import { ensureCustomAudioDecoders } from "./customAudioDecoders";
 import type { MediabunnyEvents } from "./events";
 
 type Listeners = {
@@ -28,6 +30,8 @@ export type MediabunnyState = {
   duration: number;
   hasVideo: boolean;
   hasAudio: boolean;
+  audioTracks: MediabunnyTrackInfo[];
+  selectedAudioTrackId: string | null;
   volume: number;
   muted: boolean;
   needsGesture: boolean;
@@ -49,6 +53,8 @@ export class MediabunnyController {
   private videoSink: CanvasSink | null = null;
   private audioSink: AudioBufferSink | null = null;
   private videoTrack: InputVideoTrack | null = null;
+  private audioTracks: InputAudioTrack[] = [];
+  private audioTrackInfos: MediabunnyTrackInfo[] = [];
   private audioTrack: InputAudioTrack | null = null;
 
   private duration = 0;
@@ -80,6 +86,7 @@ export class MediabunnyController {
     pause: new Set(),
     seeked: new Set(),
     timeupdate: new Set(),
+    audiochange: new Set(),
     ended: new Set(),
     error: new Set(),
     ready: new Set(),
@@ -102,6 +109,8 @@ export class MediabunnyController {
       duration: this.duration,
       hasVideo: this.videoTrack !== null,
       hasAudio: this.audioTrack !== null,
+      audioTracks: this.audioTrackInfos,
+      selectedAudioTrackId: this.audioTrack ? String(this.audioTrack.id) : null,
       volume: this.volumeValue,
       muted: this.mutedValue,
       needsGesture: this.audioContext?.state === "suspended",
@@ -138,16 +147,7 @@ export class MediabunnyController {
     if (!this.playing) return;
     this.playbackTimeAtStart = this.getPlaybackTime();
     this.playing = false;
-    void this.audioBufferIterator?.return();
-    this.audioBufferIterator = null;
-    for (const node of this.queuedAudioNodes) {
-      try {
-        node.stop();
-      } catch {
-        // Already stopped.
-      }
-    }
-    this.queuedAudioNodes.clear();
+    this.stopAudioOutput();
     this.emit("pause");
   }
 
@@ -187,14 +187,39 @@ export class MediabunnyController {
   }
 
   getAudioTracks(): MediabunnyTrackInfo[] {
-    // Filled out in M4; single-track fallback for now.
-    return this.audioTrack
-      ? [{ id: String(this.audioTrack.id), label: "Audio" }]
-      : [];
+    return this.audioTrackInfos;
   }
 
-  async selectAudioTrack(_id: string): Promise<void> {
-    // Placeholder for M4.
+  async selectAudioTrack(id: string): Promise<void> {
+    if (!this.ready || this.disposed) return;
+
+    const nextTrack =
+      this.audioTracks.find((track) => String(track.id) === id) ?? null;
+    if (!nextTrack || nextTrack === this.audioTrack) return;
+
+    const wasPlaying = this.playing;
+    if (wasPlaying) {
+      this.playbackTimeAtStart = this.getPlaybackTime();
+      this.playing = false;
+      this.stopAudioOutput();
+    }
+
+    this.audioTrack = nextTrack;
+    this.audioSink = new AudioBufferSink(nextTrack);
+    this.emit("audiochange");
+
+    if (wasPlaying && this.audioContext && this.playbackTimeAtStart < this.duration) {
+      if (this.audioContext.state === "suspended") {
+        await this.audioContext.resume();
+      }
+
+      this.audioContextStartTime = this.audioContext.currentTime;
+      this.playing = true;
+      this.audioBufferIterator = this.audioSink.buffers(this.playbackTimeAtStart);
+      void this.runAudioIterator();
+    }
+
+    this.emit("timeupdate", this.getPlaybackTime());
   }
 
   on<K extends keyof MediabunnyEvents>(
@@ -213,15 +238,7 @@ export class MediabunnyController {
     if (this.rafHandle !== null) cancelAnimationFrame(this.rafHandle);
     if (this.backgroundTickHandle !== null) window.clearInterval(this.backgroundTickHandle);
     void this.videoFrameIterator?.return();
-    void this.audioBufferIterator?.return();
-    for (const node of this.queuedAudioNodes) {
-      try {
-        node.stop();
-      } catch {
-        // Already stopped.
-      }
-    }
-    this.queuedAudioNodes.clear();
+    this.stopAudioOutput();
     this.audioContext?.close().catch(() => {
       // Ignored — already closed or never opened.
     });
@@ -233,14 +250,31 @@ export class MediabunnyController {
 
   // ===== private =====
 
+  private stopAudioOutput(): void {
+    void this.audioBufferIterator?.return();
+    this.audioBufferIterator = null;
+    for (const node of this.queuedAudioNodes) {
+      try {
+        node.stop();
+      } catch {
+        // Already stopped.
+      }
+    }
+    this.queuedAudioNodes.clear();
+  }
+
   private async load(url: string): Promise<void> {
     try {
+      await ensureCustomAudioDecoders();
       this.input = new Input({ source: new UrlSource(url), formats: ALL_FORMATS });
       this.duration = await this.input.computeDuration();
 
       let videoTrack = await this.input.getPrimaryVideoTrack();
-      let audioTrack = await this.input.getPrimaryAudioTrack();
+      const primaryAudioTrack = await this.input.getPrimaryAudioTrack();
+      const inputAudioTracks = await this.input.getAudioTracks();
       const warnings: string[] = [];
+      const availableAudioTracks: InputAudioTrack[] = [];
+      let unavailableAudioTrackCount = 0;
 
       if (videoTrack) {
         if (videoTrack.codec === null) {
@@ -251,15 +285,32 @@ export class MediabunnyController {
           videoTrack = null;
         }
       }
-      if (audioTrack) {
-        if (audioTrack.codec === null) {
-          warnings.push("Unsupported audio codec.");
-          audioTrack = null;
-        } else if (!(await audioTrack.canDecode())) {
-          warnings.push("The browser cannot decode this audio track.");
-          audioTrack = null;
+
+      for (const track of inputAudioTracks) {
+        if (track.codec === null) {
+          unavailableAudioTrackCount += 1;
+          continue;
         }
+
+        if (!(await track.canDecode())) {
+          unavailableAudioTrackCount += 1;
+          continue;
+        }
+
+        availableAudioTracks.push(track);
       }
+
+      if (unavailableAudioTrackCount === 1) {
+        warnings.push("One audio track is unavailable in this browser.");
+      } else if (unavailableAudioTrackCount > 1) {
+        warnings.push(`${unavailableAudioTrackCount} audio tracks are unavailable in this browser.`);
+      }
+
+      const audioTrack =
+        (primaryAudioTrack &&
+          availableAudioTracks.find((track) => track.id === primaryAudioTrack.id)) ??
+        availableAudioTracks[0] ??
+        null;
 
       if (this.disposed) return;
       if (!videoTrack && !audioTrack) {
@@ -270,6 +321,8 @@ export class MediabunnyController {
       if (warnings.length > 0) this.warning = warnings.join(" ");
 
       this.videoTrack = videoTrack;
+      this.audioTracks = availableAudioTracks;
+      this.audioTrackInfos = availableAudioTracks.map((track) => describeAudioTrack(track));
       this.audioTrack = audioTrack;
 
       this.audioContext = new AudioContext({ sampleRate: audioTrack?.sampleRate });
@@ -448,4 +501,56 @@ export class MediabunnyController {
       }
     }
   }
+}
+
+function describeAudioTrack(track: InputAudioTrack): MediabunnyTrackInfo {
+  const language =
+    track.languageCode && track.languageCode !== "und"
+      ? formatLanguageName(track.languageCode)
+      : null;
+  const label = firstNonEmpty(track.name, language, `Track ${track.number}`);
+  const details = [
+    detailUnlessDuplicate(language, label),
+    formatCodec(track.codec),
+    track.disposition.commentary ? "commentary" : null,
+    track.disposition.visuallyImpaired ? "descriptive" : null,
+    track.disposition.hearingImpaired ? "SDH" : null,
+    track.disposition.original ? "original" : null,
+    track.disposition.default ? "default" : null,
+  ];
+
+  return {
+    id: String(track.id),
+    label: joinTrackLabel(label, details),
+    language: language ?? undefined,
+  };
+}
+
+function firstNonEmpty(...values: Array<string | null | undefined>) {
+  return values.find((value) => value && value.trim().length > 0)?.trim() ?? "Unknown";
+}
+
+function detailUnlessDuplicate(detail: string | null, label: string) {
+  if (!detail) return null;
+  return detail.localeCompare(label, undefined, { sensitivity: "accent" }) === 0
+    ? null
+    : detail;
+}
+
+function joinTrackLabel(label: string, metadata: Array<string | null>) {
+  const details = metadata.filter((value): value is string => Boolean(value));
+  return details.length > 0 ? `${label} · ${details.join(" · ")}` : label;
+}
+
+function formatCodec(codec: unknown) {
+  const value = typeof codec === "string" ? codec.trim() : "";
+  if (!value) return null;
+
+  return value
+    .replaceAll("_", " ")
+    .replaceAll("-", " ")
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((part) => part.toUpperCase())
+    .join(" ");
 }
