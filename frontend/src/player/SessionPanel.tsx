@@ -1,3 +1,5 @@
+import { useState } from "react";
+
 import type { Room } from "../types";
 import type { RoomSocketApi } from "../useRoomSocket";
 
@@ -19,6 +21,7 @@ export function SessionPanel({
   rooms,
 }: Props) {
   const live = socket.connectionState === "live";
+  const { copied, copy } = useInviteLink();
 
   return (
     <aside className="session-panel">
@@ -37,6 +40,14 @@ export function SessionPanel({
           ? "No one else here yet."
           : `${socket.presenceCount} watcher${socket.presenceCount === 1 ? "" : "s"} connected`}
       </p>
+
+      <button
+        className="ghost-button wide"
+        onClick={() => void copy()}
+        type="button"
+      >
+        {copied ? "Link copied" : "Copy invite link"}
+      </button>
 
       <label className="input-stack">
         <span className="label-text">Your name</span>
@@ -75,6 +86,26 @@ export function SessionPanel({
       </div>
     </aside>
   );
+}
+
+function useInviteLink() {
+  const [copied, setCopied] = useState(false);
+
+  const copy = async () => {
+    const url = window.location.href;
+    try {
+      await navigator.clipboard.writeText(url);
+    } catch {
+      // Browsers without clipboard permission fall back to a prompt so the
+      // user can select+copy manually.
+      window.prompt("Copy invite link", url);
+      return;
+    }
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 2000);
+  };
+
+  return { copied, copy };
 }
 
 function labelForConnection(state: RoomSocketApi["connectionState"]) {
