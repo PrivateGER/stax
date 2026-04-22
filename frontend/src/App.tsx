@@ -186,7 +186,6 @@ export default function App() {
             onRefresh={() => void refresh()}
             onRoomCreated={handleRoomCreated}
             roomId={route.roomId}
-            rooms={rooms}
           />
         ) : null}
 

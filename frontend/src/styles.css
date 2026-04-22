@@ -730,23 +730,12 @@ code {
   font-size: 0.88rem;
 }
 
-.player-layout {
-  display: grid;
-  grid-template-columns: 1fr;
-  grid-template-rows: minmax(0, 1fr);
-  flex: 1;
-  min-height: 0;
-}
-
-.player-layout.with-session {
-  grid-template-columns: 1fr 340px;
-}
-
 .player-stage {
   background: #000;
   min-height: 0;
   min-width: 0;
   overflow: hidden;
+  flex: 1;
 }
 
 .player-video {
@@ -834,56 +823,44 @@ code {
   margin: 0.3rem 0.1rem;
 }
 
-/* ========== Session panel ========== */
+/* ========== Session menu ========== */
 
-.session-panel {
+.session-menu {
+  position: relative;
+}
+
+.session-menu-panel {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 6px);
+  z-index: 40;
+  width: min(320px, 90vw);
+  padding: 1rem;
   background: var(--bg-elevated);
-  border-left: 1px solid var(--border);
-  padding: 1.25rem;
+  border: 1px solid var(--border-strong);
+  border-radius: 12px;
+  box-shadow: 0 20px 48px rgba(0, 0, 0, 0.55);
   display: grid;
-  gap: 1rem;
-  align-content: start;
-  overflow-y: auto;
+  gap: 0.85rem;
 }
 
-.session-head {
-  display: flex;
-  justify-content: space-between;
-  align-items: flex-start;
-  gap: 0.75rem;
+.session-menu-head {
+  display: grid;
+  gap: 0.2rem;
 }
 
-.session-head h2 {
-  font-size: 1.15rem;
+.session-menu-head h3 {
+  font-size: 1.05rem;
+  font-weight: 600;
+  margin: 0;
 }
 
-.session-presence {
-  font-size: 0.92rem;
-  color: var(--text);
-}
-
-.session-hint {
+.session-menu-head .muted {
   font-size: 0.85rem;
-  padding: 0.65rem 0.75rem;
-  background: rgba(229, 160, 13, 0.08);
-  border: 1px solid rgba(229, 160, 13, 0.2);
-  border-radius: 8px;
-  color: var(--text);
 }
 
-.session-activity {
-  font-size: 0.85rem;
-  padding: 0.6rem 0.75rem;
-  background: rgba(255, 255, 255, 0.03);
-  border-radius: 6px;
-}
-
-.session-footer {
-  border-top: 1px solid var(--border);
-  padding-top: 0.75rem;
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
+.session-menu-panel .link-button {
+  justify-self: start;
 }
 
 /* ========== Connection pill ========== */
@@ -1082,17 +1059,6 @@ code {
 
   .title-hero-art {
     max-width: 200px;
-  }
-
-  .player-layout.with-session {
-    grid-template-columns: 1fr;
-    grid-template-rows: minmax(0, 1fr) auto;
-  }
-
-  .session-panel {
-    border-left: 0;
-    border-top: 1px solid var(--border);
-    max-height: 50vh;
   }
 }
 

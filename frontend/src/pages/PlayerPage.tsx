@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 
 import { api } from "../api";
 import { displayMediaTitle } from "../format";
-import { SessionPanel } from "../player/SessionPanel";
+import { SessionMenu } from "../player/SessionMenu";
 import { TracksMenu } from "../player/TracksMenu";
 import { UnplayableNotice } from "../player/UnplayableNotice";
 import { deriveSubtitleSources } from "../player/subtitleSources";
@@ -10,7 +10,7 @@ import { useAudioTracks } from "../player/useAudioTracks";
 import { useRoomSync } from "../player/useRoomSync";
 import { navigate } from "../router";
 import type { MediaItem, Room } from "../types";
-import { useRoomSocket, type RoomSocketApi } from "../useRoomSocket";
+import { useRoomSocket } from "../useRoomSocket";
 import { usePlayerSource } from "../usePlayerSource";
 import { useStreamCopyProgress } from "../useStreamCopyProgress";
 import { useWatchTogether } from "../useWatchTogether";
@@ -18,7 +18,6 @@ import { useWatchTogether } from "../useWatchTogether";
 type Props = {
   item: MediaItem | null;
   roomId: string | null;
-  rooms: Room[];
   clientName: string;
   onClientNameChange: (name: string) => void;
   onRefresh: () => void;
@@ -28,7 +27,6 @@ type Props = {
 export function PlayerPage({
   item,
   roomId,
-  rooms,
   clientName,
   onClientNameChange,
   onRefresh,
@@ -39,9 +37,7 @@ export function PlayerPage({
   const [playerError, setPlayerError] = useState<string | null>(null);
   const [creatingStreamCopy, setCreatingStreamCopy] = useState(false);
   const [streamCopyError, setStreamCopyError] = useState<string | null>(null);
-  const [showSessionPanel, setShowSessionPanel] = useState<boolean>(Boolean(roomId));
   const [prevItemId, setPrevItemId] = useState<string | null>(item?.id ?? null);
-  const [prevRoomId, setPrevRoomId] = useState<string | null>(roomId);
 
   const currentItemId = item?.id ?? null;
   if (currentItemId !== prevItemId) {
@@ -49,10 +45,6 @@ export function PlayerPage({
     setSelectedSubtitleIndex(null);
     setPlayerError(null);
     setStreamCopyError(null);
-  }
-  if (roomId !== prevRoomId) {
-    setPrevRoomId(roomId);
-    setShowSessionPanel(Boolean(roomId));
   }
 
   const { summary: liveStreamCopy, seedFromCreate: seedLiveStreamCopy } =
@@ -65,7 +57,7 @@ export function PlayerPage({
   const socket = useRoomSocket(roomId, clientName);
   const watchTogether = useWatchTogether(item, onRoomCreated);
   const audio = useAudioTracks(videoRef, item);
-  const { catchUp } = useRoomSync({
+  useRoomSync({
     videoRef,
     socket,
     item,
@@ -175,19 +167,12 @@ export function PlayerPage({
           />
 
           {roomId ? (
-            <button
-              aria-pressed={showSessionPanel}
-              className="session-pill"
-              onClick={() => setShowSessionPanel((visible) => !visible)}
-              title={showSessionPanel ? "Hide session panel" : "Show session panel"}
-              type="button"
-            >
-              <span
-                aria-hidden="true"
-                className={`session-pill-dot ${socket.connectionState}`}
-              />
-              <span>{sessionPillLabel(socket)}</span>
-            </button>
+            <SessionMenu
+              clientName={clientName}
+              onClientNameChange={onClientNameChange}
+              onLeave={() => navigate({ name: "watch", mediaId: item.id, roomId: null })}
+              socket={socket}
+            />
           ) : (
             <button
               className="primary-button"
@@ -205,57 +190,32 @@ export function PlayerPage({
         <p className="error player-error">{watchTogether.error}</p>
       ) : null}
       {playerError ? <p className="error player-error">{playerError}</p> : null}
+      {socket.error ? (
+        <p className="error player-error">{socket.error}</p>
+      ) : null}
 
-      <div className={`player-layout ${roomId && showSessionPanel ? "with-session" : ""}`}>
-        <div className="player-stage">
-          <video
-            autoPlay={!roomId}
-            className="player-video"
-            controls
-            key={item.id}
-            onError={() => setPlayerError("The browser could not load this file.")}
-            playsInline
-            preload="metadata"
-            ref={videoRef}
-          >
-            {subtitleSources.map((track) => (
-              <track
-                key={track.key}
-                kind="subtitles"
-                label={track.label}
-                src={track.src}
-                srcLang={track.language}
-              />
-            ))}
-          </video>
-        </div>
-
-        {roomId && showSessionPanel ? (
-          <SessionPanel
-            clientName={clientName}
-            onCatchUp={catchUp}
-            onClientNameChange={onClientNameChange}
-            onLeave={() => navigate({ name: "watch", mediaId: item.id, roomId: null })}
-            rooms={rooms}
-            socket={socket}
-          />
-        ) : null}
+      <div className="player-stage">
+        <video
+          autoPlay={!roomId}
+          className="player-video"
+          controls
+          key={item.id}
+          onError={() => setPlayerError("The browser could not load this file.")}
+          playsInline
+          preload="metadata"
+          ref={videoRef}
+        >
+          {subtitleSources.map((track) => (
+            <track
+              key={track.key}
+              kind="subtitles"
+              label={track.label}
+              src={track.src}
+              srcLang={track.language}
+            />
+          ))}
+        </video>
       </div>
     </div>
   );
-}
-
-function sessionPillLabel(socket: RoomSocketApi): string {
-  switch (socket.connectionState) {
-    case "connecting":
-      return "Connecting…";
-    case "error":
-      return "Connection error";
-    case "offline":
-      return "Offline";
-    case "live":
-      return socket.presenceCount > 1
-        ? `Live · ${socket.presenceCount}`
-        : "Live";
-  }
 }

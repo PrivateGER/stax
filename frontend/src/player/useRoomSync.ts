@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type RefObject } from "react";
+import { useEffect, useRef, useState, type RefObject } from "react";
 
 import type { MediaItem } from "../types";
 import {
@@ -20,16 +20,12 @@ type Options = {
 // follow-room effect writing `video.currentTime` back.
 const SEEK_ECHO_TOLERANCE_SECONDS = 0.5;
 
-export type UseRoomSync = {
-  catchUp: () => void;
-};
-
 export function useRoomSync({
   videoRef,
   socket,
   item,
   onAutoplayBlocked,
-}: Options): UseRoomSync {
+}: Options): void {
   const live = socket.connectionState === "live";
   const nudgeResetRef = useRef<number | null>(null);
   const [clockTickMs, setClockTickMs] = useState<number>(monotonicNow());
@@ -202,24 +198,4 @@ export function useRoomSync({
     };
   }, [live, videoRef]);
 
-  const catchUp = useCallback(() => {
-    if (!socket.room || socket.authoritativeReceiptAtMs === null) return;
-    const video = videoRef.current;
-    if (!video) return;
-
-    const expected = deriveExpectedPosition(
-      socket.room,
-      socket.authoritativeReceiptAtMs,
-      monotonicNow(),
-    );
-    video.currentTime = expected;
-
-    if (socket.room.playbackState.status === "playing") {
-      void video.play().catch(() => {
-        onAutoplayBlocked("Press play once to catch up with the room.");
-      });
-    }
-  }, [socket.room, socket.authoritativeReceiptAtMs, videoRef, onAutoplayBlocked]);
-
-  return { catchUp };
 }
