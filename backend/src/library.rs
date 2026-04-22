@@ -835,7 +835,8 @@ pub(crate) async fn probe_media_metadata(
         .arg("-show_entries")
         .arg(
             "format=format_name,duration:stream=index,codec_type,codec_name,profile,level,\
-             pix_fmt,bits_per_raw_sample,width,height,channels,channel_layout,tags,disposition",
+             pix_fmt,bits_per_raw_sample,width,height,channels,channel_layout:\
+             stream_tags=language,title:stream_disposition=default,forced",
         )
         .arg("-of")
         .arg("json")
@@ -1363,7 +1364,7 @@ fn content_type_for_extension(extension: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{fs, path::PathBuf};
+    use std::{fs, path::PathBuf, process::Command as StdCommand};
     use tempfile::TempDir;
 
     #[test]
@@ -1827,5 +1828,85 @@ mod tests {
         assert_eq!(metadata.subtitle_streams.len(), 1);
         assert!(metadata.subtitle_streams[0].forced);
         assert_eq!(metadata.playback_mode, PlaybackMode::NeedsPreparation);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn probe_media_metadata_extracts_real_stream_titles_and_languages() {
+        if !external_av_tools_available() {
+            eprintln!("skipping: ffmpeg/ffprobe not on PATH");
+            return;
+        }
+
+        let temp_dir = TempDir::new().unwrap();
+        let subtitle_path = temp_dir.path().join("sample.srt");
+        let media_path = temp_dir.path().join("sample-with-tags.mkv");
+        fs::write(
+            &subtitle_path,
+            "1\n00:00:00,000 --> 00:00:00,800\nHello from subtitle\n",
+        )
+        .unwrap();
+
+        let status = StdCommand::new("ffmpeg")
+            .arg("-y")
+            .arg("-f")
+            .arg("lavfi")
+            .arg("-i")
+            .arg("testsrc=size=320x240:rate=1")
+            .arg("-f")
+            .arg("lavfi")
+            .arg("-i")
+            .arg("sine=frequency=1000:sample_rate=48000")
+            .arg("-f")
+            .arg("srt")
+            .arg("-i")
+            .arg(&subtitle_path)
+            .arg("-t")
+            .arg("1")
+            .arg("-metadata:s:a:0")
+            .arg("language=eng")
+            .arg("-metadata:s:a:0")
+            .arg("title=ENG")
+            .arg("-metadata:s:s:0")
+            .arg("language=eng")
+            .arg("-metadata:s:s:0")
+            .arg("title=Signs")
+            .arg("-c:v")
+            .arg("libx264")
+            .arg("-pix_fmt")
+            .arg("yuv420p")
+            .arg("-c:a")
+            .arg("aac")
+            .arg("-c:s")
+            .arg("srt")
+            .arg("-shortest")
+            .arg(&media_path)
+            .status()
+            .expect("ffmpeg invocation failed to start");
+        assert!(status.success(), "ffmpeg exited with status {status}");
+
+        let metadata =
+            probe_media_metadata(&media_path, Some("mkv"), Some(Path::new("ffprobe"))).await;
+
+        assert_eq!(metadata.probe_error, None);
+        assert_eq!(metadata.audio_streams.len(), 1);
+        assert_eq!(metadata.audio_streams[0].language.as_deref(), Some("eng"));
+        assert_eq!(metadata.audio_streams[0].title.as_deref(), Some("ENG"));
+        assert_eq!(metadata.subtitle_streams.len(), 1);
+        assert_eq!(metadata.subtitle_streams[0].language.as_deref(), Some("eng"));
+        assert_eq!(metadata.subtitle_streams[0].title.as_deref(), Some("Signs"));
+    }
+
+    #[cfg(unix)]
+    fn external_av_tools_available() -> bool {
+        fn probe(binary: &str) -> bool {
+            StdCommand::new(binary)
+                .arg("-version")
+                .output()
+                .map(|output| output.status.success())
+                .unwrap_or(false)
+        }
+
+        probe("ffmpeg") && probe("ffprobe")
     }
 }
