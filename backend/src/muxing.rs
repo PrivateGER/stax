@@ -1004,11 +1004,11 @@ impl HlsSessionManager {
         // already wrote it to disk in `spawn_if_needed`, so the normal
         // file path works for it.
         if filename == VIDEO_VARIANT_FILENAME {
-            self.wait_for_ready(&session).await?;
             // Unknown-duration sessions follow ffmpeg's own rolling variant
-            // playlist. We only synthesize a static VOD variant when the plan
-            // is bounded and all segment URIs are known up-front.
+            // playlist on disk, so we still have to wait for ffmpeg to become
+            // ready before the file exists.
             if !session.plan.is_bounded() {
+                self.wait_for_ready(&session).await?;
                 let path = session.dir.join(filename);
                 if !fs::try_exists(&path).await.unwrap_or(false) {
                     self.wait_for_file(&path).await?;
@@ -1022,6 +1022,9 @@ impl HlsSessionManager {
                     },
                 });
             }
+            // Bounded sessions use our synthesized static VOD playlist. Return
+            // it immediately after session spawn — no readiness wait — so the
+            // player never blocks on the playlist request itself.
             session.in_flight.fetch_add(1, Ordering::Relaxed);
             let body = build_variant_playlist(&session.plan).into_bytes();
             return Ok(HlsServeResult {
@@ -3429,7 +3432,7 @@ seg_0_00100.m4s\n";
         };
 
         let result = manager
-            .serve(&item, VIDEO_VARIANT_FILENAME, BrowserHint::Generic)
+            .serve(&item, INIT_SEGMENT_FROZEN, BrowserHint::Generic)
             .await;
         match result {
             Err(HlsError::SpawnFailed(message)) => {

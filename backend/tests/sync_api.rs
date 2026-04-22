@@ -2893,6 +2893,102 @@ while true; do sleep 1; done
 
 #[cfg(unix)]
 #[tokio::test]
+async fn hls_video_variant_returns_immediately_before_transcoder_is_ready() {
+    let temp_dir = TempDir::new().unwrap();
+    let root = temp_dir.path().join("library");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("movie.mkv"), b"synthetic").unwrap();
+
+    let probe = write_probe_script(
+        &temp_dir,
+        "probe-full-transcode.sh",
+        r###"#!/usr/bin/env bash
+set -euo pipefail
+cat <<'JSON'
+{
+  "format": { "format_name": "matroska,webm", "duration": "600.0" },
+  "streams": [
+    { "codec_type": "video", "codec_name": "hevc", "width": 320, "height": 240 },
+    { "codec_type": "audio", "codec_name": "ac3" }
+  ]
+}
+JSON
+"###,
+    );
+    let ffmpeg_stub = write_ffmpeg_stub(
+        &temp_dir,
+        "ffmpeg-delayed-ready.sh",
+        r###"#!/usr/bin/env bash
+set -euo pipefail
+
+# Delay readiness to mimic a cold full-transcode startup.
+sleep 2
+printf 'init' > "init_0.mp4"
+printf 'segment' > "seg_0_00000.m4s"
+cat > "stream_0.m3u8" <<'EOF'
+#EXTM3U
+#EXT-X-VERSION:7
+#EXT-X-TARGETDURATION:2
+#EXT-X-MAP:URI="init_0.mp4"
+#EXTINF:2.000,
+seg_0_00000.m4s
+EOF
+
+trap 'exit 0' TERM INT
+while true; do sleep 1; done
+"###,
+    );
+
+    let library = LibraryConfig::from_paths(vec![root]).with_probe_command(probe);
+    let hls_config = HlsConfig {
+        cache_dir: temp_dir.path().join("hls-cache"),
+        max_concurrent: 2,
+        idle_secs: 60,
+        ffmpeg_command: Some(ffmpeg_stub),
+        hw_accel: Default::default(),
+        vaapi_device: None,
+    };
+
+    let server = TestServer::spawn_with_library_and_hls(library, hls_config).await;
+    server.scan_library().await;
+    let library = server.wait_for_probes_complete().await;
+    let item = library
+        .items
+        .into_iter()
+        .next()
+        .expect("scanned media item");
+    assert_eq!(
+        item.playback_mode,
+        syncplay_backend::protocol::PlaybackMode::HlsFullTranscode
+    );
+
+    let started = std::time::Instant::now();
+    let response = server
+        .client
+        .get(format!(
+            "{}/api/media/{}/hls/stream_0.m3u8",
+            server.base_url, item.id
+        ))
+        .send()
+        .await
+        .unwrap();
+    let elapsed = started.elapsed();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        elapsed < Duration::from_millis(1200),
+        "video variant should not wait for transcoder readiness (elapsed {:?})",
+        elapsed
+    );
+    let body = response.text().await.unwrap();
+    assert!(
+        body.contains("#EXT-X-ENDLIST"),
+        "bounded synthetic variant should be returned immediately: {body}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn hls_seek_respawn_throttle_returns_429_with_retry_after() {
     let temp_dir = TempDir::new().unwrap();
     let root = temp_dir.path().join("library");
