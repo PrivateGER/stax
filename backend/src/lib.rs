@@ -42,9 +42,9 @@ use persistence::{Persistence, PersistenceError, StreamCopyRecord, StreamCopyReq
 use probes::{ProbeConfig, ProbeJob, ProbeWorkerPool};
 use protocol::{
     ClientSocketMessage, CreateRoomRequest, CreateStreamCopyRequest, HealthResponse,
-    LibraryResponse, LibraryScanResponse, PlaybackAction, PlaybackMode, Room, RoomSocketQuery,
-    RoomsResponse, ServerEvent, StreamCopyStatus, StreamCopySummary, SubtitleMode,
-    SubtitleSourceKind,
+    LibraryResponse, LibraryScanResponse, MediaItem, PlaybackAction, PlaybackMode, Room,
+    RoomSocketQuery, RoomsResponse, ServerEvent, StreamCopyStatus, StreamCopySummary, SubtitleMode,
+    SubtitleSourceKind, is_text_subtitle_codec,
 };
 use stream_copies::{StreamCopyConfig, StreamCopyJob, StreamCopyWorkerPool};
 use streaming::{
@@ -66,20 +66,6 @@ pub struct AppState {
     stream_copies: StreamCopyWorkerPool,
     thumbnails: ThumbnailWorkerPool,
     probes: ProbeWorkerPool,
-}
-
-impl AppState {
-    pub fn stream_copies(&self) -> StreamCopyWorkerPool {
-        self.stream_copies.clone()
-    }
-
-    pub fn thumbnails(&self) -> ThumbnailWorkerPool {
-        self.thumbnails.clone()
-    }
-
-    pub fn probes(&self) -> ProbeWorkerPool {
-        self.probes.clone()
-    }
 }
 
 #[derive(Debug)]
@@ -553,46 +539,39 @@ async fn stream_media(
     State(state): State<AppState>,
     Path(media_id): Path<Uuid>,
     headers: HeaderMap,
-) -> Response {
+) -> Result<Response, ApiError> {
     let range_header = match headers.get(RANGE) {
         Some(value) => match value.to_str() {
             Ok(value) => Some(value),
             Err(_) => {
-                return ApiError::bad_request("Range header must be valid ASCII.").into_response();
+                return Err(ApiError::bad_request("Range header must be valid ASCII."));
             }
         },
         None => None,
     };
 
-    let media_item = match state.library.media_item(media_id).await {
-        Ok(Some(media_item)) => media_item,
-        Ok(None) => return ApiError::not_found("Media not found.").into_response(),
-        Err(error) => {
-            warn!(%error, %media_id, "failed to load media item");
-            return ApiError::internal("Failed to load media.").into_response();
-        }
-    };
+    let media_item =
+        load_media_item(&state, media_id, "stream_media", "Failed to load media.").await?;
 
     let stream_result = match media_item.playback_mode {
         PlaybackMode::Direct => stream_media_response(&media_item, range_header).await,
         PlaybackMode::NeedsPreparation => {
-            let Some(record) = load_current_stream_copy_record(&state, &media_item).await else {
-                return ApiError::with_status(
+            let Some(record) = load_current_stream_copy_record(&state, &media_item).await? else {
+                return Err(ApiError::with_status(
                     StatusCode::CONFLICT,
                     playback_unavailable_message(&media_item),
-                )
-                .into_response();
+                ));
             };
             if record.status != StreamCopyStatus::Ready {
-                return ApiError::with_status(
+                return Err(ApiError::with_status(
                     StatusCode::CONFLICT,
                     playback_unavailable_message(&media_item),
-                )
-                .into_response();
+                ));
             }
             let Some(output_path) = record.output_path.as_deref() else {
-                return ApiError::internal("Prepared stream copy is missing an output file.")
-                    .into_response();
+                return Err(ApiError::internal(
+                    "Prepared stream copy is missing an output file.",
+                ));
             };
             let content_type = record
                 .output_content_type
@@ -606,61 +585,56 @@ async fn stream_media(
             .await
         }
         PlaybackMode::Unsupported => {
-            return ApiError::with_status(
+            return Err(ApiError::with_status(
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
                 "This media is not supported for browser playback.",
-            )
-            .into_response();
+            ));
         }
     };
 
     match stream_result {
-        Ok(response) => response,
-        Err(StreamMediaError::NotFound) => {
-            ApiError::not_found("Media file not found.").into_response()
-        }
-        Err(StreamMediaError::MalformedRange(message)) => {
-            ApiError::bad_request(message).into_response()
-        }
+        Ok(response) => Ok(response),
+        Err(StreamMediaError::NotFound) => Err(ApiError::not_found("Media file not found.")),
+        Err(StreamMediaError::MalformedRange(message)) => Err(ApiError::bad_request(message)),
         Err(StreamMediaError::UnsatisfiableRange { file_len }) => {
-            unsatisfiable_range_response(file_len)
+            Ok(unsatisfiable_range_response(file_len))
         }
         Err(StreamMediaError::Io(error)) => {
             warn!(%error, media_id = %media_item.id, "failed to stream media");
-            ApiError::internal("Failed to stream media.").into_response()
+            Err(ApiError::internal("Failed to stream media."))
         }
     }
 }
 
-async fn stream_thumbnail(State(state): State<AppState>, Path(media_id): Path<Uuid>) -> Response {
-    let media_item = match state.library.media_item(media_id).await {
-        Ok(Some(media_item)) => media_item,
-        Ok(None) => return ApiError::not_found("Media not found.").into_response(),
-        Err(error) => {
-            warn!(%error, %media_id, "failed to load media item for thumbnail");
-            return ApiError::internal("Failed to load media.").into_response();
-        }
-    };
+async fn stream_thumbnail(
+    State(state): State<AppState>,
+    Path(media_id): Path<Uuid>,
+) -> Result<Response, ApiError> {
+    let media_item = load_media_item(
+        &state,
+        media_id,
+        "stream_thumbnail",
+        "Failed to load media.",
+    )
+    .await?;
 
     if media_item.thumbnail_generated_at.is_none() {
-        return ApiError::not_found("Thumbnail not available.").into_response();
+        return Err(ApiError::not_found("Thumbnail not available."));
     }
 
     let Some(thumbnail_path) = state.library.thumbnail_path(media_item.id) else {
-        return ApiError::not_found("Thumbnail not available.").into_response();
+        return Err(ApiError::not_found("Thumbnail not available."));
     };
 
     match stream_thumbnail_response(&thumbnail_path).await {
-        Ok(response) => response,
-        Err(StreamMediaError::NotFound) => {
-            ApiError::not_found("Thumbnail not available.").into_response()
-        }
+        Ok(response) => Ok(response),
+        Err(StreamMediaError::NotFound) => Err(ApiError::not_found("Thumbnail not available.")),
         Err(StreamMediaError::Io(error)) => {
             warn!(%error, media_id = %media_item.id, "failed to stream thumbnail");
-            ApiError::internal("Failed to stream thumbnail.").into_response()
+            Err(ApiError::internal("Failed to stream thumbnail."))
         }
         Err(StreamMediaError::MalformedRange(_) | StreamMediaError::UnsatisfiableRange { .. }) => {
-            ApiError::internal("Failed to stream thumbnail.").into_response()
+            Err(ApiError::internal("Failed to stream thumbnail."))
         }
     }
 }
@@ -669,16 +643,10 @@ async fn get_stream_copy(
     State(state): State<AppState>,
     Path(media_id): Path<Uuid>,
 ) -> Result<Json<StreamCopySummary>, ApiError> {
-    let media_item = match state.library.media_item(media_id).await {
-        Ok(Some(media_item)) => media_item,
-        Ok(None) => return Err(ApiError::not_found("Media not found.")),
-        Err(error) => {
-            warn!(%error, %media_id, "failed to load media item for stream copy");
-            return Err(ApiError::internal("Failed to load media."));
-        }
-    };
+    let media_item =
+        load_media_item(&state, media_id, "get_stream_copy", "Failed to load media.").await?;
 
-    let Some(record) = load_current_stream_copy_record(&state, &media_item).await else {
+    let Some(record) = load_current_stream_copy_record(&state, &media_item).await? else {
         return Err(ApiError::not_found(
             "No current stream copy exists for this media.",
         ));
@@ -697,14 +665,13 @@ async fn create_stream_copy(
     Path(media_id): Path<Uuid>,
     Json(request): Json<CreateStreamCopyRequest>,
 ) -> Result<Json<StreamCopySummary>, ApiError> {
-    let media_item = match state.library.media_item(media_id).await {
-        Ok(Some(media_item)) => media_item,
-        Ok(None) => return Err(ApiError::not_found("Media not found.")),
-        Err(error) => {
-            warn!(%error, %media_id, "failed to load media item for stream copy request");
-            return Err(ApiError::internal("Failed to load media."));
-        }
-    };
+    let media_item = load_media_item(
+        &state,
+        media_id,
+        "create_stream_copy",
+        "Failed to load media.",
+    )
+    .await?;
 
     if media_item.playback_mode == PlaybackMode::Direct {
         return Err(ApiError::with_status(
@@ -721,7 +688,7 @@ async fn create_stream_copy(
 
     validate_stream_copy_request(&media_item, &request)?;
 
-    if let Some(existing) = load_current_stream_copy_record(&state, &media_item).await {
+    if let Some(existing) = load_current_stream_copy_record(&state, &media_item).await? {
         let same_request = stream_copy_request_matches(&existing, &request);
         if same_request
             && matches!(
@@ -795,62 +762,62 @@ async fn create_stream_copy(
 async fn stream_prepared_subtitle(
     State(state): State<AppState>,
     Path(media_id): Path<Uuid>,
-) -> Response {
-    let media_item = match state.library.media_item(media_id).await {
-        Ok(Some(media_item)) => media_item,
-        Ok(None) => return ApiError::not_found("Media not found.").into_response(),
-        Err(error) => {
-            warn!(%error, %media_id, "failed to load media item for prepared subtitle");
-            return ApiError::internal("Failed to load media.").into_response();
-        }
-    };
-    let Some(record) = load_current_stream_copy_record(&state, &media_item).await else {
-        return ApiError::not_found("Prepared subtitle not found.").into_response();
+) -> Result<Response, ApiError> {
+    let media_item = load_media_item(
+        &state,
+        media_id,
+        "stream_prepared_subtitle",
+        "Failed to load media.",
+    )
+    .await?;
+    let Some(record) = load_current_stream_copy_record(&state, &media_item).await? else {
+        return Err(ApiError::not_found("Prepared subtitle not found."));
     };
     if record.status != StreamCopyStatus::Ready {
-        return ApiError::with_status(
+        return Err(ApiError::with_status(
             StatusCode::CONFLICT,
             playback_unavailable_message(&media_item),
-        )
-        .into_response();
+        ));
     }
     let Some(subtitle_path) = record.subtitle_path.as_deref() else {
-        return ApiError::not_found("Prepared subtitle not found.").into_response();
+        return Err(ApiError::not_found("Prepared subtitle not found."));
     };
 
     match stream_webvtt_file_response(std::path::Path::new(subtitle_path)).await {
-        Ok(response) => response,
-        Err(StreamMediaError::NotFound) => {
-            ApiError::not_found("Prepared subtitle not found.").into_response()
-        }
+        Ok(response) => Ok(response),
+        Err(StreamMediaError::NotFound) => Err(ApiError::not_found("Prepared subtitle not found.")),
         Err(StreamMediaError::Io(error)) => {
             warn!(%error, media_id = %media_item.id, "failed to stream prepared subtitle");
-            ApiError::internal("Failed to stream prepared subtitle.").into_response()
+            Err(ApiError::internal("Failed to stream prepared subtitle."))
         }
         Err(StreamMediaError::MalformedRange(_) | StreamMediaError::UnsatisfiableRange { .. }) => {
-            ApiError::internal("Failed to stream prepared subtitle.").into_response()
+            Err(ApiError::internal("Failed to stream prepared subtitle."))
         }
     }
 }
 
 async fn load_current_stream_copy_record(
     state: &AppState,
-    media_item: &protocol::MediaItem,
-) -> Option<StreamCopyRecord> {
-    let record = match state.persistence.find_stream_copy(media_item.id).await {
-        Ok(record) => record,
-        Err(error) => {
+    media_item: &MediaItem,
+) -> Result<Option<StreamCopyRecord>, ApiError> {
+    let record = state
+        .persistence
+        .find_stream_copy(media_item.id)
+        .await
+        .map_err(|error| {
             warn!(%error, media_id = %media_item.id, "failed to load stream copy record");
-            None
-        }
-    }?;
+            ApiError::internal("Failed to load stream copy state.")
+        })?;
 
-    (record.source_size_bytes == media_item.size_bytes
-        && record.source_modified_at == media_item.modified_at)
-        .then_some(record)
+    Ok(record.filter(|record| stream_copy_matches_media_source(record, media_item)))
 }
 
-fn playback_unavailable_message(media_item: &protocol::MediaItem) -> &'static str {
+fn stream_copy_matches_media_source(record: &StreamCopyRecord, media_item: &MediaItem) -> bool {
+    record.source_size_bytes == media_item.size_bytes
+        && record.source_modified_at == media_item.modified_at
+}
+
+fn playback_unavailable_message(media_item: &MediaItem) -> &'static str {
     match media_item.preparation_state {
         protocol::PreparationState::Preparing => {
             "A stream copy is still being prepared for this media."
@@ -955,35 +922,20 @@ fn validate_stream_copy_request(
     Ok(())
 }
 
-fn is_text_subtitle_codec(codec: Option<&str>) -> bool {
-    matches!(
-        codec.unwrap_or_default().to_ascii_lowercase().as_str(),
-        "ass" | "ssa" | "subrip" | "srt" | "webvtt" | "mov_text" | "text"
-    )
-}
-
 async fn stream_subtitle(
     State(state): State<AppState>,
     Path((media_id, track_index)): Path<(Uuid, usize)>,
-) -> Response {
-    let media_item = match state.library.media_item(media_id).await {
-        Ok(Some(media_item)) => media_item,
-        Ok(None) => return ApiError::not_found("Media not found.").into_response(),
-        Err(error) => {
-            warn!(%error, %media_id, "failed to load media item for subtitle stream");
-            return ApiError::internal("Failed to load media.").into_response();
-        }
-    };
+) -> Result<Response, ApiError> {
+    let media_item =
+        load_media_item(&state, media_id, "stream_subtitle", "Failed to load media.").await?;
 
     let Some(subtitle_track) = media_item.subtitle_tracks.get(track_index) else {
-        return ApiError::not_found("Subtitle track not found.").into_response();
+        return Err(ApiError::not_found("Subtitle track not found."));
     };
 
     match stream_subtitle_response(&media_item, subtitle_track).await {
-        Ok(response) => response,
-        Err(StreamMediaError::NotFound) => {
-            ApiError::not_found("Subtitle file not found.").into_response()
-        }
+        Ok(response) => Ok(response),
+        Err(StreamMediaError::NotFound) => Err(ApiError::not_found("Subtitle file not found.")),
         Err(StreamMediaError::Io(error)) => {
             warn!(
                 %error,
@@ -991,10 +943,10 @@ async fn stream_subtitle(
                 subtitle = %subtitle_track.relative_path,
                 "failed to stream subtitle"
             );
-            ApiError::internal("Failed to stream subtitle.").into_response()
+            Err(ApiError::internal("Failed to stream subtitle."))
         }
         Err(StreamMediaError::MalformedRange(_) | StreamMediaError::UnsatisfiableRange { .. }) => {
-            ApiError::internal("Failed to stream subtitle.").into_response()
+            Err(ApiError::internal("Failed to stream subtitle."))
         }
     }
 }
@@ -1016,15 +968,19 @@ async fn create_room(
 
     let (media_id, media_title) = match payload.media_id {
         Some(media_id) => {
-            let media_item = state
-                .library
-                .media_item(media_id)
-                .await
-                .map_err(|error| {
-                    warn!(%error, %media_id, "failed to resolve media for room");
-                    ApiError::internal("Failed to resolve media for room.")
-                })?
-                .ok_or_else(|| ApiError::bad_request("Media is not in the library index."))?;
+            let media_item = load_media_item(
+                &state,
+                media_id,
+                "create_room",
+                "Failed to resolve media for room.",
+            )
+            .await
+            .map_err(|error| match error.status {
+                StatusCode::NOT_FOUND => {
+                    ApiError::bad_request("Media is not in the library index.")
+                }
+                _ => error,
+            })?;
 
             let derived_title = provided_media_title
                 .clone()
@@ -1054,6 +1010,23 @@ async fn create_room(
     );
 
     Ok((StatusCode::CREATED, Json(snapshot)))
+}
+
+async fn load_media_item(
+    state: &AppState,
+    media_id: Uuid,
+    action: &'static str,
+    client_error: &'static str,
+) -> Result<MediaItem, ApiError> {
+    state
+        .library
+        .media_item(media_id)
+        .await
+        .map_err(|error| {
+            warn!(%error, %media_id, action, "failed to load media item");
+            ApiError::internal(client_error)
+        })?
+        .ok_or_else(|| ApiError::not_found("Media not found."))
 }
 
 async fn connect_room_socket(

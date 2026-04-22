@@ -22,7 +22,7 @@ use crate::{
     persistence::{PendingStreamCopy, Persistence, StreamCopyRecord, stream_copy_summary_for},
     protocol::{
         MediaItem, StreamCopyStatus, StreamCopySummary, SubtitleMode, SubtitleSourceKind,
-        SubtitleTrack,
+        SubtitleTrack, is_text_subtitle_codec,
     },
     streaming::convert_srt_to_vtt,
 };
@@ -182,26 +182,23 @@ async fn process_job(
     progress: &SharedStreamCopyProgress,
 ) {
     let media_id = job.media_id;
-    let now = format_timestamp(time::OffsetDateTime::now_utc());
     clear_progress(progress, media_id).await;
 
     let Some(ffmpeg_command) = config.ffmpeg_command.as_deref() else {
-        let _ = persistence
-            .mark_stream_copy_failed(media_id, "ffmpeg is not configured.", &now)
-            .await;
+        mark_stream_copy_failed(persistence, media_id, "ffmpeg is not configured.").await;
         return;
     };
     let Some(cache_dir) = config.cache_dir.as_deref() else {
-        let _ = persistence
-            .mark_stream_copy_failed(
-                media_id,
-                "Stream copy cache directory is not configured.",
-                &now,
-            )
-            .await;
+        mark_stream_copy_failed(
+            persistence,
+            media_id,
+            "Stream copy cache directory is not configured.",
+        )
+        .await;
         return;
     };
 
+    let now = format_timestamp(time::OffsetDateTime::now_utc());
     if let Err(error) = persistence.mark_stream_copy_running(media_id, &now).await {
         warn!(%error, %media_id, "failed to mark stream copy running");
         return;
@@ -210,29 +207,24 @@ async fn process_job(
     let media_item = match library.media_item(media_id).await {
         Ok(Some(item)) => item,
         Ok(None) => {
-            let now = format_timestamp(time::OffsetDateTime::now_utc());
-            let _ = persistence
-                .mark_stream_copy_failed(media_id, "Media item no longer exists.", &now)
-                .await;
+            mark_stream_copy_failed(persistence, media_id, "Media item no longer exists.").await;
             return;
         }
         Err(error) => {
             warn!(%error, %media_id, "failed to load media item for stream copy");
-            let now = format_timestamp(time::OffsetDateTime::now_utc());
-            let _ = persistence
-                .mark_stream_copy_failed(media_id, "Failed to load media item.", &now)
-                .await;
+            mark_stream_copy_failed(persistence, media_id, "Failed to load media item.").await;
             return;
         }
     };
     let copy = match persistence.find_stream_copy(media_id).await {
         Ok(Some(record)) => record,
-        Ok(None) => return,
+        Ok(None) => {
+            warn!(%media_id, "stream copy request disappeared before the worker started");
+            return;
+        }
         Err(error) => {
             warn!(%error, %media_id, "failed to load stream copy row");
-            let now = format_timestamp(time::OffsetDateTime::now_utc());
-            let _ = persistence
-                .mark_stream_copy_failed(media_id, "Failed to load stream copy request.", &now)
+            mark_stream_copy_failed(persistence, media_id, "Failed to load stream copy request.")
                 .await;
             return;
         }
@@ -264,12 +256,19 @@ async fn process_job(
         }
         Err(error_message) => {
             warn!(%media_id, error = %error_message, "stream copy failed");
-            let now = format_timestamp(time::OffsetDateTime::now_utc());
             clear_progress(progress, media_id).await;
-            let _ = persistence
-                .mark_stream_copy_failed(media_id, &error_message, &now)
-                .await;
+            mark_stream_copy_failed(persistence, media_id, &error_message).await;
         }
+    }
+}
+
+async fn mark_stream_copy_failed(persistence: &Persistence, media_id: Uuid, message: &str) {
+    let now = format_timestamp(time::OffsetDateTime::now_utc());
+    if let Err(error) = persistence
+        .mark_stream_copy_failed(media_id, message, &now)
+        .await
+    {
+        warn!(%error, %media_id, "failed to persist stream copy failure");
     }
 }
 
@@ -713,13 +712,6 @@ fn resolve_sidecar_subtitle_path(media_item: &MediaItem, track: &SubtitleTrack) 
         path.push(component.as_os_str());
     }
     path
-}
-
-fn is_text_subtitle_codec(codec: Option<&str>) -> bool {
-    matches!(
-        codec.unwrap_or_default().to_ascii_lowercase().as_str(),
-        "ass" | "ssa" | "subrip" | "srt" | "webvtt" | "mov_text" | "text"
-    )
 }
 
 fn escape_subtitles_path(path: &Path) -> String {

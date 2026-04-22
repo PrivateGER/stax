@@ -13,39 +13,43 @@ export function usePlayerSource(
 ): { fatalError: FatalError | null } {
   const [fatalError, setFatalError] = useState<FatalError | null>(null);
 
+  const itemId = item?.id ?? null;
+  const preparationState = item?.preparationState ?? null;
+  const streamCopyError = item?.streamCopy?.error ?? null;
+
   useEffect(() => {
     setFatalError(null);
     const video = videoRef.current;
-    if (!video || !item) return;
+    if (!video || !itemId || !preparationState) return;
 
-    if (item.preparationState === "unsupported") {
+    if (preparationState === "unsupported") {
       setFatalError({
         message: "This media is not supported for browser playback.",
       });
       return;
     }
-    if (item.preparationState === "needsPreparation") {
+    if (preparationState === "needsPreparation") {
       setFatalError({
         message: "This media needs a stream copy before it can be played.",
       });
       return;
     }
-    if (item.preparationState === "preparing") {
+    if (preparationState === "preparing") {
       setFatalError({
         message: "A stream copy is still being prepared for this media.",
       });
       return;
     }
-    if (item.preparationState === "failed") {
+    if (preparationState === "failed") {
       setFatalError({
         message:
-          item.streamCopy?.error ??
+          streamCopyError ??
           "The last stream copy attempt failed. Create a new stream copy to try again.",
       });
       return;
     }
 
-    video.src = streamUrl(item.id);
+    video.src = streamUrl(itemId);
 
     return () => {
       video.removeAttribute("src");
@@ -55,7 +59,7 @@ export function usePlayerSource(
         // ignore
       }
     };
-  }, [videoRef, item]);
+  }, [videoRef, itemId, preparationState, streamCopyError]);
 
   return { fatalError };
 }

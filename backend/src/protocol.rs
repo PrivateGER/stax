@@ -264,6 +264,13 @@ impl SubtitleSourceKind {
     }
 }
 
+pub(crate) fn is_text_subtitle_codec(codec: Option<&str>) -> bool {
+    matches!(
+        codec.unwrap_or_default().to_ascii_lowercase().as_str(),
+        "ass" | "ssa" | "subrip" | "srt" | "webvtt" | "mov_text" | "text"
+    )
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct StreamCopySubtitleSelection {
@@ -365,4 +372,21 @@ pub struct LibraryScanResponse {
     pub scanned_root_count: usize,
     pub indexed_item_count: usize,
     pub scanned_at: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_text_subtitle_codec;
+
+    #[test]
+    fn text_subtitle_codec_detection_is_case_insensitive() {
+        assert!(is_text_subtitle_codec(Some("SubRip")));
+        assert!(is_text_subtitle_codec(Some("MOV_TEXT")));
+    }
+
+    #[test]
+    fn text_subtitle_codec_detection_rejects_bitmap_and_missing_codecs() {
+        assert!(!is_text_subtitle_codec(Some("hdmv_pgs_subtitle")));
+        assert!(!is_text_subtitle_codec(None));
+    }
 }

@@ -278,7 +278,10 @@ export function PlayerPage({
     }
   }, [live, socket.room, socket.authoritativeReceiptAtMs, clockTickMs, item]);
 
-  // Apply drift correction nudges/seeks.
+  // Apply drift correction nudges/seeks. Keep `item` out of the deps: library
+  // polls hand us a fresh item reference every ~10s, and re-running this effect
+  // would replay the last (stale) `expectedPositionSeconds` and yank playback
+  // backward. A corrections-only trigger is what we actually want.
   useEffect(() => {
     if (!socket.lastCorrection || !live || !item) return;
 
@@ -308,7 +311,8 @@ export function PlayerPage({
     }
 
     video.playbackRate = baseRate;
-  }, [socket.lastCorrection, live, item, socket.room]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [socket.lastCorrection, live, item?.id, socket.room]);
 
   const handleSelectAudioTrack = useCallback((trackId: string) => {
     const video = videoRef.current;
