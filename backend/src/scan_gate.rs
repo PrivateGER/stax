@@ -200,7 +200,10 @@ mod tests {
         drop(guard_a);
         // Still one hold outstanding — waiter must still block.
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(!waiter.is_finished(), "waiter should block while any guard remains");
+        assert!(
+            !waiter.is_finished(),
+            "waiter should block while any guard remains"
+        );
 
         drop(guard_b);
         timeout(Duration::from_secs(1), waiter)

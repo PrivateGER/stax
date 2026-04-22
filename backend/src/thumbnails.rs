@@ -122,11 +122,7 @@ impl ThumbnailWorkerPool {
     /// long as the process — there is no graceful shutdown today (workers
     /// are short-lived ffmpeg invocations and the process exits when all
     /// other tasks do).
-    pub fn spawn(
-        config: ThumbnailConfig,
-        persistence: Persistence,
-        scan_gate: ScanGate,
-    ) -> Self {
+    pub fn spawn(config: ThumbnailConfig, persistence: Persistence, scan_gate: ScanGate) -> Self {
         let (sender, mut receiver) = mpsc::unbounded_channel::<ThumbnailJob>();
         let semaphore = Arc::new(Semaphore::new(config.max_concurrent.max(1)));
         info!(
@@ -232,7 +228,10 @@ async fn process_job(job: ThumbnailJob, config: &ThumbnailConfig, persistence: &
 }
 
 enum ThumbnailOutcome {
-    Generated { timestamp: String, source: ThumbnailSource },
+    Generated {
+        timestamp: String,
+        source: ThumbnailSource,
+    },
     Skipped,
     Failed(String),
 }
@@ -370,14 +369,7 @@ async fn generate(job: &ThumbnailJob, config: &ThumbnailConfig) -> ThumbnailOutc
         "trying frame extraction source"
     );
     let started = Instant::now();
-    match render_from_frame(
-        ffmpeg,
-        &job.media_path,
-        &output_path,
-        job.duration_seconds,
-    )
-    .await
-    {
+    match render_from_frame(ffmpeg, &job.media_path, &output_path, job.duration_seconds).await {
         Ok(()) => {
             debug!(
                 media_id = %job.media_id,
@@ -393,11 +385,7 @@ async fn generate(job: &ThumbnailJob, config: &ThumbnailConfig) -> ThumbnailOutc
     }
 }
 
-async fn render_from_image(
-    ffmpeg: &Path,
-    source: &Path,
-    output: &Path,
-) -> Result<(), String> {
+async fn render_from_image(ffmpeg: &Path, source: &Path, output: &Path) -> Result<(), String> {
     let result = Command::new(ffmpeg)
         .arg("-y")
         .arg("-loglevel")
@@ -489,7 +477,9 @@ fn classify_ffmpeg_result(
             }
         }
         Ok(output_data) => {
-            let stderr = String::from_utf8_lossy(&output_data.stderr).trim().to_string();
+            let stderr = String::from_utf8_lossy(&output_data.stderr)
+                .trim()
+                .to_string();
             let _ = fs::remove_file(output);
             if stderr.is_empty() {
                 Err(format!("ffmpeg exited with status {}", output_data.status))

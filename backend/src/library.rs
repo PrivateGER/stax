@@ -10,7 +10,11 @@ use std::{
 
 use serde::Deserialize;
 use time::OffsetDateTime;
-use tokio::{process::Command, sync::Semaphore, task::{self, JoinSet}};
+use tokio::{
+    process::Command,
+    sync::Semaphore,
+    task::{self, JoinSet},
+};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -279,7 +283,9 @@ impl LibraryService {
                         elapsed_ms = outcome.elapsed_ms,
                         "library walk complete"
                     );
-                    self.persistence.mark_root_scanned(&root_path_string).await?;
+                    self.persistence
+                        .mark_root_scanned(&root_path_string)
+                        .await?;
                 }
                 Err(error) => {
                     warn!(path = %root_path_string, %error, "library root scan failed");
@@ -431,7 +437,11 @@ fn walk_dir(
         let root_for_blocking = Arc::clone(&context.root_path);
         let indexed_at_for_blocking = Arc::clone(&context.indexed_at);
         let contents = task::spawn_blocking(move || {
-            classify_directory(&root_for_blocking, &dir_for_blocking, &indexed_at_for_blocking)
+            classify_directory(
+                &root_for_blocking,
+                &dir_for_blocking,
+                &indexed_at_for_blocking,
+            )
         })
         .await
         .map_err(|error| format!("walker task panicked: {error}"))?;
@@ -539,10 +549,7 @@ fn build_walk_record(
 
         if on_disk_fresh {
             // Mark fresh; future loads can stream it directly.
-            Some((
-                Some(format_timestamp(OffsetDateTime::now_utc())),
-                None,
-            ))
+            Some((Some(format_timestamp(OffsetDateTime::now_utc())), None))
         } else {
             // Re-queue thumbnail generation by leaving the columns NULL.
             Some((None, None))
@@ -582,11 +589,7 @@ fn build_walk_record(
 /// re-list the directory per media file. This is the optimization that
 /// kills the N×directory-listing cost the previous implementation had on
 /// high-latency filesystems.
-fn classify_directory(
-    root_path: &Path,
-    dir: &Path,
-    indexed_at: &str,
-) -> DirContents {
+fn classify_directory(root_path: &Path, dir: &Path, indexed_at: &str) -> DirContents {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(error) => {
@@ -843,10 +846,9 @@ pub(crate) async fn probe_media_metadata(
             };
             probe_outcome_with_error(probed_at, &error)
         }
-        Err(error) => probe_outcome_with_error(
-            probed_at,
-            &format!("ffprobe could not start: {error}"),
-        ),
+        Err(error) => {
+            probe_outcome_with_error(probed_at, &format!("ffprobe could not start: {error}"))
+        }
     }
 }
 
@@ -998,12 +1000,7 @@ fn parse_probe_output(
             channel_layout: stream.channel_layout.clone(),
             language: lookup_tag(&stream.tags, "language"),
             title: lookup_tag(&stream.tags, "title"),
-            default: stream
-                .disposition
-                .get("default")
-                .copied()
-                .unwrap_or(0)
-                != 0,
+            default: stream.disposition.get("default").copied().unwrap_or(0) != 0,
         })
         .collect();
 
@@ -1023,18 +1020,8 @@ fn parse_probe_output(
             codec: stream.codec_name.clone(),
             language: lookup_tag(&stream.tags, "language"),
             title: lookup_tag(&stream.tags, "title"),
-            default: stream
-                .disposition
-                .get("default")
-                .copied()
-                .unwrap_or(0)
-                != 0,
-            forced: stream
-                .disposition
-                .get("forced")
-                .copied()
-                .unwrap_or(0)
-                != 0,
+            default: stream.disposition.get("default").copied().unwrap_or(0) != 0,
+            forced: stream.disposition.get("forced").copied().unwrap_or(0) != 0,
         })
         .collect();
 
@@ -1075,7 +1062,9 @@ fn parse_probe_output(
             .map(|duration| round_to(duration, 3)),
         container_name,
         video_codec: video_stream.and_then(|stream| stream.codec_name.clone()),
-        audio_codec: audio_streams.first().and_then(|stream| stream.codec.clone()),
+        audio_codec: audio_streams
+            .first()
+            .and_then(|stream| stream.codec.clone()),
         width: video_stream.and_then(|stream| stream.width),
         height: video_stream.and_then(|stream| stream.height),
         probed_at,
@@ -1233,9 +1222,7 @@ fn is_browser_safe_video_codec(
                 })
                 .unwrap_or(true);
             let pix_fmt_ok = pix_fmt
-                .map(|value| {
-                    matches!(value.to_ascii_lowercase().as_str(), "yuv420p" | "yuvj420p")
-                })
+                .map(|value| matches!(value.to_ascii_lowercase().as_str(), "yuv420p" | "yuvj420p"))
                 .unwrap_or(true);
             let level_ok = level.map(|value| value <= 51).unwrap_or(true);
             let bit_depth_ok = bit_depth.map(|value| value <= 8).unwrap_or(true);

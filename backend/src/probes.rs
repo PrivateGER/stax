@@ -11,11 +11,7 @@
 //! mpsc channel for incoming jobs, `Semaphore` to bound concurrency,
 //! per-job tokio task that takes the permit and persists the outcome.
 
-use std::{
-    path::PathBuf,
-    sync::Arc,
-    time::Instant,
-};
+use std::{path::PathBuf, sync::Arc, time::Instant};
 
 use tokio::sync::{Semaphore, mpsc};
 use tracing::{debug, info, warn};

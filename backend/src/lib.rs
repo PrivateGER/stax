@@ -38,18 +38,18 @@ pub mod thumbnails;
 
 use clock::{AuthoritativePlaybackClock, format_timestamp, round_to};
 use library::{LibraryConfig, LibraryService};
-use muxing::{BrowserHint, HlsConfig, HlsError, HlsServeBody, HlsSessionManager};
+use muxing::{BrowserHint, HlsConfig, HlsError, HlsServeBody, HlsServeResult, HlsSessionManager};
 use persistence::{Persistence, PersistenceError};
 use probes::{ProbeConfig, ProbeJob, ProbeWorkerPool};
-use thumbnails::{ThumbnailConfig, ThumbnailJob, ThumbnailWorkerPool};
 use protocol::{
     ClientSocketMessage, CreateRoomRequest, HealthResponse, LibraryResponse, LibraryScanResponse,
     PlaybackAction, Room, RoomSocketQuery, RoomsResponse, ServerEvent,
 };
 use streaming::{
-    StreamMediaError, stream_media_response, stream_subtitle_response,
-    stream_thumbnail_response, unsatisfiable_range_response,
+    StreamMediaError, stream_media_response, stream_subtitle_response, stream_thumbnail_response,
+    unsatisfiable_range_response,
 };
+use thumbnails::{ThumbnailConfig, ThumbnailJob, ThumbnailWorkerPool};
 
 type SharedRooms = Arc<RwLock<HashMap<Uuid, SharedRoom>>>;
 type SharedRoom = Arc<RoomHub>;
@@ -305,11 +305,8 @@ pub async fn load_state_with_library_and_hls(
     // session. See `crate::scan_gate` for the rationale — probes and
     // playback compete for the same (often network-backed) library mount.
     let scan_gate = crate::scan_gate::ScanGate::new();
-    let thumbnails = ThumbnailWorkerPool::spawn(
-        thumbnail_config,
-        persistence.clone(),
-        scan_gate.clone(),
-    );
+    let thumbnails =
+        ThumbnailWorkerPool::spawn(thumbnail_config, persistence.clone(), scan_gate.clone());
 
     let probe_config = ProbeConfig {
         probe_command: library_config
@@ -400,7 +397,10 @@ pub fn build_app(state: AppState) -> Router {
             get(stream_subtitle),
         )
         .route("/api/media/{media_id}/thumbnail", get(stream_thumbnail))
-        .route("/api/media/{media_id}/hls/{filename}", get(stream_hls_asset))
+        .route(
+            "/api/media/{media_id}/hls/{filename}",
+            get(stream_hls_asset),
+        )
         .route("/api/rooms", get(list_rooms).post(create_room))
         .route("/api/rooms/{room_id}/ws", get(connect_room_socket))
         .with_state(state)
@@ -591,10 +591,7 @@ async fn stream_media(
     }
 }
 
-async fn stream_thumbnail(
-    State(state): State<AppState>,
-    Path(media_id): Path<Uuid>,
-) -> Response {
+async fn stream_thumbnail(State(state): State<AppState>, Path(media_id): Path<Uuid>) -> Response {
     let media_item = match state.library.media_item(media_id).await {
         Ok(Some(media_item)) => media_item,
         Ok(None) => return ApiError::not_found("Media not found.").into_response(),
@@ -690,16 +687,48 @@ async fn stream_hls_asset(
             warn!(%message, %media_id, "ffmpeg HLS session failed");
             return ApiError::internal("Failed to start HLS session.").into_response();
         }
+        Err(HlsError::RespawnThrottled {
+            retry_after_secs,
+            reason,
+        }) => {
+            warn!(
+                %media_id,
+                retry_after_secs,
+                reason,
+                "throttling seek-triggered HLS respawn"
+            );
+            let mut response = ApiError::with_status(
+                StatusCode::TOO_MANY_REQUESTS,
+                "Too many rapid seek requests. Please retry shortly.",
+            )
+            .into_response();
+            let retry_after_value = HeaderValue::from_str(&retry_after_secs.to_string())
+                .unwrap_or_else(|_| HeaderValue::from_static("1"));
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, retry_after_value);
+            return response;
+        }
         Err(HlsError::Io(error)) => {
             warn!(%error, %media_id, "HLS IO error");
             return ApiError::internal("Failed to serve HLS asset.").into_response();
         }
     };
 
-    match &serve_result.body {
+    let HlsServeResult {
+        body,
+        content_type,
+        _guard,
+    } = serve_result;
+
+    match body {
         HlsServeBody::File(path) => {
-            match streaming::stream_hls_file_response(path, serve_result.content_type).await {
-                Ok(response) => response,
+            match streaming::stream_hls_file_response(&path, content_type).await {
+                Ok(mut response) => {
+                    // Keep the in-flight guard alive until the response is dropped.
+                    response.extensions_mut().insert(_guard);
+                    response
+                }
                 Err(StreamMediaError::NotFound) => {
                     ApiError::not_found("HLS asset not found.").into_response()
                 }
@@ -717,12 +746,12 @@ async fn stream_hls_asset(
             // Synthesized variant playlist — return the body directly. No
             // range support needed; hls.js never issues ranged requests for
             // playlists, only for media segments.
-            let mut response = bytes.clone().into_response();
+            let mut response = bytes.into_response();
             response
                 .headers_mut()
-                .insert(header::CONTENT_TYPE, HeaderValue::from_static(
-                    serve_result.content_type,
-                ));
+                .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+            // Keep the in-flight guard alive until the response is dropped.
+            response.extensions_mut().insert(_guard);
             response
         }
     }
@@ -790,9 +819,7 @@ async fn create_room(
                     warn!(%error, %media_id, "failed to resolve media for room");
                     ApiError::internal("Failed to resolve media for room.")
                 })?
-                .ok_or_else(|| {
-                    ApiError::bad_request("Media is not in the library index.")
-                })?;
+                .ok_or_else(|| ApiError::bad_request("Media is not in the library index."))?;
 
             let derived_title = provided_media_title
                 .clone()

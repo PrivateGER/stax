@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     env,
     path::{Path, PathBuf},
     sync::{
@@ -54,6 +54,18 @@ const MIN_SEGMENT_SECONDS: f64 = 1.0;
 /// buffering five or six segments ahead of playback without respawning for
 /// each one.
 const CATCHUP_WINDOW_SECS: f64 = 60.0;
+/// Cooldown between seek-triggered respawns for a single session. Protects the
+/// encoder from rapid-fire scrub patterns that would otherwise kill/spawn ffmpeg
+/// every request.
+const RESPAWN_COOLDOWN_MS: u64 = 750;
+/// Sliding window used for per-session respawn rate limiting.
+const RESPAWN_RATE_WINDOW_SECS: u64 = 30;
+/// Hard cap on seek-triggered respawns allowed inside one window. Requests past
+/// this budget are rejected with a bounded error until the window drains.
+const RESPAWN_MAX_PER_WINDOW: usize = 6;
+/// Backoff applied after hitting the rate limit. Keeps hostile request bursts
+/// from immediately re-triggering expensive process churn.
+const RESPAWN_RATE_LIMIT_BACKOFF_SECS: u64 = 5;
 /// Filename of the frozen init segment referenced by the synthesized variant
 /// playlist. `init_0.mp4` is what ffmpeg writes; we rename it to this stable
 /// name after the first session readiness so subsequent encoder respawns (on
@@ -347,6 +359,10 @@ pub(crate) fn build_variant_playlist(plan: &SegmentPlan) -> String {
 pub enum HlsError {
     UnsupportedMode,
     SpawnFailed(String),
+    RespawnThrottled {
+        retry_after_secs: u64,
+        reason: &'static str,
+    },
     Io(std::io::Error),
     NotReady,
     NotFound,
@@ -358,6 +374,13 @@ impl std::fmt::Display for HlsError {
         match self {
             Self::UnsupportedMode => f.write_str("media is not eligible for HLS streaming"),
             Self::SpawnFailed(message) => write!(f, "ffmpeg failed: {message}"),
+            Self::RespawnThrottled {
+                retry_after_secs,
+                reason,
+            } => write!(
+                f,
+                "seek-triggered respawn is throttled ({reason}); retry in {retry_after_secs}s"
+            ),
             Self::Io(error) => write!(f, "{error}"),
             Self::NotReady => f.write_str("HLS session did not become ready in time"),
             Self::NotFound => f.write_str("HLS asset not found"),
@@ -611,6 +634,74 @@ struct EncoderState {
     highest_produced: AtomicU32,
 }
 
+#[derive(Debug, Default)]
+struct RespawnThrottleState {
+    /// Recent respawn-attempt timestamps (wall-clock ms). Old entries are
+    /// pruned against `RESPAWN_RATE_WINDOW_SECS` on every decision.
+    recent_attempts_ms: VecDeque<u64>,
+    /// Absolute wall-clock deadline while respawns are throttled. Covers both
+    /// short cooldowns and longer rate-limit backoff periods.
+    throttle_until_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RespawnThrottleReason {
+    Cooldown,
+    RateLimit,
+}
+
+impl RespawnThrottleReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Cooldown => "cooldown",
+            Self::RateLimit => "rate_limit",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RespawnThrottleDeny {
+    reason: RespawnThrottleReason,
+    retry_after_ms: u64,
+    recent_count: usize,
+}
+
+fn evaluate_respawn_throttle(
+    state: &mut RespawnThrottleState,
+    now_ms_value: u64,
+) -> Option<RespawnThrottleDeny> {
+    let window_ms = RESPAWN_RATE_WINDOW_SECS.saturating_mul(1000);
+    while let Some(front) = state.recent_attempts_ms.front().copied() {
+        if now_ms_value.saturating_sub(front) > window_ms {
+            let _ = state.recent_attempts_ms.pop_front();
+        } else {
+            break;
+        }
+    }
+
+    if now_ms_value < state.throttle_until_ms {
+        return Some(RespawnThrottleDeny {
+            reason: RespawnThrottleReason::Cooldown,
+            retry_after_ms: state.throttle_until_ms.saturating_sub(now_ms_value),
+            recent_count: state.recent_attempts_ms.len(),
+        });
+    }
+
+    if state.recent_attempts_ms.len() >= RESPAWN_MAX_PER_WINDOW {
+        state.throttle_until_ms =
+            now_ms_value.saturating_add(RESPAWN_RATE_LIMIT_BACKOFF_SECS.saturating_mul(1000));
+        return Some(RespawnThrottleDeny {
+            reason: RespawnThrottleReason::RateLimit,
+            retry_after_ms: state.throttle_until_ms.saturating_sub(now_ms_value),
+            recent_count: state.recent_attempts_ms.len(),
+        });
+    }
+
+    state.recent_attempts_ms.push_back(now_ms_value);
+    state.throttle_until_ms = now_ms_value.saturating_add(RESPAWN_COOLDOWN_MS);
+    None
+}
+
 #[derive(Debug)]
 struct HlsSession {
     media_id: Uuid,
@@ -645,6 +736,9 @@ struct HlsSession {
     /// crosses the `serve` path — keeping it `std::sync` avoids polluting
     /// that path with extra `await`s; all mutations are millisecond-scale.
     encoder: std::sync::Mutex<Option<EncoderState>>,
+    /// Per-session respawn throttle budget. Enforces a short cooldown between
+    /// respawns and a hard rate cap in a rolling window.
+    respawn_throttle: std::sync::Mutex<RespawnThrottleState>,
     /// Cached copy of the input path — the `MediaItem` isn't available on
     /// the respawn path (`serve` has a reference but the internal
     /// `respawn_at_segment` doesn't), so we stash the resolved path at
@@ -691,7 +785,7 @@ fn now_ms() -> u64 {
         .unwrap_or_default()
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct InFlightGuard {
     session: Arc<HlsSession>,
 }
@@ -903,6 +997,7 @@ impl HlsSessionManager {
             // need to respawn at the seek target.
             if session.plan.is_bounded() && self.should_respawn_for_segment(&session, segment_index)
             {
+                self.check_respawn_budget(&session, segment_index)?;
                 info!(
                     session = %session.media_id,
                     segment = segment_index,
@@ -970,6 +1065,36 @@ impl HlsSessionManager {
         let ahead_segments = segment_index.saturating_sub(frontier);
         let ahead_secs = f64::from(ahead_segments) * f64::from(HLS_TARGET_SEGMENT_SECONDS);
         ahead_secs > CATCHUP_WINDOW_SECS
+    }
+
+    fn check_respawn_budget(
+        &self,
+        session: &Arc<HlsSession>,
+        segment_index: u32,
+    ) -> Result<(), HlsError> {
+        let denied = {
+            let mut throttle = session
+                .respawn_throttle
+                .lock()
+                .expect("respawn throttle mutex poisoned");
+            evaluate_respawn_throttle(&mut throttle, now_ms())
+        };
+        if let Some(deny) = denied {
+            let retry_after_secs = ((deny.retry_after_ms.saturating_add(999)) / 1000).max(1);
+            warn!(
+                session = %session.media_id,
+                segment = segment_index,
+                reason = deny.reason.as_str(),
+                retry_after_ms = deny.retry_after_ms,
+                recent_respawns = deny.recent_count,
+                "throttling seek-triggered ffmpeg respawn"
+            );
+            return Err(HlsError::RespawnThrottled {
+                retry_after_secs,
+                reason: deny.reason.as_str(),
+            });
+        }
+        Ok(())
     }
 
     /// Wait for a specific segment file to land on disk, with a deadline
@@ -1083,6 +1208,7 @@ impl HlsSessionManager {
             spawned_at: Mutex::new(None),
             plan,
             encoder: std::sync::Mutex::new(None),
+            respawn_throttle: std::sync::Mutex::new(RespawnThrottleState::default()),
             input_path,
             browser,
             item: item.clone(),
@@ -2470,6 +2596,46 @@ mod tests {
     fn segment_plan_for_session_picks_grid_for_transcode() {
         let plan = SegmentPlan::for_session(PlaybackMode::HlsFullTranscode, 8.0, &[]);
         assert_eq!(plan.boundaries, vec![0.0, 2.0, 4.0, 6.0]);
+    }
+
+    #[test]
+    fn respawn_throttle_enforces_short_cooldown() {
+        let mut state = RespawnThrottleState::default();
+        assert!(evaluate_respawn_throttle(&mut state, 1_000).is_none());
+
+        let denied = evaluate_respawn_throttle(&mut state, 1_000 + RESPAWN_COOLDOWN_MS - 1)
+            .expect("second immediate respawn should be cooled down");
+        assert_eq!(denied.reason, RespawnThrottleReason::Cooldown);
+        assert!(denied.retry_after_ms >= 1);
+
+        assert!(evaluate_respawn_throttle(&mut state, 1_000 + RESPAWN_COOLDOWN_MS).is_none());
+    }
+
+    #[test]
+    fn respawn_throttle_rate_limits_and_recovers_after_window() {
+        let mut state = RespawnThrottleState::default();
+        let mut now = 10_000_u64;
+
+        for _ in 0..RESPAWN_MAX_PER_WINDOW {
+            assert!(
+                evaluate_respawn_throttle(&mut state, now).is_none(),
+                "respawn within budget should pass"
+            );
+            now = now.saturating_add(RESPAWN_COOLDOWN_MS);
+        }
+
+        let denied = evaluate_respawn_throttle(&mut state, now)
+            .expect("respawn beyond per-window budget should be denied");
+        assert_eq!(denied.reason, RespawnThrottleReason::RateLimit);
+        assert!(denied.retry_after_ms >= RESPAWN_RATE_LIMIT_BACKOFF_SECS * 1000);
+
+        // Once both the backoff and rolling window have drained, respawns can
+        // proceed again.
+        let recovery_at = 10_000
+            + RESPAWN_RATE_WINDOW_SECS * 1000
+            + (RESPAWN_COOLDOWN_MS * RESPAWN_MAX_PER_WINDOW as u64)
+            + 1;
+        assert!(evaluate_respawn_throttle(&mut state, recovery_at).is_none());
     }
 
     #[test]

@@ -479,11 +479,12 @@ impl Persistence {
                 )));
             }
             let playback_mode_raw = row.try_get::<String, _>("playback_mode")?;
-            let playback_mode = PlaybackMode::from_str_opt(&playback_mode_raw).ok_or_else(|| {
-                PersistenceError::InvalidData(format!(
-                    "invalid stored playback_mode '{playback_mode_raw}'"
-                ))
-            })?;
+            let playback_mode =
+                PlaybackMode::from_str_opt(&playback_mode_raw).ok_or_else(|| {
+                    PersistenceError::InvalidData(format!(
+                        "invalid stored playback_mode '{playback_mode_raw}'"
+                    ))
+                })?;
             let audio_streams_json = row.try_get::<String, _>("audio_streams_json")?;
             let subtitle_streams_json = row.try_get::<String, _>("subtitle_streams_json")?;
             let relative_path = row.try_get::<String, _>("relative_path")?;
@@ -524,10 +525,7 @@ impl Persistence {
     /// + reset thumbnail state, so the row is picked up by both the
     /// background probe pool and (after probe completes) the thumbnail
     /// pool.
-    pub async fn upsert_walk_record(
-        &self,
-        record: &WalkRecord,
-    ) -> Result<(), PersistenceError> {
+    pub async fn upsert_walk_record(&self, record: &WalkRecord) -> Result<(), PersistenceError> {
         let (
             duration_seconds,
             container_name,
@@ -738,10 +736,7 @@ impl Persistence {
                 .map(|index| format!("?{}", index + 1))
                 .collect::<Vec<_>>()
                 .join(", ");
-            let sql = format!(
-                "DELETE FROM media_items WHERE id IN ({})",
-                placeholders
-            );
+            let sql = format!("DELETE FROM media_items WHERE id IN ({})", placeholders);
             let mut query = sqlx::query(&sql);
             for id in chunk {
                 query = query.bind(id);
@@ -894,7 +889,9 @@ impl Persistence {
         const CHUNK: usize = 500;
         let media_id_str = media_id.to_string();
         for (chunk_idx, chunk) in offsets.chunks(CHUNK).enumerate() {
-            let mut query = String::from("INSERT INTO media_keyframes (media_id, kf_index, pts_seconds) VALUES ");
+            let mut query = String::from(
+                "INSERT INTO media_keyframes (media_id, kf_index, pts_seconds) VALUES ",
+            );
             for i in 0..chunk.len() {
                 if i > 0 {
                     query.push_str(", ");
