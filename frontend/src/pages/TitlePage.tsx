@@ -45,6 +45,48 @@ export function TitlePage({ item, rooms, onRoomCreated, onRefresh }: Props) {
   const [subtitleMode, setSubtitleMode] = useState<SubtitleMode>("off");
   const [subtitleSelection, setSubtitleSelection] = useState<string>("");
 
+  const audioOptions = useMemo(
+    () =>
+      (item?.audioStreams ?? []).map((stream, index) => ({
+        value: stream.index,
+        label: formatAudioStreamLabel(stream, index + 1),
+      })),
+    [item?.audioStreams],
+  );
+  const subtitleOptions = useMemo<SubtitleOption[]>(() => {
+    if (!item) return [];
+    const sidecarOptions = item.subtitleTracks.map((track, index) => ({
+      value: `sidecar:${index}`,
+      kind: "sidecar" as const,
+      index,
+      label: formatSubtitleTrackLabel(track, index + 1, true),
+    }));
+    const embeddedOptions = item.subtitleStreams.map((stream, index) => ({
+      value: `embedded:${stream.index}`,
+      kind: "embedded" as const,
+      index: stream.index,
+      label: formatSubtitleStreamLabel(stream, index + 1, true),
+    }));
+
+    return [...sidecarOptions, ...embeddedOptions];
+  }, [item?.subtitleStreams, item?.subtitleTracks]);
+
+  // Only key the reset on `item.id`: library polls return fresh array references
+  // even when content is identical, and clobbering in-flight user selections every
+  // poll tick would wipe the form the user is still filling in.
+  useEffect(() => {
+    if (!item) return;
+    const defaultAudio =
+      item.audioStreams.find((stream) => stream.default)?.index ??
+      item.audioStreams[0]?.index ??
+      null;
+    setAudioStreamIndex(defaultAudio);
+    setSubtitleMode("off");
+    setSubtitleSelection(subtitleOptions[0]?.value ?? "");
+    setStreamCopyError(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [item?.id]);
+
   if (!item) {
     return (
       <section className="title-missing">
@@ -64,42 +106,7 @@ export function TitlePage({ item, rooms, onRoomCreated, onRefresh }: Props) {
   const title = displayMediaTitle(item);
   const relatedRooms = rooms.filter((room) => room.mediaId === item.id);
   const canPlay = item.preparationState === "direct" || item.preparationState === "prepared";
-  const audioOptions = useMemo(
-    () =>
-      item.audioStreams.map((stream, index) => ({
-        value: stream.index,
-        label: formatAudioStreamLabel(stream, index + 1),
-      })),
-    [item.audioStreams],
-  );
-  const subtitleOptions = useMemo<SubtitleOption[]>(() => {
-    const sidecarOptions = item.subtitleTracks.map((track, index) => ({
-      value: `sidecar:${index}`,
-      kind: "sidecar" as const,
-      index,
-      label: formatSubtitleTrackLabel(track, index + 1, true),
-    }));
-    const embeddedOptions = item.subtitleStreams.map((stream, index) => ({
-      value: `embedded:${stream.index}`,
-      kind: "embedded" as const,
-      index: stream.index,
-      label: formatSubtitleStreamLabel(stream, index + 1, true),
-    }));
-
-    return [...sidecarOptions, ...embeddedOptions];
-  }, [item.subtitleStreams, item.subtitleTracks]);
   const subtitleSourceCount = item.subtitleTracks.length + item.subtitleStreams.length;
-
-  useEffect(() => {
-    const defaultAudio =
-      item.audioStreams.find((stream) => stream.default)?.index ??
-      item.audioStreams[0]?.index ??
-      null;
-    setAudioStreamIndex(defaultAudio);
-    setSubtitleMode("off");
-    setSubtitleSelection(subtitleOptions[0]?.value ?? "");
-    setStreamCopyError(null);
-  }, [item.id, item.audioStreams, subtitleOptions]);
 
   async function handleStartWatchTogether() {
     if (!item) return;

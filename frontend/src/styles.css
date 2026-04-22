@@ -272,6 +272,21 @@ code {
   color: var(--text-muted);
 }
 
+.input-stack select {
+  width: 100%;
+  padding: 0.6rem 0.85rem;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg-elevated);
+  color: var(--text);
+  transition: border-color 120ms ease;
+}
+
+.input-stack select:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
 /* ========== Library page ========== */
 
 .library-page {
@@ -594,13 +609,28 @@ code {
   border-top: 1px solid var(--border);
 }
 
-.title-details h2 {
+.title-details h2,
+.title-stream-copy h2 {
   font-size: 0.85rem;
   text-transform: uppercase;
   letter-spacing: 0.08em;
   color: var(--text-muted);
   font-weight: 500;
   margin-bottom: 1rem;
+}
+
+.title-stream-copy {
+  display: grid;
+  gap: 0.85rem;
+  padding: 1.25rem;
+  margin-top: 1rem;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg-elevated);
+}
+
+.title-stream-copy .title-cta {
+  margin-top: 0.25rem;
 }
 
 .detail-grid {
