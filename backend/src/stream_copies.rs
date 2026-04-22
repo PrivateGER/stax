@@ -158,12 +158,12 @@ impl StreamCopyWorkerPool {
         record: &StreamCopyRecord,
     ) -> StreamCopySummary {
         let mut summary = stream_copy_summary_for(media_id, record);
-        if record.status == StreamCopyStatus::Running {
-            if let Some(progress) = self.progress_snapshot(media_id).await {
-                summary.progress_ratio =
-                    progress_ratio_from_snapshot(duration_seconds, progress.out_time_micros);
-                summary.progress_speed = progress.speed;
-            }
+        if record.status == StreamCopyStatus::Running
+            && let Some(progress) = self.progress_snapshot(media_id).await
+        {
+            summary.progress_ratio =
+                progress_ratio_from_snapshot(duration_seconds, progress.out_time_micros);
+            summary.progress_speed = progress.speed;
         }
         summary
     }

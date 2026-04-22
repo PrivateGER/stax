@@ -290,34 +290,34 @@ async fn generate(job: &ThumbnailJob, config: &ThumbnailConfig) -> ThumbnailOutc
     }
 
     // Source 1: sidecar art (cheapest — a single file copy/scale).
-    if let Some(sidecar) = find_sidecar_art(&job.media_path) {
-        if let Some(ffmpeg) = config.ffmpeg_command.as_deref() {
-            debug!(
-                media_id = %job.media_id,
-                sidecar = %sidecar.display(),
-                "trying sidecar art source"
-            );
-            let started = Instant::now();
-            match render_from_image(ffmpeg, &sidecar, &output_path).await {
-                Ok(()) => {
-                    debug!(
-                        media_id = %job.media_id,
-                        elapsed_ms = started.elapsed().as_millis() as u64,
-                        "sidecar art rendered"
-                    );
-                    return ThumbnailOutcome::Generated {
-                        timestamp: now_timestamp(),
-                        source: ThumbnailSource::Sidecar,
-                    };
-                }
-                Err(error) => {
-                    warn!(
-                        media_id = %job.media_id,
-                        sidecar = %sidecar.display(),
-                        %error,
-                        "sidecar art conversion failed; falling through to other sources"
-                    );
-                }
+    if let Some(sidecar) = find_sidecar_art(&job.media_path)
+        && let Some(ffmpeg) = config.ffmpeg_command.as_deref()
+    {
+        debug!(
+            media_id = %job.media_id,
+            sidecar = %sidecar.display(),
+            "trying sidecar art source"
+        );
+        let started = Instant::now();
+        match render_from_image(ffmpeg, &sidecar, &output_path).await {
+            Ok(()) => {
+                debug!(
+                    media_id = %job.media_id,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "sidecar art rendered"
+                );
+                return ThumbnailOutcome::Generated {
+                    timestamp: now_timestamp(),
+                    source: ThumbnailSource::Sidecar,
+                };
+            }
+            Err(error) => {
+                warn!(
+                    media_id = %job.media_id,
+                    sidecar = %sidecar.display(),
+                    %error,
+                    "sidecar art conversion failed; falling through to other sources"
+                );
             }
         }
     }

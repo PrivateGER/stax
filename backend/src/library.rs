@@ -104,6 +104,15 @@ struct FfprobeFormat {
     duration: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct VideoPlaybackInfo<'a> {
+    pub codec: Option<&'a str>,
+    pub profile: Option<&'a str>,
+    pub pix_fmt: Option<&'a str>,
+    pub level: Option<u32>,
+    pub bit_depth: Option<u8>,
+}
+
 impl Default for LibraryConfig {
     fn default() -> Self {
         Self {
@@ -866,108 +875,6 @@ pub(crate) async fn probe_media_metadata(
     }
 }
 
-/// Run ffprobe a second time to extract the PTS offset of every keyframe
-/// in the first video stream. HLS copy-mode needs this: ffmpeg can only
-/// start a new fmp4 segment at a source keyframe (there's no way to force
-/// one without re-encoding), so the HLS session consults this list when
-/// deciding where to place segment boundaries and where to seek on a
-/// respawn.
-///
-/// Output format: `pts_time,flags` per packet, one line per row. We filter
-/// for lines whose flags column contains `K` (the keyframe flag) — ffprobe
-/// emits `K__` for keyframes, `___` for predicted frames, optionally with a
-/// `D` appended for the discardable marker.
-///
-/// Returns `Ok(vec![])` for non-video files and for files whose video stream
-/// ffprobe can't find — callers treat an empty index as "no keyframe-aware
-/// segmentation available" and fall back to a single-segment plan. Any
-/// ffprobe failure is surfaced as `Err(String)` so the probe pool can log
-/// it; the main probe outcome is already persisted independently, so a
-/// keyframe-probe failure does not poison the row.
-#[allow(dead_code)]
-pub(crate) async fn probe_video_keyframes(
-    path: &Path,
-    probe_command: Option<&Path>,
-) -> Result<Vec<f64>, String> {
-    let Some(probe_command) = probe_command else {
-        return Err("no ffprobe configured".into());
-    };
-
-    // `-select_streams v:0` binds to the first video stream — the same one
-    // the main probe reports on. `packet=pts_time,flags` is the minimum
-    // needed to decide "is this row a keyframe and when does it start";
-    // other packet fields (size, pos, duration) would blow up stdout on
-    // long films without adding signal.
-    //
-    // `-of csv=p=0` omits the section-name prefix ffprobe otherwise
-    // prepends to each row, so we parse `pts,flags` directly.
-    let output = Command::new(probe_command)
-        .arg("-v")
-        .arg("error")
-        .arg("-select_streams")
-        .arg("v:0")
-        .arg("-show_entries")
-        .arg("packet=pts_time,flags")
-        .arg("-of")
-        .arg("csv=p=0")
-        .arg(path)
-        .output()
-        .await
-        .map_err(|error| format!("ffprobe could not start: {error}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(if stderr.is_empty() {
-            format!("ffprobe exited with status {}", output.status)
-        } else {
-            format!("ffprobe failed: {stderr}")
-        });
-    }
-
-    parse_keyframe_csv(&output.stdout)
-}
-
-/// Parse ffprobe's `-of csv=p=0 -show_entries packet=pts_time,flags` stdout
-/// into a sorted list of keyframe PTS offsets (seconds). Split out for unit
-/// testing — `probe_video_keyframes` is the I/O wrapper.
-#[allow(dead_code)]
-fn parse_keyframe_csv(stdout: &[u8]) -> Result<Vec<f64>, String> {
-    let text = std::str::from_utf8(stdout)
-        .map_err(|error| format!("ffprobe returned non-UTF-8 output: {error}"))?;
-    let mut offsets: Vec<f64> = Vec::new();
-    for (line_no, raw) in text.lines().enumerate() {
-        let line = raw.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let mut fields = line.split(',');
-        let pts_field = fields.next().unwrap_or("");
-        let flags_field = fields.next().unwrap_or("");
-        if !flags_field.contains('K') {
-            continue;
-        }
-        // `pts_time` can be "N/A" for streams with no timestamps — skip
-        // them silently; the downstream plan falls back to a single
-        // segment when the list is empty anyway.
-        if pts_field == "N/A" || pts_field.is_empty() {
-            continue;
-        }
-        let pts: f64 = pts_field.parse().map_err(|error| {
-            format!("ffprobe row {line_no} has malformed pts_time {pts_field:?}: {error}")
-        })?;
-        // Guard against the occasional negative PTS in MPEG-TS containers;
-        // the HLS muxer will clamp them to zero too (-avoid_negative_ts
-        // make_zero), so we do the same here to keep plan offsets aligned.
-        offsets.push(pts.max(0.0));
-    }
-    // ffprobe emits packets in file order, which is decode order — not
-    // presentation order for B-frame containers. Sort to guarantee the
-    // strict ascending invariant that SegmentPlan relies on.
-    offsets.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    offsets.dedup();
-    Ok(offsets)
-}
-
 /// Build an error-only `ProbeOutcome`. Centralized so every fallback path
 /// produces a consistent NULL set with playback_mode=Direct as the
 /// non-null sentinel.
@@ -1020,10 +927,10 @@ fn parse_probe_output(
         })
         .collect();
 
-    if !audio_streams.iter().any(|stream| stream.default) {
-        if let Some(first) = audio_streams.first_mut() {
-            first.default = true;
-        }
+    if !audio_streams.iter().any(|stream| stream.default)
+        && let Some(first) = audio_streams.first_mut()
+    {
+        first.default = true;
     }
 
     let subtitle_streams: Vec<SubtitleStream> = parsed
@@ -1061,11 +968,13 @@ fn parse_probe_output(
     let playback_mode = classify_playback_mode(
         container_name.as_deref(),
         file_extension,
-        video_stream.and_then(|stream| stream.codec_name.as_deref()),
-        video_profile.as_deref(),
-        video_pix_fmt.as_deref(),
-        video_level,
-        video_bit_depth,
+        VideoPlaybackInfo {
+            codec: video_stream.and_then(|stream| stream.codec_name.as_deref()),
+            profile: video_profile.as_deref(),
+            pix_fmt: video_pix_fmt.as_deref(),
+            level: video_level,
+            bit_depth: video_bit_depth,
+        },
         &audio_streams,
     );
 
@@ -1115,17 +1024,13 @@ fn parse_json_u8_like(value: &serde_json::Value) -> Option<u8> {
 pub(crate) fn classify_playback_mode(
     container: Option<&str>,
     file_extension: Option<&str>,
-    video_codec: Option<&str>,
-    video_profile: Option<&str>,
-    video_pix_fmt: Option<&str>,
-    video_level: Option<u32>,
-    video_bit_depth: Option<u8>,
+    video: VideoPlaybackInfo<'_>,
     audio_streams: &[AudioStream],
 ) -> PlaybackMode {
     let container_ok = container
         .map(|value| is_browser_safe_container(value, file_extension))
         .unwrap_or(false);
-    let has_any_stream = video_codec.is_some() || !audio_streams.is_empty();
+    let has_any_stream = video.codec.is_some() || !audio_streams.is_empty();
 
     if !has_any_stream {
         return PlaybackMode::Unsupported;
@@ -1148,14 +1053,14 @@ pub(crate) fn classify_playback_mode(
             .unwrap_or(false)
     });
 
-    let video_browser_safe = match video_codec {
+    let video_browser_safe = match video.codec {
         None => true,
         Some(codec) => is_browser_safe_video_codec(
             codec,
-            video_profile,
-            video_pix_fmt,
-            video_level,
-            video_bit_depth,
+            video.profile,
+            video.pix_fmt,
+            video.level,
+            video.bit_depth,
         ),
     };
 
@@ -1227,17 +1132,14 @@ pub(crate) fn is_browser_safe_video_codec(
             let bit_depth_ok = bit_depth.map(|value| value <= 8).unwrap_or(true);
             profile_ok && pix_fmt_ok && level_ok && bit_depth_ok
         }
-        "vp9" | "av1" => {
-            let pix_fmt_ok = pix_fmt
-                .map(|value| {
-                    matches!(
-                        value.to_ascii_lowercase().as_str(),
-                        "yuv420p" | "yuvj420p" | "yuv420p10le"
-                    )
-                })
-                .unwrap_or(true);
-            pix_fmt_ok
-        }
+        "vp9" | "av1" => pix_fmt
+            .map(|value| {
+                matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "yuv420p" | "yuvj420p" | "yuv420p10le"
+                )
+            })
+            .unwrap_or(true),
         "vp8" => true,
         _ => false,
     }
@@ -1518,42 +1420,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_keyframe_csv_extracts_only_keyframe_rows_sorted_ascending() {
-        // Mixed keyframe/non-keyframe rows, out of order (ffprobe emits in
-        // decode order for B-frame streams), with a stray blank line and
-        // an N/A row that should be skipped silently.
-        let stdout = b"0.000000,K__\n\
-                       1.041667,___\n\
-                       2.083333,K__\n\
-                       \n\
-                       N/A,K__\n\
-                       1.562500,___\n\
-                       4.166667,K__D\n";
-        let offsets = parse_keyframe_csv(stdout).unwrap();
-        assert_eq!(offsets, vec![0.0, 2.083333, 4.166667]);
-    }
-
-    #[test]
-    fn parse_keyframe_csv_returns_empty_for_no_video() {
-        assert_eq!(parse_keyframe_csv(b"").unwrap(), Vec::<f64>::new());
-    }
-
-    #[test]
-    fn parse_keyframe_csv_rejects_malformed_pts() {
-        let err = parse_keyframe_csv(b"nope,K__\n").unwrap_err();
-        assert!(err.contains("malformed pts_time"), "got: {err}");
-    }
-
-    #[test]
-    fn parse_keyframe_csv_clamps_negative_pts_to_zero() {
-        // MPEG-TS can produce negative PTS before the stream start; the
-        // HLS muxer clamps to zero via -avoid_negative_ts, so the plan
-        // must match.
-        let offsets = parse_keyframe_csv(b"-0.040000,K__\n2.000000,K__\n").unwrap();
-        assert_eq!(offsets, vec![0.0, 2.0]);
-    }
-
-    #[test]
     fn parse_probe_output_returns_error_for_invalid_json() {
         let error = parse_probe_output(
             b"{ definitely-not-json",
@@ -1582,11 +1448,13 @@ mod tests {
         let mode = classify_playback_mode(
             Some("mov,mp4,m4a,3gp,3g2,mj2"),
             Some("mp4"),
-            Some("h264"),
-            Some("High"),
-            Some("yuv420p"),
-            Some(40),
-            Some(8),
+            VideoPlaybackInfo {
+                codec: Some("h264"),
+                profile: Some("High"),
+                pix_fmt: Some("yuv420p"),
+                level: Some(40),
+                bit_depth: Some(8),
+            },
             &[audio_stream("aac")],
         );
 
@@ -1598,11 +1466,13 @@ mod tests {
         let mode = classify_playback_mode(
             Some("matroska,webm"),
             Some("mkv"),
-            Some("h264"),
-            Some("High"),
-            Some("yuv420p"),
-            Some(40),
-            Some(8),
+            VideoPlaybackInfo {
+                codec: Some("h264"),
+                profile: Some("High"),
+                pix_fmt: Some("yuv420p"),
+                level: Some(40),
+                bit_depth: Some(8),
+            },
             &[audio_stream("aac")],
         );
 
@@ -1614,11 +1484,11 @@ mod tests {
         let mode = classify_playback_mode(
             Some("matroska,webm"),
             Some("webm"),
-            Some("vp9"),
-            None,
-            Some("yuv420p"),
-            None,
-            None,
+            VideoPlaybackInfo {
+                codec: Some("vp9"),
+                pix_fmt: Some("yuv420p"),
+                ..VideoPlaybackInfo::default()
+            },
             &[audio_stream("opus")],
         );
 
@@ -1630,11 +1500,13 @@ mod tests {
         let mode = classify_playback_mode(
             Some("matroska,webm"),
             Some("mkv"),
-            Some("h264"),
-            Some("High"),
-            Some("yuv420p"),
-            Some(40),
-            Some(8),
+            VideoPlaybackInfo {
+                codec: Some("h264"),
+                profile: Some("High"),
+                pix_fmt: Some("yuv420p"),
+                level: Some(40),
+                bit_depth: Some(8),
+            },
             &[audio_stream("ac3")],
         );
 
@@ -1646,11 +1518,13 @@ mod tests {
         let mode = classify_playback_mode(
             Some("matroska,webm"),
             Some("mkv"),
-            Some("h264"),
-            Some("High"),
-            Some("yuv420p"),
-            Some(40),
-            Some(8),
+            VideoPlaybackInfo {
+                codec: Some("h264"),
+                profile: Some("High"),
+                pix_fmt: Some("yuv420p"),
+                level: Some(40),
+                bit_depth: Some(8),
+            },
             &[audio_stream("dts")],
         );
 
@@ -1662,11 +1536,13 @@ mod tests {
         let mode = classify_playback_mode(
             Some("matroska,webm"),
             Some("mkv"),
-            Some("hevc"),
-            Some("Main"),
-            Some("yuv420p"),
-            Some(120),
-            Some(8),
+            VideoPlaybackInfo {
+                codec: Some("hevc"),
+                profile: Some("Main"),
+                pix_fmt: Some("yuv420p"),
+                level: Some(120),
+                bit_depth: Some(8),
+            },
             &[audio_stream("aac")],
         );
 
@@ -1678,11 +1554,13 @@ mod tests {
         let mode = classify_playback_mode(
             Some("avi"),
             Some("avi"),
-            Some("mpeg4"),
-            Some("Simple Profile"),
-            Some("yuv420p"),
-            Some(5),
-            Some(8),
+            VideoPlaybackInfo {
+                codec: Some("mpeg4"),
+                profile: Some("Simple Profile"),
+                pix_fmt: Some("yuv420p"),
+                level: Some(5),
+                bit_depth: Some(8),
+            },
             &[audio_stream("mp3")],
         );
 
@@ -1694,11 +1572,13 @@ mod tests {
         let mode = classify_playback_mode(
             Some("matroska,webm"),
             Some("mkv"),
-            Some("h264"),
-            Some("High 10"),
-            Some("yuv420p10le"),
-            Some(40),
-            Some(10),
+            VideoPlaybackInfo {
+                codec: Some("h264"),
+                profile: Some("High 10"),
+                pix_fmt: Some("yuv420p10le"),
+                level: Some(40),
+                bit_depth: Some(10),
+            },
             &[audio_stream("aac")],
         );
 
@@ -1721,11 +1601,13 @@ mod tests {
         let mode = classify_playback_mode(
             Some("matroska,webm"),
             Some("mkv"),
-            Some("h264"),
-            Some("High"),
-            Some("yuv420p"),
-            Some(40),
-            Some(8),
+            VideoPlaybackInfo {
+                codec: Some("h264"),
+                profile: Some("High"),
+                pix_fmt: Some("yuv420p"),
+                level: Some(40),
+                bit_depth: Some(8),
+            },
             &[english, japanese],
         );
 
@@ -1737,11 +1619,7 @@ mod tests {
         let mode = classify_playback_mode(
             Some("matroska,webm"),
             Some("mkv"),
-            None,
-            None,
-            None,
-            None,
-            None,
+            VideoPlaybackInfo::default(),
             &[],
         );
 
@@ -1753,11 +1631,7 @@ mod tests {
         let mode = classify_playback_mode(
             Some("mp3"),
             Some("mp3"),
-            None,
-            None,
-            None,
-            None,
-            None,
+            VideoPlaybackInfo::default(),
             &[audio_stream("mp3")],
         );
 
@@ -1893,7 +1767,10 @@ mod tests {
         assert_eq!(metadata.audio_streams[0].language.as_deref(), Some("eng"));
         assert_eq!(metadata.audio_streams[0].title.as_deref(), Some("ENG"));
         assert_eq!(metadata.subtitle_streams.len(), 1);
-        assert_eq!(metadata.subtitle_streams[0].language.as_deref(), Some("eng"));
+        assert_eq!(
+            metadata.subtitle_streams[0].language.as_deref(),
+            Some("eng")
+        );
         assert_eq!(metadata.subtitle_streams[0].title.as_deref(), Some("Signs"));
     }
 

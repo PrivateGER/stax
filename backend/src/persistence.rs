@@ -756,8 +756,8 @@ impl Persistence {
     /// stored probe fields verbatim — ffprobe never runs again. Otherwise
     /// callers pass `cached_probe = None` and we write NULL probe columns
     /// + reset thumbnail state, so the row is picked up by both the
-    /// background probe pool and (after probe completes) the thumbnail
-    /// pool.
+    ///   background probe pool and (after probe completes) the thumbnail
+    ///   pool.
     pub async fn upsert_walk_record(&self, record: &WalkRecord) -> Result<(), PersistenceError> {
         let (
             duration_seconds,
@@ -1091,83 +1091,6 @@ impl Persistence {
                     extension: row.try_get("extension")?,
                 })
             })
-            .collect()
-    }
-
-    /// Persist the keyframe index for a media item. Replaces the previous
-    /// set atomically: on a re-probe (file changed, or a manual refresh)
-    /// we want the new list to be the sole source of truth, not merged
-    /// with stale offsets from the prior run.
-    ///
-    /// Stamps `keyframes_probed_at` on the parent row using the timestamp
-    /// the caller passes in — reuses the main probe's `probed_at` so the
-    /// two timestamps line up (they come from the same scan attempt).
-    pub async fn update_keyframes(
-        &self,
-        media_id: Uuid,
-        offsets: &[f64],
-        probed_at: &str,
-    ) -> Result<(), PersistenceError> {
-        let mut tx = self.pool.begin().await?;
-
-        sqlx::query("DELETE FROM media_keyframes WHERE media_id = ?1")
-            .bind(media_id.to_string())
-            .execute(&mut *tx)
-            .await?;
-
-        // Batched inserts keep the transaction small even for films with
-        // thousands of keyframes. We cap each INSERT at ~500 rows to stay
-        // well under SQLite's default 999-parameter limit (2 params per
-        // row = ~500 rows).
-        const CHUNK: usize = 500;
-        let media_id_str = media_id.to_string();
-        for (chunk_idx, chunk) in offsets.chunks(CHUNK).enumerate() {
-            let mut query = String::from(
-                "INSERT INTO media_keyframes (media_id, kf_index, pts_seconds) VALUES ",
-            );
-            for i in 0..chunk.len() {
-                if i > 0 {
-                    query.push_str(", ");
-                }
-                query.push_str("(?, ?, ?)");
-            }
-            let mut q = sqlx::query(&query);
-            for (i, offset) in chunk.iter().enumerate() {
-                let global_index = (chunk_idx * CHUNK + i) as i64;
-                q = q.bind(&media_id_str).bind(global_index).bind(*offset);
-            }
-            q.execute(&mut *tx).await?;
-        }
-
-        sqlx::query("UPDATE media_items SET keyframes_probed_at = ?1 WHERE id = ?2")
-            .bind(probed_at)
-            .bind(&media_id_str)
-            .execute(&mut *tx)
-            .await?;
-
-        tx.commit().await?;
-        Ok(())
-    }
-
-    /// Load the keyframe PTS offsets for a media item, ordered ascending.
-    /// Returns an empty vec when no keyframes have been indexed yet (a
-    /// caller reads that as "fall back to linear-only playback"), or when
-    /// the media genuinely has no keyframes (audio-only).
-    pub async fn load_keyframes(&self, media_id: Uuid) -> Result<Vec<f64>, PersistenceError> {
-        let rows = sqlx::query(
-            r#"
-            SELECT pts_seconds
-            FROM media_keyframes
-            WHERE media_id = ?1
-            ORDER BY kf_index ASC
-            "#,
-        )
-        .bind(media_id.to_string())
-        .fetch_all(&self.pool)
-        .await?;
-
-        rows.into_iter()
-            .map(|row| row.try_get::<f64, _>("pts_seconds").map_err(Into::into))
             .collect()
     }
 

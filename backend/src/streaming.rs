@@ -71,11 +71,7 @@ pub(crate) async fn stream_file_response(
     let mut file = File::open(path).await.map_err(map_file_error)?;
     let (status, start, end) = match range {
         Some(range) => (StatusCode::PARTIAL_CONTENT, range.start, range.end),
-        None => (
-            StatusCode::OK,
-            0,
-            file_len.checked_sub(1).unwrap_or_default(),
-        ),
+        None => (StatusCode::OK, 0, file_len.saturating_sub(1)),
     };
     let content_len = if file_len == 0 { 0 } else { end - start + 1 };
 

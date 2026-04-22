@@ -843,16 +843,15 @@ fn validate_stream_copy_request(
     media_item: &protocol::MediaItem,
     request: &CreateStreamCopyRequest,
 ) -> Result<(), ApiError> {
-    if let Some(audio_stream_index) = request.audio_stream_index {
-        if !media_item
+    if let Some(audio_stream_index) = request.audio_stream_index
+        && !media_item
             .audio_streams
             .iter()
             .any(|stream| stream.index == audio_stream_index)
-        {
-            return Err(ApiError::bad_request(
-                "Selected audio stream does not exist for this media.",
-            ));
-        }
+    {
+        return Err(ApiError::bad_request(
+            "Selected audio stream does not exist for this media.",
+        ));
     }
 
     match request.subtitle_mode {

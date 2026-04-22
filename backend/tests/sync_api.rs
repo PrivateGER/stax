@@ -146,10 +146,10 @@ impl TestServer {
         let deadline = std::time::Instant::now() + timeout_duration;
         loop {
             let library = self.library().await;
-            if let Some(item) = library.items.into_iter().next() {
-                if predicate(&item) {
-                    return item;
-                }
+            if let Some(item) = library.items.into_iter().next()
+                && predicate(&item)
+            {
+                return item;
             }
 
             if std::time::Instant::now() >= deadline {
@@ -282,7 +282,7 @@ impl TestServer {
                 .into_iter()
                 .find(|item| item.id.to_string() == media_id)
             {
-                let state = serde_json::to_value(&item.preparation_state)
+                let state = serde_json::to_value(item.preparation_state)
                     .unwrap()
                     .as_str()
                     .unwrap()
@@ -617,7 +617,6 @@ async fn library_scan_keeps_healthy_roots_when_another_root_fails() {
     fs::create_dir_all(&healthy_root).unwrap();
     fs::write(healthy_root.join("movie.mp4"), b"movie").unwrap();
     let healthy_root = fs::canonicalize(&healthy_root).unwrap();
-    let missing_root = missing_root;
     let server =
         TestServer::spawn_with_library_roots(vec![healthy_root.clone(), missing_root.clone()])
             .await;
@@ -878,7 +877,7 @@ async fn concurrent_room_creation_returns_unique_rooms_and_preserves_all_entries
         .map(|index| format!("Concurrent Room {index}"))
         .collect::<Vec<_>>();
 
-    let created_rooms = join_all(room_names.iter().cloned().map(|room_name| {
+    let created_rooms = join_all(room_names.iter().map(|room_name| {
         let client = server.client.clone();
         let url = format!("{}/api/rooms", server.base_url);
 
