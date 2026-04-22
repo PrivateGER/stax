@@ -14,7 +14,6 @@ type Options = {
 export type UseStreamCopyProgress = {
   summary: StreamCopySummary | null;
   seedFromCreate: (summary: StreamCopySummary) => void;
-  reset: () => void;
 };
 
 function isActive(summary: StreamCopySummary | null): boolean {
@@ -83,9 +82,5 @@ export function useStreamCopyProgress({
     setLiveSummary(seed);
   }, []);
 
-  const reset = useCallback(() => {
-    setLiveSummary(null);
-  }, []);
-
-  return { summary, seedFromCreate, reset };
+  return { summary, seedFromCreate };
 }

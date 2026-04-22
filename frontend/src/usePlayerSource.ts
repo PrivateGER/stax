@@ -3,15 +3,11 @@ import { useEffect, useState, type RefObject } from "react";
 import { streamUrl } from "./api";
 import type { MediaItem } from "./types";
 
-type FatalError = {
-  message: string;
-};
-
 export function usePlayerSource(
   videoRef: RefObject<HTMLVideoElement | null>,
   item: MediaItem | null,
-): { fatalError: FatalError | null } {
-  const [fatalError, setFatalError] = useState<FatalError | null>(null);
+): { fatalError: string | null } {
+  const [fatalError, setFatalError] = useState<string | null>(null);
 
   const itemId = item?.id ?? null;
   const preparationState = item?.preparationState ?? null;
@@ -22,31 +18,22 @@ export function usePlayerSource(
     const video = videoRef.current;
     if (!video || !itemId || !preparationState) return;
 
-    if (preparationState === "unsupported") {
-      setFatalError({
-        message: "This media is not supported for browser playback.",
-      });
-      return;
-    }
-    if (preparationState === "needsPreparation") {
-      setFatalError({
-        message: "This media needs a stream copy before it can be played.",
-      });
-      return;
-    }
-    if (preparationState === "preparing") {
-      setFatalError({
-        message: "A stream copy is still being prepared for this media.",
-      });
-      return;
-    }
-    if (preparationState === "failed") {
-      setFatalError({
-        message:
+    switch (preparationState) {
+      case "unsupported":
+        setFatalError("This media is not supported for browser playback.");
+        return;
+      case "needsPreparation":
+        setFatalError("This media needs a stream copy before it can be played.");
+        return;
+      case "preparing":
+        setFatalError("A stream copy is still being prepared for this media.");
+        return;
+      case "failed":
+        setFatalError(
           streamCopyError ??
-          "The last stream copy attempt failed. Create a new stream copy to try again.",
-      });
-      return;
+            "The last stream copy attempt failed. Create a new stream copy to try again.",
+        );
+        return;
     }
 
     video.src = streamUrl(itemId);
@@ -56,7 +43,7 @@ export function usePlayerSource(
       try {
         video.load();
       } catch {
-        // ignore
+        // Ignored — some browsers throw when load() runs after src is cleared.
       }
     };
   }, [videoRef, itemId, preparationState, streamCopyError]);

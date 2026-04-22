@@ -100,18 +100,6 @@ code {
   color: var(--text-muted);
 }
 
-.sr-only {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  padding: 0;
-  margin: -1px;
-  overflow: hidden;
-  clip: rect(0, 0, 0, 0);
-  white-space: nowrap;
-  border: 0;
-}
-
 /* ========== App shell / nav ========== */
 
 .app {
@@ -312,39 +300,6 @@ code {
 
 .library-header-controls .search-input {
   width: 300px;
-}
-
-.chip-row {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.5rem;
-  margin-bottom: 1.5rem;
-}
-
-.chip {
-  padding: 0.4rem 0.9rem;
-  border-radius: 999px;
-  border: 1px solid var(--border);
-  background: var(--bg-elevated);
-  color: var(--text-muted);
-  font-size: 0.85rem;
-  transition: all 120ms ease;
-}
-
-.chip:hover {
-  color: var(--text);
-  border-color: var(--border-strong);
-}
-
-.chip.active {
-  color: var(--accent-contrast);
-  background: var(--accent);
-  border-color: var(--accent);
-}
-
-.chip-error {
-  border-color: rgba(255, 107, 107, 0.3);
-  color: var(--danger);
 }
 
 .breadcrumb {

@@ -105,7 +105,7 @@ export function PlayerPage({
 
   useEffect(() => {
     if (sourceError) {
-      setPlayerError(sourceError.message);
+      setPlayerError(sourceError);
     }
   }, [sourceError]);
 
