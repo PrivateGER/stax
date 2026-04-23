@@ -19,7 +19,7 @@ use uuid::Uuid;
 use crate::{
     clock::format_timestamp,
     ffmpeg::{FfmpegHardwareAcceleration, apply_input_acceleration},
-    library::{LibraryService, is_browser_safe_video_codec},
+    library::{LibraryService, is_browser_safe_audio_codec_for_mp4, is_browser_safe_video_codec},
     persistence::{PendingStreamCopy, Persistence, StreamCopyRecord, stream_copy_summary_for},
     protocol::{
         MediaItem, StreamCopyStatus, StreamCopySummary, SubtitleMode, SubtitleSourceKind,
@@ -319,7 +319,7 @@ async fn build_stream_copy(
     cleanup_path(&temp_output_path).await;
     cleanup_path(&temp_subtitle_path).await;
 
-    let selected_audio_index = selected_audio_stream_index(media_item, copy)?;
+    let default_audio_ordinal = default_audio_stream_ordinal(media_item, copy)?;
     let burned_filter = if copy.subtitle_mode == SubtitleMode::Burned {
         Some(build_burn_subtitle_filter(media_item, copy, &media_path)?)
     } else {
@@ -331,7 +331,7 @@ async fn build_stream_copy(
         media_item,
         &media_path,
         &temp_output_path,
-        selected_audio_index,
+        default_audio_ordinal,
         burned_filter.as_deref(),
         hw_accel,
         progress,
@@ -448,7 +448,7 @@ async fn run_ffmpeg_stream_copy(
     media_item: &MediaItem,
     media_path: &Path,
     output_path: &Path,
-    selected_audio_index: Option<u32>,
+    default_audio_ordinal: Option<usize>,
     burned_filter: Option<&str>,
     hw_accel: &FfmpegHardwareAcceleration,
     progress: &SharedStreamCopyProgress,
@@ -492,12 +492,43 @@ async fn run_ffmpeg_stream_copy(
         command.arg("-vn");
     }
 
-    if let Some(audio_index) = selected_audio_index {
-        command.arg("-map").arg(format!("0:{audio_index}"));
-        command.arg("-c:a").arg("aac");
-        command.arg("-b:a").arg("192k");
-    } else {
+    if media_item.audio_streams.is_empty() {
         command.arg("-an");
+    } else {
+        // Place the default track first so MediaBunny's getPrimaryAudioTrack
+        // lands on the user's selection, then append the rest in source order.
+        let mut output_order: Vec<usize> =
+            Vec::with_capacity(media_item.audio_streams.len());
+        if let Some(ordinal) = default_audio_ordinal {
+            output_order.push(ordinal);
+        }
+        for ordinal in 0..media_item.audio_streams.len() {
+            if Some(ordinal) != default_audio_ordinal {
+                output_order.push(ordinal);
+            }
+        }
+
+        for (output_audio_index, source_ordinal) in output_order.into_iter().enumerate() {
+            let stream = &media_item.audio_streams[source_ordinal];
+            command.arg("-map").arg(format!("0:{}", stream.index));
+            let can_copy = stream
+                .codec
+                .as_deref()
+                .map(is_browser_safe_audio_codec_for_mp4)
+                .unwrap_or(false);
+            if can_copy {
+                command
+                    .arg(format!("-c:a:{output_audio_index}"))
+                    .arg("copy");
+            } else {
+                command
+                    .arg(format!("-c:a:{output_audio_index}"))
+                    .arg("aac");
+                command
+                    .arg(format!("-b:a:{output_audio_index}"))
+                    .arg("192k");
+            }
+        }
     }
 
     if has_video {
@@ -667,31 +698,32 @@ fn progress_ratio_from_snapshot(
     Some((out_time_seconds / duration_seconds).clamp(0.0, 1.0) as f32)
 }
 
-fn selected_audio_stream_index(
+/// Returns the position within `media_item.audio_streams` of the track that
+/// should be surfaced as the default in the prepared file. All tracks are
+/// preserved; this ordinal just decides which one lands at output audio:0.
+fn default_audio_stream_ordinal(
     media_item: &MediaItem,
     copy: &StreamCopyRecord,
-) -> Result<Option<u32>, String> {
+) -> Result<Option<usize>, String> {
     if media_item.audio_streams.is_empty() {
         return Ok(None);
     }
 
-    let selected = match copy.audio_stream_index {
+    match copy.audio_stream_index {
         Some(index) => media_item
             .audio_streams
             .iter()
-            .find(|stream| stream.index == index)
-            .map(|stream| stream.index),
-        None => media_item
-            .audio_streams
-            .iter()
-            .find(|stream| stream.default)
-            .or_else(|| media_item.audio_streams.first())
-            .map(|stream| stream.index),
-    };
-
-    selected
-        .map(Some)
-        .ok_or_else(|| "Selected audio stream does not exist.".to_string())
+            .position(|stream| stream.index == index)
+            .map(Some)
+            .ok_or_else(|| "Selected audio stream does not exist.".to_string()),
+        None => Ok(Some(
+            media_item
+                .audio_streams
+                .iter()
+                .position(|stream| stream.default)
+                .unwrap_or(0),
+        )),
+    }
 }
 
 fn build_burn_subtitle_filter(

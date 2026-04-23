@@ -1233,6 +1233,16 @@ pub(crate) fn is_transcodable_audio_codec(codec: &str) -> bool {
     )
 }
 
+/// Codecs the browser can decode *and* ffmpeg can mux into MP4 — safe to
+/// `-c:a copy` in a stream copy. Vorbis and PCM variants are browser-decodable
+/// but not standard MP4 audio, so they still need AAC transcode.
+pub(crate) fn is_browser_safe_audio_codec_for_mp4(codec: &str) -> bool {
+    matches!(
+        codec.to_ascii_lowercase().as_str(),
+        "aac" | "mp3" | "opus" | "flac"
+    )
+}
+
 fn default_probe_command() -> Option<PathBuf> {
     Some(PathBuf::from("ffprobe"))
 }
