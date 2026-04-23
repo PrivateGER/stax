@@ -20,9 +20,6 @@ use uuid::Uuid;
 
 use crate::{
     clock::{format_timestamp, round_to},
-    env_config::{
-        default_path as default_data_path, var as configured_var, var_os as configured_var_os,
-    },
     ffmpeg::FfmpegHardwareAcceleration,
     persistence::{
         CachedMediaRecord, CachedProbeFields, LibrarySnapshot, LibraryStatusSnapshot, Persistence,
@@ -135,7 +132,7 @@ impl Default for LibraryConfig {
 
 impl LibraryConfig {
     pub fn from_env() -> Self {
-        let mut config = match configured_var_os("STAX_LIBRARY_ROOTS", "SYNCPLAY_LIBRARY_ROOTS") {
+        let mut config = match env::var_os("STAX_LIBRARY_ROOTS") {
             Some(raw_paths) => Self::from_paths(env::split_paths(&raw_paths)),
             None => Self::default(),
         };
@@ -1251,7 +1248,7 @@ fn default_probe_command() -> Option<PathBuf> {
 }
 
 fn probe_command_from_env() -> Option<PathBuf> {
-    match configured_var_os("STAX_FFPROBE_BIN", "SYNCPLAY_FFPROBE_BIN") {
+    match env::var_os("STAX_FFPROBE_BIN") {
         Some(value) if value.is_empty() => None,
         Some(value) => Some(PathBuf::from(value)),
         None => default_probe_command(),
@@ -1259,11 +1256,11 @@ fn probe_command_from_env() -> Option<PathBuf> {
 }
 
 fn default_stream_copy_cache_dir() -> PathBuf {
-    default_data_path("stax-stream-copies", "syncplay-stream-copies")
+    PathBuf::from("stax-stream-copies")
 }
 
 fn stream_copy_cache_dir_from_env() -> Option<PathBuf> {
-    match configured_var_os("STAX_STREAM_COPY_DIR", "SYNCPLAY_STREAM_COPY_DIR") {
+    match env::var_os("STAX_STREAM_COPY_DIR") {
         Some(value) if value.is_empty() => None,
         Some(value) => Some(PathBuf::from(value)),
         None => Some(default_stream_copy_cache_dir()),
@@ -1271,7 +1268,7 @@ fn stream_copy_cache_dir_from_env() -> Option<PathBuf> {
 }
 
 fn probe_workers_from_env() -> usize {
-    configured_var("STAX_PROBE_WORKERS", "SYNCPLAY_PROBE_WORKERS")
+    env::var("STAX_PROBE_WORKERS")
         .ok()
         .and_then(|raw| raw.parse::<usize>().ok())
         .filter(|value| *value > 0)
@@ -1279,7 +1276,7 @@ fn probe_workers_from_env() -> usize {
 }
 
 fn walk_workers_from_env() -> usize {
-    configured_var("STAX_WALK_WORKERS", "SYNCPLAY_WALK_WORKERS")
+    env::var("STAX_WALK_WORKERS")
         .ok()
         .and_then(|raw| raw.parse::<usize>().ok())
         .filter(|value| *value > 0)

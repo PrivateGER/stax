@@ -65,7 +65,7 @@ export function AdminPage({ health, roots, items, rooms, scanning, onRescan }: P
 
         {roots.length === 0 ? (
           <p className="muted">
-            No roots configured. Set <code>SYNCPLAY_LIBRARY_ROOTS</code>.
+            No roots configured. Set <code>STAX_LIBRARY_ROOTS</code>.
           </p>
         ) : (
           <table className="admin-table">

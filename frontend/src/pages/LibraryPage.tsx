@@ -90,7 +90,7 @@ export function LibraryPage({
       <section className="library-empty">
         <h1>Add a library root to get started</h1>
         <p className="muted">
-          Set <code>SYNCPLAY_LIBRARY_ROOTS</code> to one or more directories and rescan.
+          Set <code>STAX_LIBRARY_ROOTS</code> to one or more directories and rescan.
           The app is built around your media — it won't look right without it.
         </p>
         <button className="primary-button" disabled={scanning} onClick={onRescan} type="button">

@@ -1,9 +1,4 @@
-use std::{
-    collections::HashMap,
-    error::Error,
-    fmt,
-    path::{Path, PathBuf},
-};
+use std::{collections::HashMap, env, error::Error, fmt, path::Path};
 
 use sqlx::{
     Pool, Row, Sqlite,
@@ -15,7 +10,6 @@ use uuid::Uuid;
 use crate::{
     RoomRecord,
     clock::{AuthoritativePlaybackClock, PlaybackClockCheckpoint, format_timestamp},
-    env_config::{default_path as default_data_path, var as configured_var},
     protocol::{
         AudioStream, LibraryRoot, MediaItem, PlaybackMode, PlaybackStatus, PreparationState,
         StreamCopyStatus, StreamCopySubtitleSelection, StreamCopySummary, SubtitleMode,
@@ -200,9 +194,7 @@ pub enum PersistenceError {
 
 impl Persistence {
     pub async fn open_from_env() -> Result<Self, PersistenceError> {
-        let database_path = configured_var("STAX_DATABASE_PATH", "SYNCPLAY_DATABASE_PATH")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| default_data_path("stax.db", "syncplay.db"));
+        let database_path = env::var("STAX_DATABASE_PATH").unwrap_or_else(|_| "stax.db".into());
 
         Self::open_at(database_path).await
     }

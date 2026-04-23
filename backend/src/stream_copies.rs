@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    env,
     path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
@@ -17,7 +18,6 @@ use uuid::Uuid;
 
 use crate::{
     clock::format_timestamp,
-    env_config::{default_path as default_data_path, var as configured_var},
     ffmpeg::{FfmpegHardwareAcceleration, apply_input_acceleration},
     library::{LibraryService, is_browser_safe_audio_codec_for_mp4, is_browser_safe_video_codec},
     persistence::{PendingStreamCopy, Persistence, StreamCopyRecord, stream_copy_summary_for},
@@ -29,7 +29,6 @@ use crate::{
 };
 
 const DEFAULT_STREAM_COPY_CACHE_DIR: &str = "stax-stream-copies";
-const LEGACY_STREAM_COPY_CACHE_DIR: &str = "syncplay-stream-copies";
 const DEFAULT_WORKERS: usize = 1;
 
 type SharedStreamCopyProgress = Arc<RwLock<HashMap<Uuid, StreamCopyProgressSnapshot>>>;
@@ -67,11 +66,10 @@ impl Default for StreamCopyConfig {
 
 impl StreamCopyConfig {
     pub fn with_env_overrides(mut self) -> Self {
-        if let Some(value) =
-            configured_var("STAX_STREAM_COPY_WORKERS", "SYNCPLAY_STREAM_COPY_WORKERS")
-                .ok()
-                .and_then(|raw| raw.parse::<usize>().ok())
-                .filter(|value| *value > 0)
+        if let Some(value) = env::var("STAX_STREAM_COPY_WORKERS")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .filter(|value| *value > 0)
         {
             self.max_concurrent = value;
         }
@@ -824,7 +822,7 @@ async fn cleanup_path(path: &Path) {
 }
 
 pub fn default_stream_copy_cache_dir() -> PathBuf {
-    default_data_path(DEFAULT_STREAM_COPY_CACHE_DIR, LEGACY_STREAM_COPY_CACHE_DIR)
+    PathBuf::from(DEFAULT_STREAM_COPY_CACHE_DIR)
 }
 
 pub fn stream_copy_output_dir(cache_dir: &Path, media_id: Uuid) -> PathBuf {

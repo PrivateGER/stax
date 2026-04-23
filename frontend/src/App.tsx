@@ -15,7 +15,7 @@ import type {
   Room,
 } from "./types";
 
-const CLIENT_NAME_KEY = "syncplay.clientName";
+const CLIENT_NAME_KEY = "stax.clientName";
 
 export default function App() {
   const route = useRoute();
@@ -204,7 +204,7 @@ export default function App() {
             navigate({ name: "library", folder: null });
           }}
         >
-          Syncplay
+          Stax
         </a>
 
         <div className="top-nav-links">

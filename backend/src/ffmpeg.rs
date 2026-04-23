@@ -1,9 +1,7 @@
-use std::path::PathBuf;
+use std::{env, path::PathBuf};
 
 use tokio::process::Command;
 use tracing::warn;
-
-use crate::env_config::{var as configured_var, var_os as configured_var_os};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum FfmpegHardwareAcceleration {
@@ -20,7 +18,7 @@ pub enum FfmpegHardwareAcceleration {
 
 impl FfmpegHardwareAcceleration {
     pub fn from_env() -> Self {
-        let Some(raw) = configured_var("STAX_HW_ACCEL", "SYNCPLAY_HW_ACCEL").ok() else {
+        let Some(raw) = env::var("STAX_HW_ACCEL").ok() else {
             return Self::None;
         };
 
@@ -118,7 +116,7 @@ pub fn apply_input_acceleration_with_hw_frames(
 }
 
 fn vaapi_device_from_env() -> PathBuf {
-    configured_var_os("STAX_VAAPI_DEVICE", "SYNCPLAY_VAAPI_DEVICE")
+    env::var_os("STAX_VAAPI_DEVICE")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/dev/dri/renderD128"))

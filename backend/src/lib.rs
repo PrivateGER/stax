@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    env,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -34,7 +35,6 @@ use tracing::warn;
 use uuid::Uuid;
 
 pub mod clock;
-pub mod env_config;
 pub mod ffmpeg;
 pub mod library;
 pub mod persistence;
@@ -633,7 +633,7 @@ fn add_frontend_fallback(app: Router) -> Router {
 }
 
 fn build_cors() -> CorsLayer {
-    match env_config::var("STAX_FRONTEND_ORIGIN", "SYNCPLAY_FRONTEND_ORIGIN") {
+    match env::var("STAX_FRONTEND_ORIGIN") {
         Ok(origin) => {
             let origin =
                 HeaderValue::from_str(&origin).expect("STAX_FRONTEND_ORIGIN must be valid");
