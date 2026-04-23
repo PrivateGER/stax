@@ -53,8 +53,16 @@ impl FfmpegHardwareAcceleration {
 
     pub fn h264_filter(&self, base_filter: Option<&str>) -> Option<String> {
         match self {
-            Self::Nvenc => base_filter
-                .map(|filter| format!("hwdownload,format=nv12,{filter},format=nv12,hwupload_cuda")),
+            // h264_nvenc on consumer Nvidia GPUs (Pascal through Ada) only accepts
+            // 8-bit 4:2:0. Without forcing nv12 here, ffmpeg's auto-negotiation picks
+            // p010le for 10-bit sources and NVENC init fails with "Provided device
+            // doesn't support required NVENC features".
+            Self::Nvenc => Some(match base_filter {
+                Some(filter) => {
+                    format!("hwdownload,format=nv12,{filter},format=nv12,hwupload_cuda")
+                }
+                None => "format=nv12".to_string(),
+            }),
             Self::Vaapi { .. } => Some(match base_filter {
                 Some(filter) => format!("{filter},format=nv12,hwupload"),
                 None => "format=nv12,hwupload".to_string(),
@@ -162,6 +170,6 @@ mod tests {
                     .to_string()
             )
         );
-        assert_eq!(accel.h264_filter(None), None);
+        assert_eq!(accel.h264_filter(None), Some("format=nv12".to_string()));
     }
 }
