@@ -214,6 +214,7 @@ export default function App() {
           <PlayerPage
             clientName={clientName}
             item={findItem(route.mediaId)}
+            items={items}
             onClientNameChange={setClientName}
             onRefresh={() => void refresh()}
             onRoomCreated={handleRoomCreated}

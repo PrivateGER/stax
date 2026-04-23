@@ -166,6 +166,12 @@ export type PlaybackUpdatedEvent = {
   action: PlaybackAction;
 };
 
+export type MediaChangedEvent = {
+  type: "mediaChanged";
+  room: Room;
+  actor: string;
+};
+
 export type PresenceChangedEvent = {
   type: "presenceChanged";
   roomId: string;
@@ -193,6 +199,7 @@ export type PongEvent = { type: "pong"; clientSentAtMs: number };
 export type SocketEvent =
   | SnapshotEvent
   | PlaybackUpdatedEvent
+  | MediaChangedEvent
   | PresenceChangedEvent
   | DriftCorrectionEvent
   | SocketErrorEvent

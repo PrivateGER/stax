@@ -12,6 +12,7 @@ export type RoomSocketCommand =
   | { type: "play"; positionSeconds?: number; clientOneWayMs?: number }
   | { type: "pause"; positionSeconds?: number; clientOneWayMs?: number }
   | { type: "seek"; positionSeconds: number; clientOneWayMs?: number }
+  | { type: "selectMedia"; mediaId: string }
   | { type: "reportPosition"; positionSeconds: number };
 
 type OutgoingMessage =
@@ -141,6 +142,17 @@ export function useRoomSocket(roomId: string | null, clientName: string): RoomSo
             room: message.room,
             authoritativeReceiptAtMs: receipt,
             activity: `${message.actor} · ${message.action}`,
+          }));
+          return;
+        }
+
+        if (message.type === "mediaChanged") {
+          setState((current) => ({
+            ...current,
+            room: message.room,
+            authoritativeReceiptAtMs: receipt,
+            lastCorrection: null,
+            activity: `${message.actor} · changed video`,
           }));
           return;
         }

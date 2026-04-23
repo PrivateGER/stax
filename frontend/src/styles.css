@@ -1303,3 +1303,47 @@ code {
     display: none;
   }
 }
+
+/* ========== Media picker overlay ========== */
+
+.media-picker-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  background: rgba(0, 0, 0, 0.7);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 2.5rem 1.5rem;
+  overflow-y: auto;
+}
+
+.media-picker-panel {
+  width: min(1080px, 100%);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-strong);
+  border-radius: 14px;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.6);
+  padding: 1.4rem 1.4rem 1.8rem;
+  display: grid;
+  gap: 1rem;
+}
+
+.media-picker-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.media-picker-header h2 {
+  margin: 0.1rem 0 0;
+  font-size: 1.2rem;
+  font-weight: 600;
+}
+
+.media-picker-grid .poster-card-current {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  cursor: default;
+}

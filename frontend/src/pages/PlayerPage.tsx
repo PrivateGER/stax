@@ -5,6 +5,7 @@ import { displayMediaTitle } from "../format";
 import { PlayerSurface } from "../player/mediabunny/PlayerSurface";
 import { useMediabunnyController } from "../player/mediabunny/useMediabunnyController";
 import { useMediabunnyRoomSync } from "../player/mediabunny/useMediabunnyRoomSync";
+import { MediaPickerOverlay } from "../player/MediaPickerOverlay";
 import { SessionMenu } from "../player/SessionMenu";
 import { TracksMenu } from "../player/TracksMenu";
 import { deriveSubtitleSources } from "../player/subtitleSources";
@@ -18,6 +19,7 @@ import { useWatchTogether } from "../useWatchTogether";
 
 type Props = {
   item: MediaItem | null;
+  items: MediaItem[];
   roomId: string | null;
   clientName: string;
   onClientNameChange: (name: string) => void;
@@ -27,12 +29,14 @@ type Props = {
 
 export function PlayerPage({
   item,
+  items,
   roomId,
   clientName,
   onClientNameChange,
   onRefresh,
   onRoomCreated,
 }: Props) {
+  const [showPicker, setShowPicker] = useState(false);
   const [playerError, setPlayerError] = useState<string | null>(null);
   const [creatingStreamCopy, setCreatingStreamCopy] = useState(false);
   const [streamCopyError, setStreamCopyError] = useState<string | null>(null);
@@ -174,12 +178,22 @@ export function PlayerPage({
           />
 
           {roomId ? (
-            <SessionMenu
-              clientName={clientName}
-              onClientNameChange={onClientNameChange}
-              onLeave={() => navigate({ name: "watch", mediaId: item.id, roomId: null })}
-              socket={socket}
-            />
+            <>
+              <button
+                className="ghost-button"
+                disabled={socket.connectionState !== "live"}
+                onClick={() => setShowPicker(true)}
+                type="button"
+              >
+                Change video
+              </button>
+              <SessionMenu
+                clientName={clientName}
+                onClientNameChange={onClientNameChange}
+                onLeave={() => navigate({ name: "watch", mediaId: item.id, roomId: null })}
+                socket={socket}
+              />
+            </>
           ) : (
             <button
               className="primary-button"
@@ -213,6 +227,18 @@ export function PlayerPage({
           subtitleCues={activeCues}
         />
       </div>
+
+      {showPicker && roomId ? (
+        <MediaPickerOverlay
+          currentMediaId={item.id}
+          items={items}
+          onClose={() => setShowPicker(false)}
+          onSelect={(mediaId) => {
+            socket.send({ type: "selectMedia", mediaId });
+            setShowPicker(false);
+          }}
+        />
+      ) : null}
     </div>
   );
 }
