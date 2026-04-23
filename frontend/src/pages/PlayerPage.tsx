@@ -24,6 +24,7 @@ type Props = {
   roomId: string | null;
   clientName: string;
   onClientNameChange: (name: string) => void;
+  onLeaveSession: () => void;
   onRefresh: () => void;
   onRoomCreated: (room: Room) => void;
 };
@@ -34,6 +35,7 @@ export function PlayerPage({
   roomId,
   clientName,
   onClientNameChange,
+  onLeaveSession,
   onRefresh,
   onRoomCreated,
 }: Props) {
@@ -203,7 +205,10 @@ export function PlayerPage({
               <SessionMenu
                 clientName={clientName}
                 onClientNameChange={onClientNameChange}
-                onLeave={() => navigate({ name: "watch", mediaId: item.id, roomId: null })}
+                onLeave={() => {
+                  onLeaveSession();
+                  navigate({ name: "watch", mediaId: item.id, roomId: null });
+                }}
                 socket={socket}
               />
             </>

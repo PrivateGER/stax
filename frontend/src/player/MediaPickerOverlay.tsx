@@ -4,7 +4,6 @@ import { thumbnailUrl } from "../api";
 import {
   displayMediaTitle,
   formatDuration,
-  mediaAspectRatio,
   mediaBadges,
   posterInitials,
 } from "../format";
@@ -119,11 +118,6 @@ function PickerCard({
   const title = displayMediaTitle(item);
   const badges = mediaBadges(item);
   const hasThumbnail = item.thumbnailGeneratedAt !== null;
-  const thumbnailAspectRatio = mediaAspectRatio(item.width, item.height);
-  const posterArtStyle =
-    hasThumbnail && thumbnailAspectRatio
-      ? { aspectRatio: thumbnailAspectRatio }
-      : undefined;
 
   return (
     <button
@@ -132,7 +126,7 @@ function PickerCard({
       onClick={onSelect}
       type="button"
     >
-      <div className="poster-art" style={posterArtStyle}>
+      <div className="poster-art">
         {hasThumbnail ? (
           <img
             alt=""

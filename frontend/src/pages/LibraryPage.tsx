@@ -5,7 +5,6 @@ import { buildFolderTree, findFolder, folderPathSegments, type FolderNode } from
 import {
   displayMediaTitle,
   formatDuration,
-  mediaAspectRatio,
   mediaBadges,
   posterInitials,
 } from "../format";
@@ -360,11 +359,6 @@ function PosterCard({ item }: { item: MediaItem }) {
   const title = displayMediaTitle(item);
   const badges = mediaBadges(item);
   const hasThumbnail = item.thumbnailGeneratedAt !== null;
-  const thumbnailAspectRatio = mediaAspectRatio(item.width, item.height);
-  const posterArtStyle =
-    hasThumbnail && thumbnailAspectRatio
-      ? { aspectRatio: thumbnailAspectRatio }
-      : undefined;
 
   return (
     <button
@@ -372,7 +366,7 @@ function PosterCard({ item }: { item: MediaItem }) {
       onClick={() => navigate({ name: "title", mediaId: item.id })}
       type="button"
     >
-      <div className="poster-art" style={posterArtStyle}>
+      <div className="poster-art">
         {hasThumbnail ? (
           <img
             alt=""
@@ -402,9 +396,6 @@ function PosterCard({ item }: { item: MediaItem }) {
 function LiveSessionCard({ item, room }: { item: MediaItem | null; room: Room }) {
   const mediaTitle = item ? displayMediaTitle(item) : (room.mediaTitle ?? "Unknown title");
   const hasThumbnail = item?.thumbnailGeneratedAt != null;
-  const thumbnailAspectRatio = item ? mediaAspectRatio(item.width, item.height) : null;
-  const posterArtStyle =
-    hasThumbnail && thumbnailAspectRatio ? { aspectRatio: thumbnailAspectRatio } : undefined;
   const isPlaying = room.playbackState.status === "playing";
   const mediaId = room.mediaId;
 
@@ -418,7 +409,7 @@ function LiveSessionCard({ item, room }: { item: MediaItem | null; room: Room })
       }}
       type="button"
     >
-      <div className="poster-art" style={posterArtStyle}>
+      <div className="poster-art">
         {hasThumbnail && item ? (
           <img alt="" className="poster-image" loading="lazy" src={thumbnailUrl(item.id)} />
         ) : (

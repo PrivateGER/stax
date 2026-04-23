@@ -16,6 +16,7 @@ import type {
 } from "./types";
 
 const CLIENT_NAME_KEY = "stax.clientName";
+const ACTIVE_SESSION_KEY = "stax.activeSessionRoomId";
 
 export default function App() {
   const route = useRoute();
@@ -36,11 +37,22 @@ export default function App() {
     window.localStorage.setItem(CLIENT_NAME_KEY, fresh);
     return fresh;
   });
+  const [activeRoomId, setActiveRoomId] = useState<string | null>(() => {
+    if (typeof window === "undefined") return null;
+    return window.localStorage.getItem(ACTIVE_SESSION_KEY);
+  });
 
   const setClientName = useCallback((name: string) => {
     setClientNameState(name);
     if (typeof window !== "undefined") {
       window.localStorage.setItem(CLIENT_NAME_KEY, name);
+    }
+  }, []);
+
+  const clearActiveSession = useCallback(() => {
+    setActiveRoomId(null);
+    if (typeof window !== "undefined") {
+      window.localStorage.removeItem(ACTIVE_SESSION_KEY);
     }
   }, []);
 
@@ -77,6 +89,14 @@ export default function App() {
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  useEffect(() => {
+    if (route.name !== "watch" || !route.roomId) return;
+    setActiveRoomId(route.roomId);
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem(ACTIVE_SESSION_KEY, route.roomId);
+    }
+  }, [route]);
 
   const shouldPollRooms = route.name === "library" || route.name === "title";
 
@@ -193,6 +213,14 @@ export default function App() {
   }, [items]);
   const findItem = (mediaId: string) => itemsById.get(mediaId) ?? null;
 
+  const activeSession = useMemo(() => {
+    if (!activeRoomId) return null;
+    const room = rooms.find((candidate) => candidate.id === activeRoomId);
+    if (!room || !room.mediaId) return null;
+    return { roomId: room.id, mediaId: room.mediaId, name: room.name };
+  }, [activeRoomId, rooms]);
+  const showSessionChip = activeSession !== null && route.name !== "watch";
+
   return (
     <div className="app">
       <nav className="top-nav">
@@ -220,10 +248,27 @@ export default function App() {
         </div>
 
         <div className="top-nav-status">
-          {rooms.length > 0 ? (
-            <span className="session-count">
-              {rooms.length} Watch Together session{rooms.length === 1 ? "" : "s"}
-            </span>
+          {showSessionChip && activeSession ? (
+            <a
+              className="session-pill"
+              href={toHash({
+                name: "watch",
+                mediaId: activeSession.mediaId,
+                roomId: activeSession.roomId,
+              })}
+              onClick={(event) => {
+                event.preventDefault();
+                navigate({
+                  name: "watch",
+                  mediaId: activeSession.mediaId,
+                  roomId: activeSession.roomId,
+                });
+              }}
+              title={`Back to ${activeSession.name}`}
+            >
+              <span className="session-pill-dot live" aria-hidden="true" />
+              <span>Back to {activeSession.name}</span>
+            </a>
           ) : null}
         </div>
       </nav>
@@ -257,6 +302,7 @@ export default function App() {
             item={findItem(route.mediaId)}
             items={items}
             onClientNameChange={setClientName}
+            onLeaveSession={clearActiveSession}
             onRefresh={() => void refresh()}
             onRoomCreated={handleRoomCreated}
             roomId={route.roomId}
