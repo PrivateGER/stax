@@ -2246,7 +2246,7 @@ async fn ping_returns_pong_with_echoed_timestamp() {
         .send(Message::Text(
             serde_json::json!({
                 "type": "ping",
-                "clientSentAtMs": 1_700_000_000_123_i64
+                "clientSentAtMs": 1_700_000_000_123.5_f64
             })
             .to_string()
             .into(),
@@ -2256,7 +2256,7 @@ async fn ping_returns_pong_with_echoed_timestamp() {
 
     match next_event(&mut socket).await {
         ServerEvent::Pong { client_sent_at_ms } => {
-            assert_eq!(client_sent_at_ms, 1_700_000_000_123);
+            assert_eq!(client_sent_at_ms, 1_700_000_000_123.5);
         }
         other => panic!("expected pong, got {other:?}"),
     }
@@ -2297,7 +2297,7 @@ async fn ping_is_not_broadcast_to_other_clients() {
         .unwrap();
 
     match next_event(&mut reporter).await {
-        ServerEvent::Pong { client_sent_at_ms } => assert_eq!(client_sent_at_ms, 42),
+        ServerEvent::Pong { client_sent_at_ms } => assert_eq!(client_sent_at_ms, 42.0),
         other => panic!("expected pong on reporter, got {other:?}"),
     }
 

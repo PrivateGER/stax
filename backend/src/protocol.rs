@@ -105,7 +105,7 @@ pub enum ClientSocketMessage {
         position_seconds: f64,
     },
     Ping {
-        client_sent_at_ms: i64,
+        client_sent_at_ms: f64,
     },
 }
 
@@ -154,7 +154,7 @@ pub enum ServerEvent {
         message: String,
     },
     Pong {
-        client_sent_at_ms: i64,
+        client_sent_at_ms: f64,
     },
 }
 
