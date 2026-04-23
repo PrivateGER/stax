@@ -165,12 +165,6 @@ export class MediabunnyController {
     }
   }
 
-  setPlaybackRate(_rate: number): void {
-    // Playback rate is driven by the audio clock here; per the plan, drift
-    // nudges via the audio-clock slide land in M2 as part of useRoomSync.
-    // For M1 this is a no-op so existing callers don't break.
-  }
-
   setVolume(v: number): void {
     this.volumeValue = Math.max(0, Math.min(1, v));
     this.mutedValue = false;

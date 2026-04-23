@@ -17,7 +17,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use time::OffsetDateTime;
+use time::{Duration as TimeDuration, OffsetDateTime};
 use tokio::sync::{RwLock, broadcast};
 use tower_http::{
     compression::{
@@ -147,9 +147,13 @@ impl RoomHub {
         let mut updated_room = room.clone();
 
         let dispatch = match command {
-            ClientSocketMessage::Play { position_seconds } => {
+            ClientSocketMessage::Play {
+                position_seconds,
+                client_one_way_ms,
+            } => {
+                let anchor_time = back_date_for_client_latency(now, client_one_way_ms);
                 updated_room.clock.play(
-                    now,
+                    anchor_time,
                     position_seconds
                         .map(normalize_command_position)
                         .transpose()?,
@@ -161,9 +165,13 @@ impl RoomHub {
                     action: PlaybackAction::Play,
                 })
             }
-            ClientSocketMessage::Pause { position_seconds } => {
+            ClientSocketMessage::Pause {
+                position_seconds,
+                client_one_way_ms,
+            } => {
+                let anchor_time = back_date_for_client_latency(now, client_one_way_ms);
                 updated_room.clock.pause(
-                    now,
+                    anchor_time,
                     position_seconds
                         .map(normalize_command_position)
                         .transpose()?,
@@ -175,10 +183,14 @@ impl RoomHub {
                     action: PlaybackAction::Pause,
                 })
             }
-            ClientSocketMessage::Seek { position_seconds } => {
+            ClientSocketMessage::Seek {
+                position_seconds,
+                client_one_way_ms,
+            } => {
+                let anchor_time = back_date_for_client_latency(now, client_one_way_ms);
                 updated_room
                     .clock
-                    .seek(now, normalize_command_position(position_seconds)?);
+                    .seek(anchor_time, normalize_command_position(position_seconds)?);
 
                 SocketDispatch::Broadcast(ServerEvent::PlaybackUpdated {
                     room: updated_room.snapshot(now),
@@ -199,6 +211,11 @@ impl RoomHub {
                     tolerance_seconds: drift.tolerance_seconds,
                     suggested_action: drift.suggested_action,
                     measured_at: format_timestamp(now),
+                }));
+            }
+            ClientSocketMessage::Ping { client_sent_at_ms } => {
+                return Ok(SocketDispatch::Direct(ServerEvent::Pong {
+                    client_sent_at_ms,
                 }));
             }
         };
@@ -1288,6 +1305,16 @@ fn sanitize_client_name(client_name: Option<String>) -> String {
         })
 }
 
+/// Ceiling on client-reported one-way latency, in milliseconds. Clients sending
+/// larger values would pin the clock anchor arbitrarily far in the past and let
+/// peer projections run ahead of reality.
+const MAX_CLIENT_ONE_WAY_MS: u32 = 2_000;
+
+fn back_date_for_client_latency(now: OffsetDateTime, client_one_way_ms: Option<u32>) -> OffsetDateTime {
+    let clamped = client_one_way_ms.unwrap_or(0).min(MAX_CLIENT_ONE_WAY_MS);
+    now - TimeDuration::milliseconds(clamped as i64)
+}
+
 fn normalize_command_position(position_seconds: f64) -> Result<f64, &'static str> {
     validate_position(position_seconds).map(|value| round_to(value, 1))
 }
@@ -1483,6 +1510,7 @@ mod tests {
         room.apply_socket_message(
             ClientSocketMessage::Play {
                 position_seconds: Some(5.0),
+                client_one_way_ms: None,
             },
             "operator",
         )
@@ -1495,6 +1523,7 @@ mod tests {
             .apply_socket_message(
                 ClientSocketMessage::Pause {
                     position_seconds: None,
+                    client_one_way_ms: None,
                 },
                 "operator",
             )
@@ -1522,6 +1551,33 @@ mod tests {
     #[test]
     fn normalize_reported_position_preserves_precision() {
         assert_eq!(normalize_reported_position(1.23456).unwrap(), 1.235);
+    }
+
+    #[test]
+    fn back_date_for_client_latency_passes_through_none_and_zero() {
+        let now = OffsetDateTime::UNIX_EPOCH;
+
+        assert_eq!(back_date_for_client_latency(now, None), now);
+        assert_eq!(back_date_for_client_latency(now, Some(0)), now);
+    }
+
+    #[test]
+    fn back_date_for_client_latency_shifts_by_reported_amount() {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let shifted = back_date_for_client_latency(now, Some(250));
+
+        assert_eq!(now - shifted, TimeDuration::milliseconds(250));
+    }
+
+    #[test]
+    fn back_date_for_client_latency_clamps_values_above_ceiling() {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let shifted = back_date_for_client_latency(now, Some(10_000));
+
+        assert_eq!(
+            now - shifted,
+            TimeDuration::milliseconds(MAX_CLIENT_ONE_WAY_MS as i64)
+        );
     }
 
     #[test]

@@ -2189,6 +2189,156 @@ async fn drift_reports_are_not_broadcast_to_other_clients() {
     assert_no_event(&mut observer).await;
 }
 
+#[tokio::test]
+async fn ping_returns_pong_with_echoed_timestamp() {
+    let server = TestServer::spawn().await;
+    let room = server.seeded_room().await;
+    let mut socket = connect_room_socket(&server, &room.id.to_string(), "Operator").await;
+
+    let _ = next_event(&mut socket).await;
+    let _ = next_event(&mut socket).await;
+
+    socket
+        .send(Message::Text(
+            serde_json::json!({
+                "type": "ping",
+                "clientSentAtMs": 1_700_000_000_123_i64
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    match next_event(&mut socket).await {
+        ServerEvent::Pong { client_sent_at_ms } => {
+            assert_eq!(client_sent_at_ms, 1_700_000_000_123);
+        }
+        other => panic!("expected pong, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn ping_is_not_broadcast_to_other_clients() {
+    let server = TestServer::spawn().await;
+    let room = server.seeded_room().await;
+    let mut reporter = connect_room_socket(&server, &room.id.to_string(), "Alpha").await;
+
+    assert!(matches!(
+        next_event(&mut reporter).await,
+        ServerEvent::Snapshot { .. }
+    ));
+    assert!(matches!(
+        next_event(&mut reporter).await,
+        ServerEvent::PresenceChanged {
+            joined: true,
+            connection_count: 1,
+            ..
+        }
+    ));
+
+    let mut observer = connect_room_socket(&server, &room.id.to_string(), "Bravo").await;
+
+    let _ = next_event(&mut observer).await;
+    let _ = next_event(&mut reporter).await;
+    let _ = next_event(&mut observer).await;
+
+    reporter
+        .send(Message::Text(
+            serde_json::json!({ "type": "ping", "clientSentAtMs": 42 })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+
+    match next_event(&mut reporter).await {
+        ServerEvent::Pong { client_sent_at_ms } => assert_eq!(client_sent_at_ms, 42),
+        other => panic!("expected pong on reporter, got {other:?}"),
+    }
+
+    assert_no_event(&mut observer).await;
+}
+
+#[tokio::test]
+async fn play_with_client_one_way_ms_back_dates_the_clock_anchor() {
+    let server = TestServer::spawn().await;
+    let room = server.seeded_room().await;
+    let mut socket = connect_room_socket(&server, &room.id.to_string(), "Operator").await;
+
+    let _ = next_event(&mut socket).await;
+    let _ = next_event(&mut socket).await;
+
+    socket
+        .send(Message::Text(
+            serde_json::json!({
+                "type": "play",
+                "positionSeconds": 10.0,
+                "clientOneWayMs": 300
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    match next_event(&mut socket).await {
+        ServerEvent::PlaybackUpdated { room, .. } => {
+            assert_eq!(room.playback_state.anchor_position_seconds, 10.0);
+            // Anchor is placed 300 ms in the past, so effective position at
+            // emit time has advanced past the reported 10.0.
+            assert!(
+                room.playback_state.position_seconds >= 10.3,
+                "expected effective position >= 10.3 s, got {}",
+                room.playback_state.position_seconds
+            );
+            assert!(
+                room.playback_state.position_seconds <= 10.5,
+                "expected effective position to stay near the back-date, got {}",
+                room.playback_state.position_seconds
+            );
+        }
+        other => panic!("expected playback update, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn client_one_way_ms_above_ceiling_is_clamped() {
+    let server = TestServer::spawn().await;
+    let room = server.seeded_room().await;
+    let mut socket = connect_room_socket(&server, &room.id.to_string(), "Operator").await;
+
+    let _ = next_event(&mut socket).await;
+    let _ = next_event(&mut socket).await;
+
+    socket
+        .send(Message::Text(
+            serde_json::json!({
+                "type": "play",
+                "positionSeconds": 10.0,
+                "clientOneWayMs": 10_000
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    match next_event(&mut socket).await {
+        ServerEvent::PlaybackUpdated { room, .. } => {
+            assert_eq!(room.playback_state.anchor_position_seconds, 10.0);
+            // Server caps the back-date at 2 s; position should land close to
+            // 12.0 but never run wildly ahead.
+            assert!(
+                (12.0..=12.3).contains(&room.playback_state.position_seconds),
+                "expected clamped back-date to yield ~12.0 s, got {}",
+                room.playback_state.position_seconds
+            );
+        }
+        other => panic!("expected playback update, got {other:?}"),
+    }
+}
+
 #[cfg(unix)]
 fn write_ffmpeg_stub(temp_dir: &TempDir, name: &str, contents: &str) -> PathBuf {
     write_probe_script(temp_dir, name, contents)

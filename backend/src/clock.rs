@@ -180,6 +180,20 @@ mod tests {
     }
 
     #[test]
+    fn play_with_back_dated_anchor_advances_effective_position_immediately() {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let mut clock = AuthoritativePlaybackClock::new_paused(now);
+
+        clock.play(now - Duration::milliseconds(200), Some(5.0));
+
+        let snapshot = clock.snapshot(now);
+
+        assert_eq!(snapshot.status, PlaybackStatus::Playing);
+        assert_eq!(snapshot.anchor_position_seconds, 5.0);
+        assert_eq!(snapshot.position_seconds, 5.2);
+    }
+
+    #[test]
     fn drift_report_treats_negative_delta_symmetrically() {
         let now = OffsetDateTime::UNIX_EPOCH;
         let mut clock = AuthoritativePlaybackClock::new_paused(now);

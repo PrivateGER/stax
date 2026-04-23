@@ -188,9 +188,12 @@ export type DriftCorrectionEvent = {
 
 export type SocketErrorEvent = { type: "error"; message: string };
 
+export type PongEvent = { type: "pong"; clientSentAtMs: number };
+
 export type SocketEvent =
   | SnapshotEvent
   | PlaybackUpdatedEvent
   | PresenceChangedEvent
   | DriftCorrectionEvent
-  | SocketErrorEvent;
+  | SocketErrorEvent
+  | PongEvent;

@@ -4,6 +4,7 @@ import { api } from "../api";
 import { displayMediaTitle } from "../format";
 import { PlayerSurface } from "../player/mediabunny/PlayerSurface";
 import { useMediabunnyController } from "../player/mediabunny/useMediabunnyController";
+import { useMediabunnyRoomSync } from "../player/mediabunny/useMediabunnyRoomSync";
 import { SessionMenu } from "../player/SessionMenu";
 import { TracksMenu } from "../player/TracksMenu";
 import { deriveSubtitleSources } from "../player/subtitleSources";
@@ -65,6 +66,15 @@ export function PlayerPage({
     item,
     setPlayerError,
   );
+
+  useMediabunnyRoomSync({
+    controllerRef,
+    playerState: state,
+    socket,
+    item,
+    onAutoplayBlocked: setPlayerError,
+  });
+
   const selectedSubtitleSource =
     selectedSubtitleIndex === null ? null : subtitleSources[selectedSubtitleIndex] ?? null;
   const { activeCues, error: subtitleError } = useActiveSubtitleCue(

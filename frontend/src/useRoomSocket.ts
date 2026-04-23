@@ -9,10 +9,14 @@ import type {
 } from "./types";
 
 export type RoomSocketCommand =
-  | { type: "play"; positionSeconds?: number }
-  | { type: "pause"; positionSeconds?: number }
-  | { type: "seek"; positionSeconds: number }
+  | { type: "play"; positionSeconds?: number; clientOneWayMs?: number }
+  | { type: "pause"; positionSeconds?: number; clientOneWayMs?: number }
+  | { type: "seek"; positionSeconds: number; clientOneWayMs?: number }
   | { type: "reportPosition"; positionSeconds: number };
+
+type OutgoingMessage =
+  | RoomSocketCommand
+  | { type: "ping"; clientSentAtMs: number };
 
 export type RoomSocketState = {
   connectionState: ConnectionState;
@@ -22,6 +26,7 @@ export type RoomSocketState = {
   lastCorrection: DriftCorrectionEvent | null;
   authoritativeReceiptAtMs: number | null;
   activity: string;
+  oneWayLatencyMs: number | null;
 };
 
 export type RoomSocketApi = RoomSocketState & {
@@ -40,16 +45,24 @@ const IDLE_STATE: RoomSocketState = {
   lastCorrection: null,
   authoritativeReceiptAtMs: null,
   activity: "Not connected",
+  oneWayLatencyMs: null,
 };
+
+const PING_INTERVAL_MS = 5_000;
+const LATENCY_WINDOW = 5;
 
 export function useRoomSocket(roomId: string | null, clientName: string): RoomSocketApi {
   const [state, setState] = useState<RoomSocketState>(IDLE_STATE);
   const socketRef = useRef<WebSocket | null>(null);
+  // Ref mirror of the live latency estimate so `send` can inject
+  // `clientOneWayMs` without re-creating itself on every sample.
+  const latencyRef = useRef<number | null>(null);
 
   useEffect(() => {
     if (!roomId) {
       socketRef.current?.close();
       socketRef.current = null;
+      latencyRef.current = null;
       setState(IDLE_STATE);
       return;
     }
@@ -62,6 +75,18 @@ export function useRoomSocket(roomId: string | null, clientName: string): RoomSo
 
     const socket = new WebSocket(socketUrl(roomId, clientName));
     socketRef.current = socket;
+    latencyRef.current = null;
+    // Rolling window of recent one-way latency samples; we take the min so
+    // GC/jitter spikes don't inflate the projection correction.
+    const latencySamples: number[] = [];
+    let pingInterval: number | null = null;
+
+    const sendPing = () => {
+      if (socket.readyState !== WebSocket.OPEN) return;
+      socket.send(
+        JSON.stringify({ type: "ping", clientSentAtMs: monotonicNow() }),
+      );
+    };
 
     socket.onopen = () => {
       if (socketRef.current !== socket) return;
@@ -69,6 +94,8 @@ export function useRoomSocket(roomId: string | null, clientName: string): RoomSo
         ...current,
         activity: "Connected. Waiting for snapshot…",
       }));
+      sendPing();
+      pingInterval = window.setInterval(sendPing, PING_INTERVAL_MS);
     };
 
     socket.onmessage = (event) => {
@@ -78,8 +105,21 @@ export function useRoomSocket(roomId: string | null, clientName: string): RoomSo
         const message = JSON.parse(event.data) as SocketEvent;
         const receipt = monotonicNow();
 
+        if (message.type === "pong") {
+          const rtt = receipt - message.clientSentAtMs;
+          if (rtt >= 0 && Number.isFinite(rtt)) {
+            const oneWay = rtt / 2;
+            latencySamples.push(oneWay);
+            if (latencySamples.length > LATENCY_WINDOW) latencySamples.shift();
+            const min = Math.min(...latencySamples);
+            latencyRef.current = min;
+            setState((current) => ({ ...current, oneWayLatencyMs: min }));
+          }
+          return;
+        }
+
         if (message.type === "snapshot") {
-          setState({
+          setState((current) => ({
             connectionState: "live",
             room: message.room,
             presenceCount: message.connectionCount,
@@ -90,7 +130,8 @@ export function useRoomSocket(roomId: string | null, clientName: string): RoomSo
               message.connectionCount === 1
                 ? "You're the only one here."
                 : `${message.connectionCount} watchers connected.`,
-          });
+            oneWayLatencyMs: current.oneWayLatencyMs,
+          }));
           return;
         }
 
@@ -141,15 +182,20 @@ export function useRoomSocket(roomId: string | null, clientName: string): RoomSo
     socket.onclose = () => {
       if (socketRef.current !== socket) return;
       socketRef.current = null;
+      if (pingInterval !== null) window.clearInterval(pingInterval);
+      latencyRef.current = null;
       setState((current) => ({
         ...current,
         connectionState: "offline",
         activity: "Watch Together session closed.",
+        oneWayLatencyMs: null,
       }));
     };
 
     return () => {
       if (socketRef.current === socket) socketRef.current = null;
+      if (pingInterval !== null) window.clearInterval(pingInterval);
+      latencyRef.current = null;
       socket.close();
     };
   }, [roomId, clientName]);
@@ -157,7 +203,19 @@ export function useRoomSocket(roomId: string | null, clientName: string): RoomSo
   const send = useCallback((command: RoomSocketCommand) => {
     const socket = socketRef.current;
     if (!socket || socket.readyState !== WebSocket.OPEN) return;
-    socket.send(JSON.stringify(command));
+
+    let outgoing: OutgoingMessage = command;
+    if (
+      (command.type === "play" ||
+        command.type === "pause" ||
+        command.type === "seek") &&
+      command.clientOneWayMs === undefined &&
+      latencyRef.current !== null
+    ) {
+      outgoing = { ...command, clientOneWayMs: Math.round(latencyRef.current) };
+    }
+
+    socket.send(JSON.stringify(outgoing));
   }, []);
 
   return { ...state, send };
@@ -167,6 +225,7 @@ export function deriveExpectedPosition(
   room: Room | null,
   receiptAtMs: number | null,
   nowMs: number,
+  oneWayLatencyMs: number | null,
 ) {
   if (!room) return 0;
 
@@ -174,7 +233,11 @@ export function deriveExpectedPosition(
     return room.playbackState.positionSeconds;
   }
 
-  const elapsedSeconds = Math.max(0, nowMs - receiptAtMs) / 1000;
+  // Pretend the message arrived when the server sent it, so our projection
+  // is measured from the authoritative emit time rather than our local receipt.
+  const adjustedReceiptMs =
+    oneWayLatencyMs !== null ? receiptAtMs - oneWayLatencyMs : receiptAtMs;
+  const elapsedSeconds = Math.max(0, nowMs - adjustedReceiptMs) / 1000;
 
   return Number(
     (

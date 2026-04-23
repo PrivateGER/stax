@@ -78,10 +78,24 @@ pub struct RoomSocketQuery {
     rename_all_fields = "camelCase"
 )]
 pub enum ClientSocketMessage {
-    Play { position_seconds: Option<f64> },
-    Pause { position_seconds: Option<f64> },
-    Seek { position_seconds: f64 },
-    ReportPosition { position_seconds: f64 },
+    Play {
+        position_seconds: Option<f64>,
+        client_one_way_ms: Option<u32>,
+    },
+    Pause {
+        position_seconds: Option<f64>,
+        client_one_way_ms: Option<u32>,
+    },
+    Seek {
+        position_seconds: f64,
+        client_one_way_ms: Option<u32>,
+    },
+    ReportPosition {
+        position_seconds: f64,
+    },
+    Ping {
+        client_sent_at_ms: i64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,6 +132,9 @@ pub enum ServerEvent {
     },
     Error {
         message: String,
+    },
+    Pong {
+        client_sent_at_ms: i64,
     },
 }
 
