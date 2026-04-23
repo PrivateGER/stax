@@ -155,11 +155,15 @@ export class MediabunnyController {
     if (!this.ready || this.disposed) return;
     const clamped = Math.max(0, Math.min(seconds, this.duration));
     const wasPlaying = this.playing;
-    if (wasPlaying) this.pause();
+    if (wasPlaying) {
+      this.playbackTimeAtStart = this.getPlaybackTime();
+      this.playing = false;
+      this.stopAudioOutput();
+    }
     this.playbackTimeAtStart = clamped;
-    await this.startVideoIterator();
     this.emit("seeked", clamped);
     this.emit("timeupdate", clamped);
+    await this.startVideoIterator();
     if (wasPlaying && clamped < this.duration) {
       await this.play();
     }

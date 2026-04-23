@@ -21,6 +21,12 @@ type Options = {
 // `seeked` event is treated as user intent rather than the echo of our own
 // follow-room effect seeking the controller back onto the authoritative clock.
 const SEEK_ECHO_TOLERANCE_SECONDS = 0.5;
+const LOCAL_SEEK_GRACE_MS = 3_000;
+
+type PendingSeek = {
+  positionSeconds: number;
+  sentAtMs: number;
+};
 
 export function useMediabunnyRoomSync({
   controllerRef,
@@ -39,10 +45,15 @@ export function useMediabunnyRoomSync({
   const receiptRef = useRef(socket.authoritativeReceiptAtMs);
   const sendRef = useRef(socket.send);
   const latencyRef = useRef(socket.oneWayLatencyMs);
+  const pendingSeekRef = useRef<PendingSeek | null>(null);
   roomRef.current = socket.room;
   receiptRef.current = socket.authoritativeReceiptAtMs;
   sendRef.current = socket.send;
   latencyRef.current = socket.oneWayLatencyMs;
+
+  useEffect(() => {
+    pendingSeekRef.current = null;
+  }, [item?.id, socket.room?.id]);
 
   useEffect(() => {
     const tickId = window.setInterval(() => {
@@ -58,6 +69,7 @@ export function useMediabunnyRoomSync({
     const interval = window.setInterval(() => {
       const controller = controllerRef.current;
       if (!controller) return;
+      if (hasActivePendingSeek(pendingSeekRef, monotonicNow())) return;
       socket.send({
         type: "reportPosition",
         positionSeconds: Number(
@@ -82,6 +94,27 @@ export function useMediabunnyRoomSync({
 
     const controller = controllerRef.current;
     if (!controller) return;
+
+    const pendingSeek = pendingSeekRef.current;
+    if (pendingSeek) {
+      const expectedForRoom = deriveExpectedPosition(
+        socket.room,
+        socket.authoritativeReceiptAtMs,
+        clockTickMs,
+        socket.oneWayLatencyMs,
+      );
+      const tolerance = Math.max(
+        socket.room.playbackState.driftToleranceSeconds,
+        SEEK_ECHO_TOLERANCE_SECONDS,
+      );
+      if (Math.abs(expectedForRoom - pendingSeek.positionSeconds) <= tolerance) {
+        pendingSeekRef.current = null;
+      } else if (clockTickMs - pendingSeek.sentAtMs < LOCAL_SEEK_GRACE_MS) {
+        return;
+      } else {
+        pendingSeekRef.current = null;
+      }
+    }
 
     const expected = deriveExpectedPosition(
       socket.room,
@@ -128,6 +161,23 @@ export function useMediabunnyRoomSync({
     if (!socket.lastCorrection || !live || !item || !ready) return;
     if (socket.lastCorrection.suggestedAction === "inSync") return;
 
+    const pendingSeek = pendingSeekRef.current;
+    if (pendingSeek) {
+      const ageMs = monotonicNow() - pendingSeek.sentAtMs;
+      if (
+        Math.abs(
+          socket.lastCorrection.expectedPositionSeconds -
+            pendingSeek.positionSeconds,
+        ) <= SEEK_ECHO_TOLERANCE_SECONDS
+      ) {
+        pendingSeekRef.current = null;
+      } else if (ageMs < LOCAL_SEEK_GRACE_MS) {
+        return;
+      } else {
+        pendingSeekRef.current = null;
+      }
+    }
+
     const controller = controllerRef.current;
     if (!controller) return;
 
@@ -160,10 +210,11 @@ export function useMediabunnyRoomSync({
     const handleSeeked = () => {
       const room = roomRef.current;
       if (!room) return;
+      const now = monotonicNow();
       const expected = deriveExpectedPosition(
         room,
         receiptRef.current,
-        monotonicNow(),
+        now,
         latencyRef.current,
       );
       if (
@@ -171,7 +222,12 @@ export function useMediabunnyRoomSync({
         SEEK_ECHO_TOLERANCE_SECONDS
       )
         return;
-      send({ type: "seek", positionSeconds: positionNow() });
+      const positionSeconds = positionNow();
+      pendingSeekRef.current = {
+        positionSeconds,
+        sentAtMs: now,
+      };
+      send({ type: "seek", positionSeconds });
     };
 
     const offs = [
@@ -184,4 +240,15 @@ export function useMediabunnyRoomSync({
       for (const off of offs) off();
     };
   }, [live, ready, controllerRef]);
+}
+
+function hasActivePendingSeek(
+  pendingSeekRef: RefObject<PendingSeek | null>,
+  nowMs: number,
+): boolean {
+  const pendingSeek = pendingSeekRef.current;
+  if (!pendingSeek) return false;
+  if (nowMs - pendingSeek.sentAtMs < LOCAL_SEEK_GRACE_MS) return true;
+  pendingSeekRef.current = null;
+  return false;
 }
