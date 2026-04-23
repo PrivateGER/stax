@@ -11,7 +11,7 @@ use std::os::unix::fs::PermissionsExt;
 use axum::Router;
 use futures_util::{SinkExt, StreamExt, future::join_all};
 use reqwest::Client;
-use reqwest::header::{CONTENT_RANGE, RANGE};
+use reqwest::header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_RANGE, RANGE};
 use syncplay_backend::{
     build_app,
     library::LibraryConfig,
@@ -399,6 +399,16 @@ async fn assert_no_event(
     );
 }
 
+fn compression_test_client() -> Client {
+    Client::builder()
+        .no_gzip()
+        .no_zstd()
+        .no_brotli()
+        .no_deflate()
+        .build()
+        .unwrap()
+}
+
 use reqwest::StatusCode;
 
 #[cfg(unix)]
@@ -584,6 +594,36 @@ async fn library_scan_indexes_supported_files_and_ignores_other_entries() {
     );
     assert!(scan.roots[0].last_scanned_at.is_some());
     assert_eq!(scan.roots[0].last_scan_error, None);
+}
+
+#[tokio::test]
+async fn library_endpoint_supports_gzip_and_zstd_compression() {
+    let temp_dir = TempDir::new().unwrap();
+    let root = temp_dir.path().join("library");
+    fs::create_dir_all(root.join("nested")).unwrap();
+    fs::write(
+        root.join("movie-with-a-very-long-name-to-inflate-json.mp4"),
+        b"movie",
+    )
+    .unwrap();
+    fs::write(root.join("nested").join("episode-01.mkv"), b"episode").unwrap();
+    let server = TestServer::spawn_with_library_roots(vec![root]).await;
+    let client = compression_test_client();
+
+    server.scan_library().await;
+
+    for encoding in ["gzip", "zstd"] {
+        let response = client
+            .get(format!("{}/api/library", server.base_url))
+            .header(ACCEPT_ENCODING, encoding)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers().get(CONTENT_ENCODING).unwrap(), encoding);
+        assert!(!response.bytes().await.unwrap().is_empty());
+    }
 }
 
 #[tokio::test]
@@ -1209,6 +1249,35 @@ async fn media_stream_returns_full_file_when_no_range_is_requested() {
         response.bytes().await.unwrap().as_ref(),
         expected_bytes.as_slice()
     );
+}
+
+#[tokio::test]
+async fn media_stream_skips_response_compression_for_video() {
+    let temp_dir = TempDir::new().unwrap();
+    let root = temp_dir.path().join("library");
+    fs::create_dir_all(&root).unwrap();
+    let expected_bytes = b"stream-me".to_vec();
+    fs::write(root.join("movie.mp4"), &expected_bytes).unwrap();
+    let server = TestServer::spawn_with_library_roots(vec![root]).await;
+    let client = compression_test_client();
+    let scan = server.scan_library().await;
+    let media_id = scan.items[0].id;
+
+    for encoding in ["gzip", "zstd"] {
+        let response = client
+            .get(format!("{}/api/media/{media_id}/stream", server.base_url))
+            .header(ACCEPT_ENCODING, encoding)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get(CONTENT_ENCODING).is_none());
+        assert_eq!(
+            response.bytes().await.unwrap().as_ref(),
+            expected_bytes.as_slice()
+        );
+    }
 }
 
 #[tokio::test]

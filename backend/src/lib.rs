@@ -20,6 +20,10 @@ use axum::{
 use time::OffsetDateTime;
 use tokio::sync::{RwLock, broadcast};
 use tower_http::{
+    compression::{
+        CompressionLayer,
+        predicate::{DefaultPredicate, NotForContentType, Predicate},
+    },
     cors::{Any, CorsLayer},
     trace::TraceLayer,
 };
@@ -377,6 +381,12 @@ pub async fn seeded_state() -> AppState {
 }
 
 pub fn build_app(state: AppState) -> Router {
+    let compression = CompressionLayer::new().compress_when(
+        DefaultPredicate::new()
+            .and(NotForContentType::const_new("audio/"))
+            .and(NotForContentType::const_new("video/"))
+            .and(NotForContentType::const_new("application/octet-stream")),
+    );
     let app = Router::new()
         .route("/api/health", get(health))
         .route("/api/library", get(list_library))
@@ -405,6 +415,7 @@ pub fn build_app(state: AppState) -> Router {
         .with_state(state);
 
     add_frontend_fallback(app)
+        .layer(compression)
         .layer(build_cors())
         .layer(TraceLayer::new_for_http())
 }
