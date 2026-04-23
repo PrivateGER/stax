@@ -266,7 +266,14 @@ export class MediabunnyController {
   private async load(url: string): Promise<void> {
     try {
       await ensureCustomAudioDecoders();
+      if (this.disposed) return;
       this.input = new Input({ source: new UrlSource(url), formats: ALL_FORMATS });
+      if (this.disposed) {
+        // dispose() ran between the `await` above and this assignment, so
+        // dispose()'s own `this.input?.dispose()` was a no-op. Clean up now.
+        this.input.dispose();
+        return;
+      }
       this.duration = await this.input.computeDuration();
 
       let videoTrack = await this.input.getPrimaryVideoTrack();
@@ -420,7 +427,15 @@ export class MediabunnyController {
     while (true) {
       const iterator = this.videoFrameIterator;
       if (!iterator) return;
-      const candidate = (await iterator.next()).value ?? null;
+      let candidate: WrappedCanvas | null;
+      try {
+        candidate = (await iterator.next()).value ?? null;
+      } catch {
+        // iterator.next() throws InputDisposedError after dispose(), and the
+        // UrlSource fetch can reject mid-flight on abort. Either way, if we've
+        // moved on (seek, disposal), there's nothing useful to do.
+        return;
+      }
       if (!candidate) return;
       if (localAsyncId !== this.asyncId || this.disposed) return;
       const playbackTime = this.getPlaybackTime();
@@ -438,6 +453,19 @@ export class MediabunnyController {
     if (!this.audioSink || !this.audioContext || !this.gainNode) return;
     const iterator = this.audioBufferIterator;
     if (!iterator) return;
+    try {
+      await this.pumpAudioIterator(iterator);
+    } catch {
+      // Same rationale as advanceVideoFrame: InputDisposedError / aborted
+      // fetches during tear-down are expected and should not surface as
+      // unhandled rejections.
+    }
+  }
+
+  private async pumpAudioIterator(
+    iterator: AsyncGenerator<WrappedAudioBuffer, void, unknown>,
+  ): Promise<void> {
+    if (!this.audioContext || !this.gainNode) return;
     for await (const { buffer, timestamp } of iterator) {
       if (this.disposed) return;
       const node = this.audioContext.createBufferSource();

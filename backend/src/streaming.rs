@@ -19,6 +19,8 @@ use tokio_util::io::ReaderStream;
 
 use crate::protocol::{MediaItem, SubtitleStream, SubtitleTrack};
 
+const OPEN_ENDED_RANGE_CAP: u64 = 8 * 1024 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ByteRange {
     start: u64,
@@ -344,7 +346,13 @@ pub(crate) fn parse_range_header(
     }
 
     let end = if end.is_empty() {
-        file_len - 1
+        // Open-ended ranges (`bytes=N-`) get capped so HTTP/1.1 clients don't
+        // stall a single connection on a multi-hundred-megabyte response that
+        // they only want a small prefix of. MediaBunny's UrlSource aborts and
+        // retries aggressively; over h1 an abort is a TCP teardown, so a
+        // full-file body here becomes a retry loop. Explicit `bytes=a-b`
+        // requests are honored as-is.
+        (start + OPEN_ENDED_RANGE_CAP - 1).min(file_len - 1)
     } else {
         end.parse::<u64>()
             .map_err(|_| {
@@ -369,6 +377,20 @@ mod tests {
         let range = parse_range_header("bytes=5-", 10).unwrap();
 
         assert_eq!(range, ByteRange { start: 5, end: 9 });
+    }
+
+    #[test]
+    fn parse_range_header_caps_open_ended_ranges_below_file_len() {
+        let file_len = 100 * 1024 * 1024;
+        let range = parse_range_header("bytes=0-", file_len).unwrap();
+
+        assert_eq!(
+            range,
+            ByteRange {
+                start: 0,
+                end: OPEN_ENDED_RANGE_CAP - 1,
+            }
+        );
     }
 
     #[test]
