@@ -1,5 +1,6 @@
 import { useMemo, useState } from "react";
 
+import shimakazeUrl from "../../asset/shimakaze_sfw.png";
 import { api, thumbnailUrl } from "../api";
 import {
   displayMediaTitle,
@@ -90,6 +91,7 @@ export function TitlePage({ item, rooms, onRoomCreated, onRefresh }: Props) {
   if (!item) {
     return (
       <section className="title-missing">
+        <img alt="" aria-hidden="true" className="title-missing-mascot" src={shimakazeUrl} />
         <h1>Title not found</h1>
         <p className="muted">This media is not in the library anymore.</p>
         <button

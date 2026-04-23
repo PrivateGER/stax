@@ -168,11 +168,25 @@ code {
 }
 
 .top-nav-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
   font-weight: 700;
   font-size: 1.1rem;
   text-decoration: none;
   color: var(--accent);
   letter-spacing: -0.02em;
+}
+
+.top-nav-mascot {
+  width: 32px;
+  height: 32px;
+  border-radius: var(--radius-pill);
+  object-fit: cover;
+  object-position: top center;
+  background: #fff;
+  border: 1px solid var(--border);
+  flex: none;
 }
 
 .top-nav-links {
@@ -555,7 +569,19 @@ code {
   padding: 2rem;
   text-align: center;
   display: grid;
+  justify-items: center;
   gap: 1rem;
+}
+
+.library-empty-mascot {
+  width: 180px;
+  height: 180px;
+  border-radius: var(--radius-pill);
+  object-fit: cover;
+  object-position: top center;
+  background: #fff;
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-md);
 }
 
 /* ========== Title page ========== */
@@ -572,7 +598,37 @@ code {
   padding: 2rem;
   text-align: center;
   display: grid;
+  justify-items: center;
   gap: 1rem;
+}
+
+.title-missing-mascot {
+  width: 140px;
+  height: 140px;
+  border-radius: var(--radius-pill);
+  object-fit: cover;
+  object-position: top center;
+  background: #fff;
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-md);
+}
+
+.inline-empty {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 1rem 0;
+}
+
+.inline-empty-mascot {
+  width: 56px;
+  height: 56px;
+  border-radius: var(--radius-pill);
+  object-fit: cover;
+  object-position: top center;
+  background: #fff;
+  border: 1px solid var(--border);
+  flex: none;
 }
 
 .title-hero {

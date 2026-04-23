@@ -1,5 +1,6 @@
 import { useMemo, useState } from "react";
 
+import shimakazeUrl from "../../asset/shimakaze_sfw.png";
 import { thumbnailUrl } from "../api";
 import { buildFolderTree, findFolder, folderPathSegments, type FolderNode } from "../folderTree";
 import {
@@ -87,6 +88,7 @@ export function LibraryPage({
   if (roots.length === 0 && !loading) {
     return (
       <section className="library-empty">
+        <img alt="" aria-hidden="true" className="library-empty-mascot" src={shimakazeUrl} />
         <h1>Add a library root to get started</h1>
         <p className="muted">
           Set <code>STAX_LIBRARY_ROOTS</code> to one or more directories and rescan.
@@ -321,7 +323,15 @@ function SearchResults({
       {loading ? (
         <p className="muted">Loading library…</p>
       ) : items.length === 0 ? (
-        <p className="muted">No titles match the current search.</p>
+        <div className="inline-empty">
+          <img
+            alt=""
+            aria-hidden="true"
+            className="inline-empty-mascot"
+            src={shimakazeUrl}
+          />
+          <p className="muted">No titles match the current search.</p>
+        </div>
       ) : (
         <div className="poster-grid">
           {items.map((item) => (

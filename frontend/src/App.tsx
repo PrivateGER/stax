@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 
+import shimakazeUrl from "../asset/shimakaze_sfw.png";
 import { api } from "./api";
 import { AdminPage } from "./pages/AdminPage";
 import { LibraryPage } from "./pages/LibraryPage";
@@ -232,7 +233,13 @@ export default function App() {
             navigate({ name: "library", folder: null });
           }}
         >
-          Stax
+          <img
+            alt=""
+            aria-hidden="true"
+            className="top-nav-mascot"
+            src={shimakazeUrl}
+          />
+          <span>Stax</span>
         </a>
 
         <div className="top-nav-links">
