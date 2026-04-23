@@ -907,33 +907,6 @@ code {
   color: rgba(255, 255, 255, 0.85);
 }
 
-.mb-buffer-pill {
-  font-variant-numeric: tabular-nums;
-  font-size: 0.73rem;
-  line-height: 1;
-  padding: 0.38rem 0.52rem;
-  border-radius: 999px;
-  white-space: nowrap;
-  border: 1px solid transparent;
-  color: rgba(255, 255, 255, 0.9);
-  background: rgba(255, 255, 255, 0.08);
-}
-
-.mb-buffer-pill.healthy {
-  background: rgba(96, 177, 92, 0.16);
-  border-color: rgba(96, 177, 92, 0.35);
-}
-
-.mb-buffer-pill.medium {
-  background: rgba(229, 160, 13, 0.16);
-  border-color: rgba(229, 160, 13, 0.35);
-}
-
-.mb-buffer-pill.low {
-  background: rgba(201, 95, 95, 0.18);
-  border-color: rgba(201, 95, 95, 0.4);
-}
-
 .mb-progress {
   flex: 1;
   height: 10px;
@@ -953,6 +926,18 @@ code {
   height: 3px;
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.25);
+}
+
+.mb-progress-buffered {
+  position: absolute;
+  left: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  height: 3px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.45);
+  transition: width 180ms ease-out;
+  pointer-events: none;
 }
 
 .mb-progress-fill {

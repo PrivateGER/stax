@@ -30,10 +30,8 @@ export type MediabunnyState = {
   duration: number;
   hasVideo: boolean;
   hasAudio: boolean;
-  audioBufferedSeconds: number;
-  audioRecentLateByMs: number;
-  audioWorstLateByMs: number;
-  audioLateStartCount: number;
+  /** Fraction of the source file (0..1) that has been fetched from the network. */
+  bufferedFraction: number;
   audioTracks: MediabunnyTrackInfo[];
   selectedAudioTrackId: string | null;
   volume: number;
@@ -70,10 +68,11 @@ export class MediabunnyController {
   private audioBufferIterator: AsyncGenerator<WrappedAudioBuffer, void, unknown> | null = null;
   private nextFrame: WrappedCanvas | null = null;
   private queuedAudioNodes = new Map<AudioBufferSourceNode, number>();
-  private audioLateStartCount = 0;
-  private audioWorstLateByMs = 0;
-  private audioRecentLateByMs = 0;
-  private audioRecentLateAtMs = -Infinity;
+
+  /** Highest byte offset (exclusive) ever read from the source. */
+  private sourceBytesRead = 0;
+  /** Total size of the source in bytes, once known. */
+  private sourceTotalBytes: number | null = null;
 
   /** Incremented on seek; in-flight async work checks this to bail out after a new seek. */
   private asyncId = 0;
@@ -127,10 +126,7 @@ export class MediabunnyController {
       duration: this.duration,
       hasVideo: this.videoTrack !== null,
       hasAudio: this.audioTrack !== null,
-      audioBufferedSeconds: this.getBufferedAudioSeconds(),
-      audioRecentLateByMs: this.getRecentAudioLateByMs(),
-      audioWorstLateByMs: this.audioWorstLateByMs,
-      audioLateStartCount: this.audioLateStartCount,
+      bufferedFraction: this.getBufferedFraction(),
       audioTracks: this.audioTrackInfos,
       selectedAudioTrackId: this.audioTrack ? String(this.audioTrack.id) : null,
       volume: this.volumeValue,
@@ -291,13 +287,18 @@ export class MediabunnyController {
     try {
       await ensureCustomAudioDecoders();
       if (this.disposed) return;
-      this.input = new Input({ source: new UrlSource(url), formats: ALL_FORMATS });
+      const source = new UrlSource(url);
+      source.onread = (_start, end) => {
+        if (end > this.sourceBytesRead) this.sourceBytesRead = end;
+      };
+      this.input = new Input({ source, formats: ALL_FORMATS });
       if (this.disposed) {
         // dispose() ran between the `await` above and this assignment, so
         // dispose()'s own `this.input?.dispose()` was a no-op. Clean up now.
         this.input.dispose();
         return;
       }
+      this.sourceTotalBytes = await source.getSizeOrNull();
       this.duration = await this.input.computeDuration();
 
       let videoTrack = await this.input.getPrimaryVideoTrack();
@@ -504,16 +505,10 @@ export class MediabunnyController {
       const startTimestamp =
         this.audioContextStartTime + timestamp - this.playbackTimeAtStart;
       const lateBySeconds = Math.max(0, this.audioContext.currentTime - startTimestamp);
-      if (lateBySeconds > 0) {
-        this.recordAudioLateStart(lateBySeconds);
-      }
       if (lateBySeconds === 0) {
         node.start(startTimestamp);
       } else {
-        node.start(
-          this.audioContext.currentTime,
-          lateBySeconds,
-        );
+        node.start(this.audioContext.currentTime, lateBySeconds);
       }
       const bufferedUntil = timestamp + Math.max(duration, buffer.duration);
       this.queuedAudioNodes.set(node, bufferedUntil);
@@ -546,28 +541,11 @@ export class MediabunnyController {
     this.context.drawImage(frame.canvas, 0, 0);
   }
 
-  private getBufferedAudioSeconds(): number {
-    if (!this.audioTrack || this.queuedAudioNodes.size === 0) return 0;
-    const playbackTime = this.getPlaybackTime();
-    let bufferedSeconds = 0;
-    for (const bufferedUntil of this.queuedAudioNodes.values()) {
-      bufferedSeconds = Math.max(bufferedSeconds, bufferedUntil - playbackTime);
-    }
-    return Number(Math.max(0, bufferedSeconds).toFixed(3));
-  }
-
-  private getRecentAudioLateByMs(): number {
-    if (performance.now() - this.audioRecentLateAtMs > 3000) return 0;
-    return this.audioRecentLateByMs;
-  }
-
-  private recordAudioLateStart(lateBySeconds: number): void {
-    const lateByMs = Math.round(lateBySeconds * 1000);
-    if (lateByMs <= 0) return;
-    this.audioLateStartCount += 1;
-    this.audioWorstLateByMs = Math.max(this.audioWorstLateByMs, lateByMs);
-    this.audioRecentLateByMs = lateByMs;
-    this.audioRecentLateAtMs = performance.now();
+  private getBufferedFraction(): number {
+    if (!this.sourceTotalBytes || this.sourceTotalBytes <= 0) return 0;
+    const fraction = this.sourceBytesRead / this.sourceTotalBytes;
+    if (!Number.isFinite(fraction)) return 0;
+    return Math.max(0, Math.min(1, fraction));
   }
 
   private getPlaybackTime(): number {

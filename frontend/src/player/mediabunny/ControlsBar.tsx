@@ -186,26 +186,6 @@ export function ControlsBar({
         </div>
       ) : null}
 
-      {state.hasAudio ? (
-        <span
-          aria-live="off"
-          className={`mb-buffer-pill ${bufferClassName(state.audioBufferedSeconds)}`}
-          title="Local audio queued ahead of playback"
-        >
-          Buffer {formatBufferSeconds(state.audioBufferedSeconds)}
-        </span>
-      ) : null}
-
-      {state.hasAudio ? (
-        <span
-          aria-live="off"
-          className={`mb-buffer-pill ${lateClassName(state.audioRecentLateByMs)}`}
-          title={`Recent late audio chunk start. Worst: ${state.audioWorstLateByMs}ms across ${state.audioLateStartCount} catch-up events.`}
-        >
-          Late {formatLateMilliseconds(state.audioRecentLateByMs)}
-        </span>
-      ) : null}
-
       <span className="mb-time">{formatTimeCode(state.currentTime)}</span>
 
       <div
@@ -215,6 +195,10 @@ export function ControlsBar({
         onPointerUp={handleProgressUp}
         ref={progressRef}
       >
+        <div
+          className="mb-progress-buffered"
+          style={{ width: `${clamp01(state.bufferedFraction) * 100}%` }}
+        />
         <div
           className="mb-progress-fill"
           style={{ width: `${displayFraction * 100}%` }}
@@ -240,29 +224,6 @@ export function ControlsBar({
 function clamp01(x: number): number {
   if (!Number.isFinite(x)) return 0;
   return Math.max(0, Math.min(1, x));
-}
-
-function formatBufferSeconds(seconds: number): string {
-  if (!Number.isFinite(seconds) || seconds <= 0) return "0.0s";
-  if (seconds >= 10) return `${seconds.toFixed(0)}s`;
-  return `${seconds.toFixed(1)}s`;
-}
-
-function bufferClassName(seconds: number): string {
-  if (seconds < 0.35) return "low";
-  if (seconds < 1) return "medium";
-  return "healthy";
-}
-
-function formatLateMilliseconds(milliseconds: number): string {
-  if (!Number.isFinite(milliseconds) || milliseconds <= 0) return "0ms";
-  return `${Math.round(milliseconds)}ms`;
-}
-
-function lateClassName(milliseconds: number): string {
-  if (milliseconds < 8) return "healthy";
-  if (milliseconds < 25) return "medium";
-  return "low";
 }
 
 function PlayGlyph() {
