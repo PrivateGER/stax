@@ -27,6 +27,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 pub mod clock;
+pub mod ffmpeg;
 pub mod library;
 pub mod persistence;
 pub mod probes;
@@ -35,6 +36,9 @@ pub mod scan_gate;
 pub mod stream_copies;
 pub mod streaming;
 pub mod thumbnails;
+
+#[cfg(not(debug_assertions))]
+mod frontend_assets;
 
 use clock::{AuthoritativePlaybackClock, format_timestamp, round_to};
 use library::{LibraryConfig, LibraryService};
@@ -268,6 +272,7 @@ pub async fn load_state_with_library(
         ffmpeg_command: library_config
             .ffmpeg_command()
             .map(std::path::Path::to_path_buf),
+        hw_accel: library_config.hw_accel().clone(),
         ..StreamCopyConfig::default()
     }
     .with_env_overrides();
@@ -278,6 +283,7 @@ pub async fn load_state_with_library(
         ffmpeg_command: library_config
             .ffmpeg_command()
             .map(std::path::Path::to_path_buf),
+        hw_accel: library_config.hw_accel().clone(),
         ..ThumbnailConfig::default()
     }
     .with_env_overrides();
@@ -371,7 +377,7 @@ pub async fn seeded_state() -> AppState {
 }
 
 pub fn build_app(state: AppState) -> Router {
-    Router::new()
+    let app = Router::new()
         .route("/api/health", get(health))
         .route("/api/library", get(list_library))
         .route("/api/library/scan", post(scan_library))
@@ -395,9 +401,21 @@ pub fn build_app(state: AppState) -> Router {
         .route("/api/media/{media_id}/thumbnail", get(stream_thumbnail))
         .route("/api/rooms", get(list_rooms).post(create_room))
         .route("/api/rooms/{room_id}/ws", get(connect_room_socket))
-        .with_state(state)
+        .with_state(state);
+
+    add_frontend_fallback(app)
         .layer(build_cors())
         .layer(TraceLayer::new_for_http())
+}
+
+#[cfg(not(debug_assertions))]
+fn add_frontend_fallback(app: Router) -> Router {
+    app.fallback(frontend_assets::serve)
+}
+
+#[cfg(debug_assertions)]
+fn add_frontend_fallback(app: Router) -> Router {
+    app
 }
 
 fn build_cors() -> CorsLayer {

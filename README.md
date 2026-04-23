@@ -35,6 +35,7 @@ Room and playback state now persist in SQLite. Set `SYNCPLAY_DATABASE_PATH=/path
 Set `SYNCPLAY_LIBRARY_ROOTS=/media/movies:/media/shows` to configure one or more library roots for indexing on Unix-like systems.
 Set `SYNCPLAY_FFPROBE_BIN=/usr/local/bin/ffprobe` to override the probe binary used for media metadata extraction.
 Set `SYNCPLAY_FFMPEG_BIN=/usr/local/bin/ffmpeg` (or empty to disable) to control the binary used for thumbnail generation, and `SYNCPLAY_THUMBNAIL_DIR=/var/lib/syncplay/thumbnails` to choose where generated thumbnails are cached on disk.
+Set `SYNCPLAY_HW_ACCEL=nvenc|vaapi|qsv|videotoolbox|auto|none` to enable FFmpeg hardware acceleration for video-heavy paths. VAAPI uses `SYNCPLAY_VAAPI_DEVICE=/dev/dri/renderD128` by default.
 
 ### Frontend
 
@@ -45,6 +46,21 @@ npm run dev
 ```
 
 The Vite dev server listens on `http://127.0.0.1:5173` and proxies `/api` requests to the backend.
+
+### Release binary
+
+Release builds embed the compiled frontend assets into the backend binary:
+
+```bash
+cd frontend
+npm install
+npm run build
+
+cd ../backend
+cargo build --release
+```
+
+The release binary serves the SPA from the backend origin, for example `http://127.0.0.1:3001/`, while keeping `/api/...` reserved for API routes.
 
 ## Current endpoints
 
@@ -101,4 +117,3 @@ Those tests also cover restart recovery against a real SQLite database, repeated
 
 - Add room-selected media so the synchronized player is tied to room state instead of a local preview choice
 - Add browser tests for two-tab pause/play/seek behavior with the real player
-- Add optional HLS transcoding for formats browsers cannot direct-play

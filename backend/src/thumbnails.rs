@@ -37,6 +37,7 @@ use uuid::Uuid;
 
 use crate::{
     clock::format_timestamp,
+    ffmpeg::{FfmpegHardwareAcceleration, apply_input_acceleration},
     persistence::{PendingThumbnail, Persistence},
     scan_gate::ScanGate,
 };
@@ -54,6 +55,7 @@ const SIDECAR_BASENAMES: &[&str] = &["poster", "cover", "folder"];
 pub struct ThumbnailConfig {
     pub cache_dir: Option<PathBuf>,
     pub ffmpeg_command: Option<PathBuf>,
+    pub hw_accel: FfmpegHardwareAcceleration,
     pub max_concurrent: usize,
 }
 
@@ -62,6 +64,7 @@ impl Default for ThumbnailConfig {
         Self {
             cache_dir: Some(default_thumbnail_cache_dir()),
             ffmpeg_command: default_ffmpeg_command(),
+            hw_accel: FfmpegHardwareAcceleration::None,
             max_concurrent: DEFAULT_WORKERS,
         }
     }
@@ -128,6 +131,7 @@ impl ThumbnailWorkerPool {
             workers = config.max_concurrent,
             cache_dir = ?config.cache_dir,
             ffmpeg = ?config.ffmpeg_command,
+            hw_accel = ?config.hw_accel,
             "thumbnail worker pool starting"
         );
         let config = Arc::new(config);
@@ -139,11 +143,10 @@ impl ThumbnailWorkerPool {
                     media_path = %job.media_path.display(),
                     "thumbnail job dequeued; awaiting worker permit"
                 );
-                // Pause new thumbnail work while any foreground HLS session
-                // is active — same rationale as the probe pool. Thumbnail
-                // generation also invokes ffmpeg and reads from the library
-                // mount, so running it concurrently with playback can starve
-                // the user-facing transcoder. See `scan_gate` for details.
+                // Pause new thumbnail work while foreground playback or
+                // preparation owns the library mount. Thumbnail generation
+                // also invokes ffmpeg, so it can otherwise starve the
+                // user-facing transcoder. See `scan_gate` for details.
                 scan_gate.wait_idle().await;
                 let permit = match Arc::clone(&semaphore).acquire_owned().await {
                     Ok(permit) => permit,
@@ -368,7 +371,15 @@ async fn generate(job: &ThumbnailJob, config: &ThumbnailConfig) -> ThumbnailOutc
         "trying frame extraction source"
     );
     let started = Instant::now();
-    match render_from_frame(ffmpeg, &job.media_path, &output_path, job.duration_seconds).await {
+    match render_from_frame(
+        ffmpeg,
+        &job.media_path,
+        &output_path,
+        job.duration_seconds,
+        &config.hw_accel,
+    )
+    .await
+    {
         Ok(()) => {
             debug!(
                 media_id = %job.media_id,
@@ -435,16 +446,17 @@ async fn render_from_frame(
     media_path: &Path,
     output: &Path,
     duration_seconds: Option<f64>,
+    hw_accel: &FfmpegHardwareAcceleration,
 ) -> Result<(), String> {
     let seek = thumbnail_seek_seconds(duration_seconds);
     // `thumbnail=100` scores the next 100 frames after the seek and picks
     // the most representative one. We intentionally sample later in the
     // file so episodic content doesn't collapse onto the same opening
     // credits frame across a whole season.
-    let result = Command::new(ffmpeg)
-        .arg("-y")
-        .arg("-loglevel")
-        .arg("error")
+    let mut command = Command::new(ffmpeg);
+    command.arg("-y").arg("-loglevel").arg("error");
+    apply_input_acceleration(&mut command, hw_accel);
+    let result = command
         .arg("-ss")
         .arg(format!("{seek:.3}"))
         .arg("-i")

@@ -18,6 +18,10 @@ use uuid::Uuid;
 
 use crate::{
     clock::format_timestamp,
+    ffmpeg::{
+        FfmpegHardwareAcceleration, apply_input_acceleration,
+        apply_input_acceleration_with_hw_frames,
+    },
     library::{LibraryService, is_browser_safe_video_codec},
     persistence::{PendingStreamCopy, Persistence, StreamCopyRecord, stream_copy_summary_for},
     protocol::{
@@ -48,6 +52,7 @@ struct FfmpegProgressBlock {
 pub struct StreamCopyConfig {
     pub cache_dir: Option<PathBuf>,
     pub ffmpeg_command: Option<PathBuf>,
+    pub hw_accel: FfmpegHardwareAcceleration,
     pub max_concurrent: usize,
 }
 
@@ -56,6 +61,7 @@ impl Default for StreamCopyConfig {
         Self {
             cache_dir: Some(default_stream_copy_cache_dir()),
             ffmpeg_command: Some(PathBuf::from("ffmpeg")),
+            hw_accel: FfmpegHardwareAcceleration::None,
             max_concurrent: DEFAULT_WORKERS,
         }
     }
@@ -108,6 +114,7 @@ impl StreamCopyWorkerPool {
         info!(
             workers = config.max_concurrent,
             ffmpeg = ?config.ffmpeg_command,
+            hw_accel = ?config.hw_accel,
             cache_dir = ?config.cache_dir,
             "stream copy worker pool starting"
         );
@@ -231,7 +238,16 @@ async fn process_job(
     };
 
     let started = Instant::now();
-    match build_stream_copy(&media_item, &copy, cache_dir, ffmpeg_command, progress).await {
+    match build_stream_copy(
+        &media_item,
+        &copy,
+        cache_dir,
+        ffmpeg_command,
+        &config.hw_accel,
+        progress,
+    )
+    .await
+    {
         Ok(outcome) => {
             let now = format_timestamp(time::OffsetDateTime::now_utc());
             clear_progress(progress, media_id).await;
@@ -283,6 +299,7 @@ async fn build_stream_copy(
     copy: &StreamCopyRecord,
     cache_dir: &Path,
     ffmpeg_command: &Path,
+    hw_accel: &FfmpegHardwareAcceleration,
     progress: &SharedStreamCopyProgress,
 ) -> Result<StreamCopyOutcome, String> {
     let media_path = crate::streaming::resolve_media_path(media_item);
@@ -319,6 +336,7 @@ async fn build_stream_copy(
         &temp_output_path,
         selected_audio_index,
         burned_filter.as_deref(),
+        hw_accel,
         progress,
     )
     .await?;
@@ -435,9 +453,28 @@ async fn run_ffmpeg_stream_copy(
     output_path: &Path,
     selected_audio_index: Option<u32>,
     burned_filter: Option<&str>,
+    hw_accel: &FfmpegHardwareAcceleration,
     progress: &SharedStreamCopyProgress,
 ) -> Result<(), String> {
     let has_video = media_item.video_codec.is_some();
+    let browser_safe_video = media_item
+        .video_codec
+        .as_deref()
+        .map(|codec| {
+            is_browser_safe_video_codec(
+                codec,
+                media_item.video_profile.as_deref(),
+                media_item.video_pix_fmt.as_deref(),
+                media_item.video_level,
+                media_item.video_bit_depth,
+            )
+        })
+        .unwrap_or(false);
+    let transcodes_video = has_video && !(browser_safe_video && burned_filter.is_none());
+    let burned_subtitles_use_cuda_bridge =
+        burned_filter.is_some() && matches!(hw_accel, FfmpegHardwareAcceleration::Nvenc);
+    let can_use_input_hwaccel =
+        transcodes_video && (burned_filter.is_none() || burned_subtitles_use_cuda_bridge);
     let mut command = Command::new(ffmpeg_command);
     command
         .arg("-y")
@@ -447,10 +484,17 @@ async fn run_ffmpeg_stream_copy(
         .arg("-progress")
         .arg("pipe:1")
         .arg("-nostdin")
-        .arg("-i")
-        .arg(media_path)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+
+    if can_use_input_hwaccel {
+        if burned_subtitles_use_cuda_bridge {
+            apply_input_acceleration_with_hw_frames(&mut command, hw_accel);
+        } else {
+            apply_input_acceleration(&mut command, hw_accel);
+        }
+    }
+    command.arg("-i").arg(media_path);
 
     if has_video {
         command.arg("-map").arg("0:v:0?");
@@ -467,30 +511,18 @@ async fn run_ffmpeg_stream_copy(
     }
 
     if has_video {
-        let browser_safe_video = media_item
-            .video_codec
-            .as_deref()
-            .map(|codec| {
-                is_browser_safe_video_codec(
-                    codec,
-                    media_item.video_profile.as_deref(),
-                    media_item.video_pix_fmt.as_deref(),
-                    media_item.video_level,
-                    media_item.video_bit_depth,
-                )
-            })
-            .unwrap_or(false);
-        if browser_safe_video && burned_filter.is_none() {
+        if !transcodes_video {
             command.arg("-c:v").arg("copy");
         } else {
-            command
-                .arg("-c:v")
-                .arg("libx264")
-                .arg("-preset")
-                .arg("veryfast")
-                .arg("-pix_fmt")
-                .arg("yuv420p");
-            if let Some(filter) = burned_filter {
+            command.arg("-c:v").arg(hw_accel.h264_encoder());
+            if hw_accel.uses_software_h264_encoder() {
+                command
+                    .arg("-preset")
+                    .arg("veryfast")
+                    .arg("-pix_fmt")
+                    .arg("yuv420p");
+            }
+            if let Some(filter) = hw_accel.h264_filter(burned_filter) {
                 command.arg("-vf").arg(filter);
             }
         }
@@ -717,8 +749,8 @@ fn resolve_sidecar_subtitle_path(media_item: &MediaItem, track: &SubtitleTrack) 
 fn escape_subtitles_path(path: &Path) -> String {
     path.to_string_lossy()
         .replace('\\', "\\\\")
-        .replace(':', "\\:")
-        .replace('\'', "\\'")
+        .replace(':', r"\\:")
+        .replace('\'', r"\\\'")
         .replace('[', "\\[")
         .replace(']', "\\]")
         .replace(',', "\\,")
@@ -772,7 +804,8 @@ fn temp_path_for_final(final_path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::temp_path_for_final;
+    use super::{escape_subtitles_path, temp_path_for_final};
+    use crate::ffmpeg::FfmpegHardwareAcceleration;
     use std::path::Path;
 
     #[test]
@@ -797,5 +830,49 @@ mod tests {
     fn temp_path_falls_back_when_no_extension_exists() {
         let temp = temp_path_for_final(Path::new("/tmp/output"));
         assert_eq!(temp, Path::new("/tmp/output.tmp"));
+    }
+
+    #[test]
+    fn subtitles_filter_path_escape_preserves_apostrophes_and_options() {
+        let escaped = escape_subtitles_path(Path::new("/tmp/You're an Akiba Maid: v3, [test].mkv"));
+
+        assert_eq!(
+            escaped,
+            r"/tmp/You\\\'re an Akiba Maid\\: v3\, \[test\].mkv"
+        );
+        assert_eq!(
+            format!("subtitles={escaped}:si=1"),
+            r"subtitles=/tmp/You\\\'re an Akiba Maid\\: v3\, \[test\].mkv:si=1"
+        );
+    }
+
+    #[test]
+    fn burned_subtitles_do_not_use_input_hwaccel() {
+        let transcodes_video = true;
+        let burned_filter = Some("subtitles=/tmp/movie.mkv:si=1");
+        let burned_subtitles_use_cuda_bridge = burned_filter.is_some()
+            && matches!(
+                FfmpegHardwareAcceleration::None,
+                FfmpegHardwareAcceleration::Nvenc
+            );
+        let can_use_input_hwaccel =
+            transcodes_video && (burned_filter.is_none() || burned_subtitles_use_cuda_bridge);
+
+        assert!(!can_use_input_hwaccel);
+    }
+
+    #[test]
+    fn burned_subtitles_can_use_input_hwaccel_with_nvenc() {
+        let transcodes_video = true;
+        let burned_filter = Some("subtitles=/tmp/movie.mkv:si=1");
+        let burned_subtitles_use_cuda_bridge = burned_filter.is_some()
+            && matches!(
+                FfmpegHardwareAcceleration::Nvenc,
+                FfmpegHardwareAcceleration::Nvenc
+            );
+        let can_use_input_hwaccel =
+            transcodes_video && (burned_filter.is_none() || burned_subtitles_use_cuda_bridge);
+
+        assert!(can_use_input_hwaccel);
     }
 }

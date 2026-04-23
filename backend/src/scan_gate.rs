@@ -1,5 +1,5 @@
 //! Coordination primitive that pauses background I/O work (library probes,
-//! thumbnail generation) while any foreground HLS playback session is active.
+//! thumbnail generation) while any foreground playback/preparation work is active.
 //!
 //! ## Why this exists
 //!
@@ -7,8 +7,8 @@
 //! share (SMB / NFS / sshfs; see `CLAUDE.md`). Concurrent ffprobe invocations
 //! against a high-latency mount can saturate its read bandwidth — we've seen
 //! individual probes take 18–38 seconds under contention — and when that
-//! happens while the user is trying to watch something, the HLS ffmpeg gets
-//! starved. The symptom was "playback still buffering": stats showed
+//! happens while the user is trying to watch something, the foreground ffmpeg
+//! gets starved. The symptom was "playback still buffering": stats showed
 //! `time=…` freezing for 10+ seconds at a stretch while four concurrent
 //! probes hammered the mount, even for a pure `-c:v copy -c:a copy` remux
 //! that should otherwise be bounded only by disk read speed.
@@ -37,8 +37,8 @@ use tokio::sync::watch;
 use tracing::{debug, info};
 
 /// Cheap-to-clone handle to the shared gate. Clone it into every background
-/// worker that should pause for foreground playback, and into the HLS session
-/// manager (which holds guards).
+/// worker that should pause for foreground playback/preparation, and into any
+/// foreground owner that should hold the gate.
 #[derive(Clone, Debug)]
 pub struct ScanGate {
     tx: Arc<watch::Sender<u32>>,

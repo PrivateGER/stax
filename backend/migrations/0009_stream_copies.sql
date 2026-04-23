@@ -1,6 +1,6 @@
 UPDATE media_items
 SET playback_mode = 'needsPreparation'
-WHERE playback_mode IN ('hlsRemux', 'hlsAudioTranscode', 'hlsFullTranscode');
+WHERE playback_mode NOT IN ('direct', 'needsPreparation', 'unsupported');
 
 CREATE TABLE IF NOT EXISTS stream_copies (
     media_id            TEXT    NOT NULL PRIMARY KEY,

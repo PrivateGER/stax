@@ -20,6 +20,7 @@ use uuid::Uuid;
 
 use crate::{
     clock::{format_timestamp, round_to},
+    ffmpeg::FfmpegHardwareAcceleration,
     persistence::{
         CachedMediaRecord, CachedProbeFields, LibrarySnapshot, Persistence, PersistenceError,
         ProbeOutcome, WalkRecord,
@@ -47,6 +48,7 @@ pub struct LibraryConfig {
     root_paths: Vec<PathBuf>,
     probe_command: Option<PathBuf>,
     ffmpeg_command: Option<PathBuf>,
+    hw_accel: FfmpegHardwareAcceleration,
     thumbnail_cache_dir: Option<PathBuf>,
     stream_copy_cache_dir: Option<PathBuf>,
     probe_workers: usize,
@@ -119,6 +121,7 @@ impl Default for LibraryConfig {
             root_paths: Vec::new(),
             probe_command: default_probe_command(),
             ffmpeg_command: default_ffmpeg_command(),
+            hw_accel: FfmpegHardwareAcceleration::None,
             thumbnail_cache_dir: Some(default_thumbnail_cache_dir()),
             stream_copy_cache_dir: Some(default_stream_copy_cache_dir()),
             probe_workers: DEFAULT_PROBE_WORKERS,
@@ -135,6 +138,7 @@ impl LibraryConfig {
         };
         config.probe_command = probe_command_from_env();
         config.ffmpeg_command = ffmpeg_command_from_env();
+        config.hw_accel = FfmpegHardwareAcceleration::from_env();
         config.thumbnail_cache_dir = thumbnail_cache_dir_from_env();
         config.stream_copy_cache_dir = stream_copy_cache_dir_from_env();
         config.probe_workers = probe_workers_from_env();
@@ -155,6 +159,7 @@ impl LibraryConfig {
             root_paths: normalized,
             probe_command: default_probe_command(),
             ffmpeg_command: default_ffmpeg_command(),
+            hw_accel: FfmpegHardwareAcceleration::None,
             thumbnail_cache_dir: Some(default_thumbnail_cache_dir()),
             stream_copy_cache_dir: Some(default_stream_copy_cache_dir()),
             probe_workers: DEFAULT_PROBE_WORKERS,
@@ -192,6 +197,15 @@ impl LibraryConfig {
 
     pub fn ffmpeg_command(&self) -> Option<&Path> {
         self.ffmpeg_command.as_deref()
+    }
+
+    pub fn with_hw_accel(mut self, hw_accel: FfmpegHardwareAcceleration) -> Self {
+        self.hw_accel = hw_accel;
+        self
+    }
+
+    pub fn hw_accel(&self) -> &FfmpegHardwareAcceleration {
+        &self.hw_accel
     }
 
     pub fn with_thumbnail_cache_dir(mut self, path: impl Into<PathBuf>) -> Self {
@@ -241,6 +255,10 @@ impl LibraryService {
 
     pub fn ffmpeg_command(&self) -> Option<&Path> {
         self.config.ffmpeg_command()
+    }
+
+    pub fn hw_accel(&self) -> &FfmpegHardwareAcceleration {
+        self.config.hw_accel()
     }
 
     pub async fn sync_config(&self) -> Result<(), PersistenceError> {

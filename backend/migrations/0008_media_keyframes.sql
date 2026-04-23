@@ -1,6 +1,6 @@
--- Source-video keyframe PTS offsets for HLS copy-mode segmentation.
+-- Source-video keyframe PTS offsets for legacy segmented playback experiments.
 -- Populated by the background probe pool immediately after the main
--- ffprobe; consumed by the HLS session to build a segment plan that
+-- ffprobe; consumed by older playback preparation code to build a segment plan that
 -- lands every segment boundary on a source keyframe (otherwise we
 -- can't start a new fMP4 chunk without re-encoding).
 --
