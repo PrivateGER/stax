@@ -103,7 +103,19 @@ impl TestServer {
     }
 
     async fn seeded_room(&self) -> Room {
-        self.rooms().await.rooms.into_iter().next().unwrap()
+        self.client
+            .post(format!("{}/api/rooms", self.base_url))
+            .json(&serde_json::json!({
+                "name": "Test Room"
+            }))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
     }
 
     async fn library(&self) -> LibraryResponse {
@@ -550,10 +562,7 @@ async fn room_listing_is_sorted_alphabetically() {
         .map(|room| room.name)
         .collect::<Vec<_>>();
 
-    assert_eq!(
-        names,
-        vec!["Alpha Night", "Friday Watch Party", "Zulu Night"]
-    );
+    assert_eq!(names, vec!["Alpha Night", "Zulu Night"]);
 }
 
 #[tokio::test]
@@ -1048,7 +1057,7 @@ async fn concurrent_room_creation_returns_unique_rooms_and_preserves_all_entries
 
     let listed_rooms = server.rooms().await.rooms;
 
-    assert_eq!(listed_rooms.len(), room_names.len() + 1);
+    assert_eq!(listed_rooms.len(), room_names.len());
 
     for room_name in room_names {
         assert!(listed_rooms.iter().any(|room| room.name == room_name));
@@ -1056,23 +1065,14 @@ async fn concurrent_room_creation_returns_unique_rooms_and_preserves_all_entries
 }
 
 #[tokio::test]
-async fn persistent_startup_seeds_preview_room_only_once() {
+async fn startup_does_not_seed_preview_room() {
     let temp_dir = TempDir::new().unwrap();
     let database_path = temp_dir.path().join("syncplay.db");
 
-    let first_server = TestServer::spawn_persistent(&database_path).await;
-    let first_rooms = first_server.rooms().await.rooms;
+    let server = TestServer::spawn_persistent(&database_path).await;
+    let rooms = server.rooms().await.rooms;
 
-    assert_eq!(first_rooms.len(), 1);
-    assert_eq!(first_rooms[0].name, "Friday Watch Party");
-
-    drop(first_server);
-
-    let second_server = TestServer::spawn_persistent(&database_path).await;
-    let second_rooms = second_server.rooms().await.rooms;
-
-    assert_eq!(second_rooms.len(), 1);
-    assert_eq!(second_rooms[0].name, "Friday Watch Party");
+    assert!(rooms.is_empty());
 }
 
 #[tokio::test]

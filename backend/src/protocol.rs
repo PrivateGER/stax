@@ -90,6 +90,9 @@ pub enum ClientSocketMessage {
         position_seconds: f64,
         client_one_way_ms: Option<u32>,
     },
+    SelectMedia {
+        media_id: Uuid,
+    },
     ReportPosition {
         position_seconds: f64,
     },
@@ -113,6 +116,10 @@ pub enum ServerEvent {
         room: Room,
         actor: String,
         action: PlaybackAction,
+    },
+    MediaChanged {
+        room: Room,
+        actor: String,
     },
     PresenceChanged {
         room_id: Uuid,

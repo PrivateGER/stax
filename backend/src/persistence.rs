@@ -310,6 +310,22 @@ impl Persistence {
         Ok(())
     }
 
+    pub(crate) async fn delete_room(&self, room_id: Uuid) -> Result<bool, PersistenceError> {
+        // FK cascade on playback_sessions.room_id drops the matching
+        // checkpoint row in the same statement.
+        let result = sqlx::query(
+            r#"
+            DELETE FROM rooms
+            WHERE id = ?1
+            "#,
+        )
+        .bind(room_id.to_string())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
     pub(crate) async fn load_library_snapshot(&self) -> Result<LibrarySnapshot, PersistenceError> {
         let root_rows = sqlx::query(
             r#"

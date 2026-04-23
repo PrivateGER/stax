@@ -5,6 +5,7 @@ use std::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
+    time::Duration,
 };
 
 use axum::{
@@ -18,7 +19,10 @@ use axum::{
     routing::{get, post},
 };
 use time::{Duration as TimeDuration, OffsetDateTime};
-use tokio::sync::{RwLock, broadcast};
+use tokio::{
+    sync::{Mutex as TokioMutex, RwLock, broadcast, mpsc},
+    task::JoinHandle,
+};
 use tower_http::{
     compression::{
         CompressionLayer,
@@ -66,6 +70,10 @@ type SharedRooms = Arc<RwLock<HashMap<Uuid, SharedRoom>>>;
 type SharedRoom = Arc<RoomHub>;
 
 const ROOM_EVENT_BUFFER: usize = 64;
+/// Grace period before a room with no connected clients is deleted.
+/// Tolerates brief reconnects (refresh, network blip) without destroying
+/// a session.
+const EMPTY_ROOM_GRACE: Duration = Duration::from_secs(120);
 
 #[derive(Clone)]
 pub struct AppState {
@@ -75,14 +83,18 @@ pub struct AppState {
     stream_copies: StreamCopyWorkerPool,
     thumbnails: ThumbnailWorkerPool,
     probes: ProbeWorkerPool,
+    cleanup_tx: mpsc::UnboundedSender<Uuid>,
 }
 
 #[derive(Debug)]
 struct RoomHub {
     room: RwLock<RoomRecord>,
     persistence: Persistence,
+    library: LibraryService,
     connection_count: AtomicUsize,
     events: broadcast::Sender<ServerEvent>,
+    cleanup_tx: mpsc::UnboundedSender<Uuid>,
+    cleanup_task: TokioMutex<Option<JoinHandle<()>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -101,14 +113,22 @@ enum SocketDispatch {
 }
 
 impl RoomHub {
-    fn new(room: RoomRecord, persistence: Persistence) -> Self {
+    fn new(
+        room: RoomRecord,
+        persistence: Persistence,
+        library: LibraryService,
+        cleanup_tx: mpsc::UnboundedSender<Uuid>,
+    ) -> Self {
         let (events, _) = broadcast::channel(ROOM_EVENT_BUFFER);
 
         Self {
             room: RwLock::new(room),
             persistence,
+            library,
             connection_count: AtomicUsize::new(0),
             events,
+            cleanup_tx,
+            cleanup_task: TokioMutex::new(None),
         }
     }
 
@@ -124,13 +144,40 @@ impl RoomHub {
         self.connection_count.load(Ordering::Relaxed)
     }
 
-    fn join(&self) -> usize {
-        self.connection_count.fetch_add(1, Ordering::Relaxed) + 1
+    async fn join(self: &Arc<Self>) -> usize {
+        let count = self.connection_count.fetch_add(1, Ordering::Relaxed) + 1;
+        // A join cancels any pending empty-room cleanup — somebody's back
+        // before the grace period expired.
+        if let Some(handle) = self.cleanup_task.lock().await.take() {
+            handle.abort();
+        }
+        count
     }
 
-    fn leave(&self) -> usize {
+    async fn leave(self: &Arc<Self>) -> usize {
         let previous = self.connection_count.fetch_sub(1, Ordering::Relaxed);
-        previous.saturating_sub(1)
+        let count = previous.saturating_sub(1);
+        if count == 0 {
+            self.schedule_cleanup().await;
+        }
+        count
+    }
+
+    async fn schedule_cleanup(self: &Arc<Self>) {
+        let mut guard = self.cleanup_task.lock().await;
+        if let Some(handle) = guard.take() {
+            handle.abort();
+        }
+        let room_id = self.room.read().await.id;
+        let tx = self.cleanup_tx.clone();
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(EMPTY_ROOM_GRACE).await;
+            // The receiver task double-checks connection_count before
+            // deleting, so a race with a late join after this send is
+            // harmless.
+            let _ = tx.send(room_id);
+        });
+        *guard = Some(handle);
     }
 
     fn broadcast(&self, event: ServerEvent) {
@@ -142,6 +189,13 @@ impl RoomHub {
         command: ClientSocketMessage,
         actor: &str,
     ) -> Result<SocketDispatch, &'static str> {
+        // SelectMedia needs to resolve the incoming media id against the
+        // library before touching room state, so it owns its own write-lock
+        // path instead of sharing the clone/swap pattern below.
+        if let ClientSocketMessage::SelectMedia { media_id } = command {
+            return self.apply_select_media(media_id, actor).await;
+        }
+
         let now = OffsetDateTime::now_utc();
         let mut room = self.room.write().await;
         let mut updated_room = room.clone();
@@ -198,6 +252,11 @@ impl RoomHub {
                     action: PlaybackAction::Seek,
                 })
             }
+            ClientSocketMessage::SelectMedia { .. } => {
+                // Handled above; this branch only exists so the match stays
+                // exhaustive.
+                unreachable!("SelectMedia is handled before the main match");
+            }
             ClientSocketMessage::ReportPosition { position_seconds } => {
                 let reported_position_seconds = normalize_reported_position(position_seconds)?;
                 let drift = room.clock.report_drift(now, reported_position_seconds);
@@ -229,22 +288,45 @@ impl RoomHub {
 
         Ok(dispatch)
     }
+
+    async fn apply_select_media(
+        &self,
+        media_id: Uuid,
+        actor: &str,
+    ) -> Result<SocketDispatch, &'static str> {
+        let media_item = match self.library.media_item(media_id).await {
+            Ok(Some(item)) => item,
+            Ok(None) => return Err("Selected media is not in the library."),
+            Err(error) => {
+                warn!(%error, %media_id, "failed to load media for select");
+                return Err("Failed to load the selected media.");
+            }
+        };
+
+        let now = OffsetDateTime::now_utc();
+        let mut room = self.room.write().await;
+        let mut updated_room = room.clone();
+
+        updated_room.media_id = Some(media_item.id);
+        updated_room.media_title = Some(media_item.file_name.clone());
+        updated_room.clock = AuthoritativePlaybackClock::new_paused(now);
+
+        if let Err(error) = self.persistence.save_room(&updated_room).await {
+            warn!(%error, room_id = %updated_room.id, "failed to persist media selection");
+            return Err("Failed to persist room state.");
+        }
+
+        *room = updated_room.clone();
+        drop(room);
+
+        Ok(SocketDispatch::Broadcast(ServerEvent::MediaChanged {
+            room: updated_room.snapshot(now),
+            actor: actor.to_string(),
+        }))
+    }
 }
 
 impl RoomRecord {
-    fn seeded(name: &str, media_title: Option<&str>) -> Self {
-        let now = OffsetDateTime::now_utc();
-
-        Self {
-            id: Uuid::new_v4(),
-            name: name.to_string(),
-            media_id: None,
-            media_title: media_title.map(str::to_string),
-            created_at: format_timestamp(now),
-            clock: AuthoritativePlaybackClock::new_paused(now),
-        }
-    }
-
     fn new(
         name: String,
         media_id: Option<Uuid>,
@@ -363,28 +445,72 @@ pub async fn load_state_with_library(
         stream_copies.enqueue_pending(pending_stream_copies);
     }
 
-    let mut room_records = persistence.load_rooms().await?;
+    let room_records = persistence.load_rooms().await?;
 
-    if room_records.is_empty() {
-        let preview_room =
-            RoomRecord::seeded("Friday Watch Party", Some("The Grand Budapest Hotel"));
-        persistence.save_room(&preview_room).await?;
-        room_records.push(preview_room);
-    }
+    let (cleanup_tx, cleanup_rx) = mpsc::unbounded_channel::<Uuid>();
 
-    let rooms = room_records
+    let rooms: HashMap<Uuid, SharedRoom> = room_records
         .into_iter()
-        .map(|room| (room.id, Arc::new(RoomHub::new(room, persistence.clone()))))
+        .map(|room| {
+            (
+                room.id,
+                Arc::new(RoomHub::new(
+                    room,
+                    persistence.clone(),
+                    library.clone(),
+                    cleanup_tx.clone(),
+                )),
+            )
+        })
         .collect();
+    let rooms: SharedRooms = Arc::new(RwLock::new(rooms));
+
+    spawn_room_cleanup_task(rooms.clone(), persistence.clone(), cleanup_rx);
+    // Any room that was already empty at boot (process died while clients
+    // were elsewhere) should also fall under the cleanup timer.
+    {
+        let rooms_guard = rooms.read().await;
+        for hub in rooms_guard.values() {
+            hub.schedule_cleanup().await;
+        }
+    }
 
     Ok(AppState {
         library,
-        rooms: Arc::new(RwLock::new(rooms)),
+        rooms,
         persistence,
         stream_copies,
         thumbnails,
         probes,
+        cleanup_tx,
     })
+}
+
+fn spawn_room_cleanup_task(
+    rooms: SharedRooms,
+    persistence: Persistence,
+    mut cleanup_rx: mpsc::UnboundedReceiver<Uuid>,
+) {
+    tokio::spawn(async move {
+        while let Some(room_id) = cleanup_rx.recv().await {
+            let mut guard = rooms.write().await;
+            let Some(hub) = guard.get(&room_id) else {
+                continue;
+            };
+            if hub.connection_count() != 0 {
+                // Race: a client joined after the timer fired. Leave the
+                // room alone; a later leave-to-zero will reschedule.
+                continue;
+            }
+            guard.remove(&room_id);
+            drop(guard);
+            if let Err(error) = persistence.delete_room(room_id).await {
+                warn!(%error, %room_id, "failed to delete empty room");
+            } else {
+                tracing::info!(%room_id, "deleted empty room after grace period");
+            }
+        }
+    });
 }
 
 pub async fn seeded_state() -> AppState {
@@ -1114,10 +1240,16 @@ async fn create_room(
         ApiError::internal("Failed to persist room.")
     })?;
 
-    state.rooms.write().await.insert(
-        snapshot.id,
-        Arc::new(RoomHub::new(room, state.persistence.clone())),
-    );
+    let hub = Arc::new(RoomHub::new(
+        room,
+        state.persistence.clone(),
+        state.library.clone(),
+        state.cleanup_tx.clone(),
+    ));
+    // No clients yet, so the cleanup timer starts ticking immediately.
+    // A connecting client within 2 minutes cancels it.
+    hub.schedule_cleanup().await;
+    state.rooms.write().await.insert(snapshot.id, hub);
 
     Ok((StatusCode::CREATED, Json(snapshot)))
 }
@@ -1163,7 +1295,7 @@ async fn handle_room_socket(
     client_name: String,
 ) {
     let mut room_events = room.subscribe();
-    let connection_count = room.join();
+    let connection_count = room.join().await;
     let snapshot = room.snapshot().await;
 
     if send_server_event(
@@ -1176,7 +1308,7 @@ async fn handle_room_socket(
     .await
     .is_err()
     {
-        room.leave();
+        room.leave().await;
         return;
     }
 
@@ -1267,7 +1399,7 @@ async fn handle_room_socket(
         }
     }
 
-    let connection_count = room.leave();
+    let connection_count = room.leave().await;
 
     room.broadcast(ServerEvent::PresenceChanged {
         room_id,
@@ -1396,6 +1528,14 @@ mod tests {
         build_app(seeded_state().await)
     }
 
+    async fn test_room_hub(room: RoomRecord) -> (Arc<RoomHub>, mpsc::UnboundedReceiver<Uuid>) {
+        let persistence = Persistence::open_in_memory().await.unwrap();
+        let library = LibraryService::new(persistence.clone(), LibraryConfig::default());
+        let (cleanup_tx, cleanup_rx) = mpsc::unbounded_channel();
+        let hub = Arc::new(RoomHub::new(room, persistence, library, cleanup_tx));
+        (hub, cleanup_rx)
+    }
+
     #[tokio::test]
     async fn health_endpoint_returns_ok() {
         let response = test_app()
@@ -1464,17 +1604,19 @@ mod tests {
             .unwrap();
         let payload: RoomsResponse = serde_json::from_slice(&body).unwrap();
 
-        assert_eq!(payload.rooms.len(), 2);
+        assert_eq!(payload.rooms.len(), 1);
         assert!(payload.rooms.iter().any(|room| room.name == "Movie Lab"));
     }
 
     #[tokio::test]
     async fn report_position_returns_direct_correction_event() {
-        let persistence = Persistence::open_in_memory().await.unwrap();
-        let room = Arc::new(RoomHub::new(
-            RoomRecord::new("Test Room".into(), None, None, OffsetDateTime::now_utc()),
-            persistence,
-        ));
+        let (room, _cleanup_rx) = test_room_hub(RoomRecord::new(
+            "Test Room".into(),
+            None,
+            None,
+            OffsetDateTime::now_utc(),
+        ))
+        .await;
 
         let event = room
             .apply_socket_message(
@@ -1501,11 +1643,13 @@ mod tests {
 
     #[tokio::test]
     async fn pause_without_position_uses_elapsed_playback_time() {
-        let persistence = Persistence::open_in_memory().await.unwrap();
-        let room = Arc::new(RoomHub::new(
-            RoomRecord::new("Clock Room".into(), None, None, OffsetDateTime::now_utc()),
-            persistence,
-        ));
+        let (room, _cleanup_rx) = test_room_hub(RoomRecord::new(
+            "Clock Room".into(),
+            None,
+            None,
+            OffsetDateTime::now_utc(),
+        ))
+        .await;
 
         room.apply_socket_message(
             ClientSocketMessage::Play {
