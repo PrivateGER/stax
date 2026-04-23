@@ -18,10 +18,7 @@ use uuid::Uuid;
 
 use crate::{
     clock::format_timestamp,
-    ffmpeg::{
-        FfmpegHardwareAcceleration, apply_input_acceleration,
-        apply_input_acceleration_with_hw_frames,
-    },
+    ffmpeg::{FfmpegHardwareAcceleration, apply_input_acceleration},
     library::{LibraryService, is_browser_safe_video_codec},
     persistence::{PendingStreamCopy, Persistence, StreamCopyRecord, stream_copy_summary_for},
     protocol::{
@@ -471,10 +468,7 @@ async fn run_ffmpeg_stream_copy(
         })
         .unwrap_or(false);
     let transcodes_video = has_video && !(browser_safe_video && burned_filter.is_none());
-    let burned_subtitles_use_cuda_bridge =
-        burned_filter.is_some() && matches!(hw_accel, FfmpegHardwareAcceleration::Nvenc);
-    let can_use_input_hwaccel =
-        transcodes_video && (burned_filter.is_none() || burned_subtitles_use_cuda_bridge);
+    let can_use_input_hwaccel = should_use_input_hwaccel(transcodes_video, burned_filter);
     let mut command = Command::new(ffmpeg_command);
     command
         .arg("-y")
@@ -488,11 +482,7 @@ async fn run_ffmpeg_stream_copy(
         .stderr(Stdio::piped());
 
     if can_use_input_hwaccel {
-        if burned_subtitles_use_cuda_bridge {
-            apply_input_acceleration_with_hw_frames(&mut command, hw_accel);
-        } else {
-            apply_input_acceleration(&mut command, hw_accel);
-        }
+        apply_input_acceleration(&mut command, hw_accel);
     }
     command.arg("-i").arg(media_path);
 
@@ -577,6 +567,10 @@ async fn run_ffmpeg_stream_copy(
     }
 
     Ok(())
+}
+
+fn should_use_input_hwaccel(transcodes_video: bool, burned_filter: Option<&str>) -> bool {
+    transcodes_video && burned_filter.is_none()
 }
 
 async fn read_ffmpeg_progress(
@@ -804,8 +798,7 @@ fn temp_path_for_final(final_path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{escape_subtitles_path, temp_path_for_final};
-    use crate::ffmpeg::FfmpegHardwareAcceleration;
+    use super::{escape_subtitles_path, should_use_input_hwaccel, temp_path_for_final};
     use std::path::Path;
 
     #[test]
@@ -848,31 +841,16 @@ mod tests {
 
     #[test]
     fn burned_subtitles_do_not_use_input_hwaccel() {
-        let transcodes_video = true;
         let burned_filter = Some("subtitles=/tmp/movie.mkv:si=1");
-        let burned_subtitles_use_cuda_bridge = burned_filter.is_some()
-            && matches!(
-                FfmpegHardwareAcceleration::None,
-                FfmpegHardwareAcceleration::Nvenc
-            );
-        let can_use_input_hwaccel =
-            transcodes_video && (burned_filter.is_none() || burned_subtitles_use_cuda_bridge);
 
-        assert!(!can_use_input_hwaccel);
+        assert!(!should_use_input_hwaccel(true, burned_filter));
     }
 
     #[test]
-    fn burned_subtitles_can_use_input_hwaccel_with_nvenc() {
-        let transcodes_video = true;
+    fn stream_copies_without_burn_in_can_use_input_hwaccel() {
         let burned_filter = Some("subtitles=/tmp/movie.mkv:si=1");
-        let burned_subtitles_use_cuda_bridge = burned_filter.is_some()
-            && matches!(
-                FfmpegHardwareAcceleration::Nvenc,
-                FfmpegHardwareAcceleration::Nvenc
-            );
-        let can_use_input_hwaccel =
-            transcodes_video && (burned_filter.is_none() || burned_subtitles_use_cuda_bridge);
 
-        assert!(can_use_input_hwaccel);
+        assert!(!should_use_input_hwaccel(true, burned_filter));
+        assert!(should_use_input_hwaccel(true, None));
     }
 }

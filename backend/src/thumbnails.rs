@@ -350,11 +350,18 @@ async fn generate(job: &ThumbnailJob, config: &ThumbnailConfig) -> ThumbnailOutc
             };
         }
         Err(error) => {
-            debug!(
-                media_id = %job.media_id,
-                %error,
-                "no embedded attached_pic; falling through to frame extraction"
-            );
+            if is_missing_attached_pic_error(&error) {
+                debug!(
+                    media_id = %job.media_id,
+                    "no embedded attached_pic; falling through to frame extraction"
+                );
+            } else {
+                debug!(
+                    media_id = %job.media_id,
+                    %error,
+                    "embedded attached_pic extraction failed; falling through to frame extraction"
+                );
+            }
         }
     }
 
@@ -500,6 +507,10 @@ fn classify_ffmpeg_result(
         }
         Err(error) => Err(format!("ffmpeg could not start: {error}")),
     }
+}
+
+fn is_missing_attached_pic_error(error: &str) -> bool {
+    error.contains("matches no streams")
 }
 
 /// Look for sidecar art only in the media file's own directory. This keeps
@@ -672,5 +683,16 @@ mod tests {
         assert_eq!(thumbnail_seek_seconds(Some(1500.0)), 300.0);
         assert_eq!(thumbnail_seek_seconds(Some(0.0)), 0.0);
         assert_eq!(thumbnail_seek_seconds(None), 0.0);
+    }
+
+    #[test]
+    fn recognizes_missing_attached_pic_ffmpeg_error() {
+        assert!(is_missing_attached_pic_error(
+            "ffmpeg failed: Stream map '' matches no streams.\n\
+             To ignore this, add a trailing '?' to the map."
+        ));
+        assert!(!is_missing_attached_pic_error(
+            "ffmpeg failed: Invalid data found when processing input"
+        ));
     }
 }

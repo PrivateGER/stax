@@ -58,9 +58,7 @@ impl FfmpegHardwareAcceleration {
             // p010le for 10-bit sources and NVENC init fails with "Provided device
             // doesn't support required NVENC features".
             Self::Nvenc => Some(match base_filter {
-                Some(filter) => {
-                    format!("hwdownload,format=nv12,{filter},format=nv12,hwupload_cuda")
-                }
+                Some(filter) => format!("{filter},format=nv12"),
                 None => "format=nv12".to_string(),
             }),
             Self::Vaapi { .. } => Some(match base_filter {
@@ -160,15 +158,12 @@ mod tests {
     }
 
     #[test]
-    fn nvenc_h264_filter_bridges_subtitles_through_system_memory() {
+    fn nvenc_h264_filter_converts_software_filter_output() {
         let accel = FfmpegHardwareAcceleration::Nvenc;
 
         assert_eq!(
             accel.h264_filter(Some("subtitles=/tmp/movie.mkv:si=0")),
-            Some(
-                "hwdownload,format=nv12,subtitles=/tmp/movie.mkv:si=0,format=nv12,hwupload_cuda"
-                    .to_string()
-            )
+            Some("subtitles=/tmp/movie.mkv:si=0,format=nv12".to_string())
         );
         assert_eq!(accel.h264_filter(None), Some("format=nv12".to_string()));
     }
