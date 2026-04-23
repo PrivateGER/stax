@@ -360,6 +360,8 @@ pub struct MediaItem {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct LibraryResponse {
+    pub revision: u64,
+    pub has_pending_background_work: bool,
     pub roots: Vec<LibraryRoot>,
     pub items: Vec<MediaItem>,
 }
@@ -367,11 +369,20 @@ pub struct LibraryResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct LibraryScanResponse {
+    pub revision: u64,
+    pub has_pending_background_work: bool,
     pub roots: Vec<LibraryRoot>,
     pub items: Vec<MediaItem>,
     pub scanned_root_count: usize,
     pub indexed_item_count: usize,
     pub scanned_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryStatusResponse {
+    pub revision: u64,
+    pub has_pending_background_work: bool,
 }
 
 #[cfg(test)]

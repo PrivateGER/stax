@@ -30,6 +30,12 @@ pub(crate) struct LibrarySnapshot {
     pub items: Vec<MediaItem>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct LibraryStatusSnapshot {
+    pub revision: u64,
+    pub has_pending_background_work: bool,
+}
+
 /// Minimal media-item snapshot the thumbnail worker needs to schedule a job.
 /// Kept narrow on purpose so the worker pool doesn't pull the entire
 /// `MediaItem` shape (with its serialized stream/subtitle blobs) into memory
@@ -377,6 +383,63 @@ impl Persistence {
         })
     }
 
+    pub(crate) async fn load_library_status(
+        &self,
+    ) -> Result<LibraryStatusSnapshot, PersistenceError> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                revision,
+                EXISTS(
+                    SELECT 1
+                    FROM media_items
+                    WHERE probed_at IS NULL
+                      AND probe_error IS NULL
+                ) AS has_pending_probes,
+                EXISTS(
+                    SELECT 1
+                    FROM media_items
+                    WHERE thumbnail_generated_at IS NULL
+                      AND thumbnail_error IS NULL
+                      AND probed_at IS NOT NULL
+                      AND probe_error IS NULL
+                ) AS has_pending_thumbnails,
+                EXISTS(
+                    SELECT 1
+                    FROM stream_copies
+                    INNER JOIN media_items ON media_items.id = stream_copies.media_id
+                    WHERE stream_copies.source_size_bytes = media_items.size_bytes
+                      AND stream_copies.source_modified_at = media_items.modified_at
+                      AND stream_copies.status IN (?1, ?2)
+                ) AS has_pending_stream_copies
+            FROM library_state
+            WHERE singleton = 1
+            "#,
+        )
+        .bind(StreamCopyStatus::Queued.as_str())
+        .bind(StreamCopyStatus::Running.as_str())
+        .fetch_one(&self.pool)
+        .await?;
+
+        let revision = row.try_get::<i64, _>("revision")?;
+        if revision < 0 {
+            return Err(PersistenceError::InvalidData(format!(
+                "invalid stored library revision '{revision}'"
+            )));
+        }
+
+        let has_pending_probes = row.try_get::<i64, _>("has_pending_probes")? != 0;
+        let has_pending_thumbnails = row.try_get::<i64, _>("has_pending_thumbnails")? != 0;
+        let has_pending_stream_copies = row.try_get::<i64, _>("has_pending_stream_copies")? != 0;
+
+        Ok(LibraryStatusSnapshot {
+            revision: revision as u64,
+            has_pending_background_work: has_pending_probes
+                || has_pending_thumbnails
+                || has_pending_stream_copies,
+        })
+    }
+
     pub(crate) async fn find_media_item(
         &self,
         media_id: Uuid,
@@ -518,6 +581,7 @@ impl Persistence {
         .bind(&request.updated_at)
         .execute(&self.pool)
         .await?;
+        bump_library_revision(&self.pool).await?;
 
         Ok(())
     }
@@ -541,6 +605,7 @@ impl Persistence {
         .bind(media_id.to_string())
         .execute(&self.pool)
         .await?;
+        bump_library_revision(&self.pool).await?;
 
         Ok(())
     }
@@ -573,6 +638,7 @@ impl Persistence {
         .bind(media_id.to_string())
         .execute(&self.pool)
         .await?;
+        bump_library_revision(&self.pool).await?;
 
         Ok(())
     }
@@ -601,6 +667,7 @@ impl Persistence {
         .bind(media_id.to_string())
         .execute(&self.pool)
         .await?;
+        bump_library_revision(&self.pool).await?;
 
         Ok(())
     }
@@ -624,8 +691,10 @@ impl Persistence {
 
         let mut transaction = self.pool.begin().await?;
 
+        let mut changed = false;
+
         for path in configured_paths {
-            sqlx::query(
+            let result = sqlx::query(
                 r#"
                 INSERT INTO library_roots (path, created_at)
                 VALUES (?1, ?2)
@@ -636,6 +705,7 @@ impl Persistence {
             .bind(&now)
             .execute(&mut *transaction)
             .await?;
+            changed |= result.rows_affected() > 0;
         }
 
         for path in existing_paths {
@@ -643,7 +713,7 @@ impl Persistence {
                 continue;
             }
 
-            sqlx::query(
+            let result = sqlx::query(
                 r#"
                 DELETE FROM library_roots
                 WHERE path = ?1
@@ -652,6 +722,11 @@ impl Persistence {
             .bind(path)
             .execute(&mut *transaction)
             .await?;
+            changed |= result.rows_affected() > 0;
+        }
+
+        if changed {
+            bump_library_revision(&mut *transaction).await?;
         }
 
         transaction.commit().await?;
@@ -912,6 +987,7 @@ impl Persistence {
         .bind(subtitle_streams_json)
         .execute(&self.pool)
         .await?;
+        bump_library_revision(&self.pool).await?;
 
         Ok(())
     }
@@ -937,6 +1013,9 @@ impl Persistence {
             .bind(root_path)
             .execute(&self.pool)
             .await?;
+            if result.rows_affected() > 0 {
+                bump_library_revision(&self.pool).await?;
+            }
             return Ok(result.rows_affected() as usize);
         }
 
@@ -978,6 +1057,10 @@ impl Persistence {
             total_removed += result.rows_affected() as usize;
         }
 
+        if total_removed > 0 {
+            bump_library_revision(&self.pool).await?;
+        }
+
         Ok(total_removed)
     }
 
@@ -997,6 +1080,7 @@ impl Persistence {
         .bind(root_path)
         .execute(&self.pool)
         .await?;
+        bump_library_revision(&self.pool).await?;
 
         Ok(())
     }
@@ -1055,6 +1139,7 @@ impl Persistence {
         .bind(media_id.to_string())
         .execute(&self.pool)
         .await?;
+        bump_library_revision(&self.pool).await?;
 
         Ok(())
     }
@@ -1116,6 +1201,7 @@ impl Persistence {
         .bind(media_id.to_string())
         .execute(&self.pool)
         .await?;
+        bump_library_revision(&self.pool).await?;
 
         Ok(())
     }
@@ -1131,6 +1217,7 @@ impl Persistence {
             WHERE thumbnail_generated_at IS NULL
               AND thumbnail_error IS NULL
               AND probed_at IS NOT NULL
+              AND probe_error IS NULL
             ORDER BY root_path ASC, relative_path ASC
             "#,
         )
@@ -1219,10 +1306,29 @@ impl Persistence {
         .execute(&mut *transaction)
         .await?;
 
+        bump_library_revision(&mut *transaction).await?;
+
         transaction.commit().await?;
 
         Ok(())
     }
+}
+
+async fn bump_library_revision<'e, E>(executor: E) -> Result<(), sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = Sqlite>,
+{
+    sqlx::query(
+        r#"
+        UPDATE library_state
+        SET revision = revision + 1
+        WHERE singleton = 1
+        "#,
+    )
+    .execute(executor)
+    .await?;
+
+    Ok(())
 }
 
 impl fmt::Display for PersistenceError {

@@ -18,8 +18,9 @@ use syncplay_backend::{
     load_state, load_state_with_library,
     persistence::Persistence,
     protocol::{
-        CreateStreamCopyRequest, DriftCorrectionAction, LibraryResponse, LibraryScanResponse, Room,
-        RoomsResponse, ServerEvent, StreamCopyStatus, StreamCopySummary,
+        CreateStreamCopyRequest, DriftCorrectionAction, LibraryResponse, LibraryScanResponse,
+        LibraryStatusResponse, Room, RoomsResponse, ServerEvent, StreamCopyStatus,
+        StreamCopySummary,
     },
     seeded_state,
 };
@@ -131,6 +132,19 @@ impl TestServer {
             .unwrap()
     }
 
+    async fn library_status(&self) -> LibraryStatusResponse {
+        self.client
+            .get(format!("{}/api/library/status", self.base_url))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
+    }
+
     /// Poll `/api/library` until the predicate succeeds for the first item
     /// or the timeout elapses. Thumbnail generation is now backgrounded, so
     /// tests that previously read scan output synchronously have to wait
@@ -199,7 +213,9 @@ impl TestServer {
                 .items
                 .iter()
                 .filter(|item| {
-                    item.thumbnail_generated_at.is_none() && item.thumbnail_error.is_none()
+                    item.thumbnail_generated_at.is_none()
+                        && item.thumbnail_error.is_none()
+                        && item.probe_error.is_none()
                 })
                 .count();
             if probe_pending == 0 && thumb_pending == 0 {
@@ -209,6 +225,28 @@ impl TestServer {
                 panic!(
                     "library never settled: {probe_pending} probe pending, {thumb_pending} thumbnail pending"
                 );
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    async fn wait_for_library_status<F>(
+        &self,
+        timeout_duration: Duration,
+        mut predicate: F,
+    ) -> LibraryStatusResponse
+    where
+        F: FnMut(&LibraryStatusResponse) -> bool,
+    {
+        let deadline = std::time::Instant::now() + timeout_duration;
+        loop {
+            let status = self.library_status().await;
+            if predicate(&status) {
+                return status;
+            }
+
+            if std::time::Instant::now() >= deadline {
+                panic!("library status did not match predicate within {timeout_duration:?}");
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
@@ -728,6 +766,70 @@ exit 2
             .unwrap()
             .contains("synthetic ffprobe failure")
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn library_status_reports_revision_and_pending_background_work() {
+    let temp_dir = TempDir::new().unwrap();
+    let root = temp_dir.path().join("library");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("movie.mp4"), b"movie").unwrap();
+
+    let probe_script = write_probe_script(
+        &temp_dir,
+        "probe-slow.sh",
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+sleep 0.2
+cat <<'JSON'
+{
+  "format": { "format_name": "mov,mp4,m4a,3gp,3g2,mj2", "duration": "120.000" },
+  "streams": [
+    { "codec_type": "video", "codec_name": "h264", "width": 1920, "height": 1080 },
+    { "codec_type": "audio", "codec_name": "aac" }
+  ]
+}
+JSON
+"#,
+    );
+    let ffmpeg_stub = write_ffmpeg_stub(
+        &temp_dir,
+        "ffmpeg-ok.sh",
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+output="${!#}"
+printf 'STUBJPEG' > "$output"
+"#,
+    );
+    let cache_dir = temp_dir.path().join("thumbnails");
+
+    let config = LibraryConfig::from_paths(vec![root])
+        .with_probe_command(probe_script)
+        .with_ffmpeg_command(ffmpeg_stub)
+        .with_thumbnail_cache_dir(&cache_dir);
+    let server = TestServer::spawn_with_library_config(config).await;
+
+    let initial_status = server.library_status().await;
+    assert!(!initial_status.has_pending_background_work);
+
+    let scan = server.scan_library().await;
+    assert!(scan.revision > initial_status.revision);
+    assert!(scan.has_pending_background_work);
+
+    let in_progress = server.library_status().await;
+    assert!(in_progress.revision >= scan.revision);
+    assert!(in_progress.has_pending_background_work);
+
+    let settled_status = server
+        .wait_for_library_status(Duration::from_secs(5), |status| {
+            !status.has_pending_background_work && status.revision > scan.revision
+        })
+        .await;
+    let settled_library = server.library().await;
+
+    assert_eq!(settled_library.revision, settled_status.revision);
+    assert!(!settled_library.has_pending_background_work);
 }
 
 /// Builds a probe script that records every invocation by appending a

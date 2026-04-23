@@ -46,9 +46,9 @@ use persistence::{Persistence, PersistenceError, StreamCopyRecord, StreamCopyReq
 use probes::{ProbeConfig, ProbeJob, ProbeWorkerPool};
 use protocol::{
     ClientSocketMessage, CreateRoomRequest, CreateStreamCopyRequest, HealthResponse,
-    LibraryResponse, LibraryScanResponse, MediaItem, PlaybackAction, PlaybackMode, Room,
-    RoomSocketQuery, RoomsResponse, ServerEvent, StreamCopyStatus, StreamCopySummary, SubtitleMode,
-    SubtitleSourceKind, is_text_subtitle_codec,
+    LibraryResponse, LibraryScanResponse, LibraryStatusResponse, MediaItem, PlaybackAction,
+    PlaybackMode, Room, RoomSocketQuery, RoomsResponse, ServerEvent, StreamCopyStatus,
+    StreamCopySummary, SubtitleMode, SubtitleSourceKind, is_text_subtitle_codec,
 };
 use stream_copies::{StreamCopyConfig, StreamCopyJob, StreamCopyWorkerPool};
 use streaming::{
@@ -380,6 +380,7 @@ pub fn build_app(state: AppState) -> Router {
     let app = Router::new()
         .route("/api/health", get(health))
         .route("/api/library", get(list_library))
+        .route("/api/library/status", get(library_status))
         .route("/api/library/scan", post(scan_library))
         .route("/api/media/{media_id}/stream", get(stream_media))
         .route(
@@ -502,6 +503,15 @@ async fn list_library(State(state): State<AppState>) -> Result<Json<LibraryRespo
     state.library.snapshot().await.map(Json).map_err(|error| {
         warn!(%error, "failed to load library snapshot");
         ApiError::internal("Failed to load library.")
+    })
+}
+
+async fn library_status(
+    State(state): State<AppState>,
+) -> Result<Json<LibraryStatusResponse>, ApiError> {
+    state.library.status().await.map(Json).map_err(|error| {
+        warn!(%error, "failed to load library status");
+        ApiError::internal("Failed to load library status.")
     })
 }
 

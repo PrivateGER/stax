@@ -22,12 +22,12 @@ use crate::{
     clock::{format_timestamp, round_to},
     ffmpeg::FfmpegHardwareAcceleration,
     persistence::{
-        CachedMediaRecord, CachedProbeFields, LibrarySnapshot, Persistence, PersistenceError,
-        ProbeOutcome, WalkRecord,
+        CachedMediaRecord, CachedProbeFields, LibrarySnapshot, LibraryStatusSnapshot, Persistence,
+        PersistenceError, ProbeOutcome, WalkRecord,
     },
     protocol::{
-        AudioStream, LibraryResponse, LibraryScanResponse, MediaItem, PlaybackMode, SubtitleStream,
-        SubtitleTrack,
+        AudioStream, LibraryResponse, LibraryScanResponse, LibraryStatusResponse, MediaItem,
+        PlaybackMode, SubtitleStream, SubtitleTrack,
     },
     thumbnails::{
         default_ffmpeg_command, default_thumbnail_cache_dir, ffmpeg_command_from_env,
@@ -273,9 +273,16 @@ impl LibraryService {
     }
 
     pub async fn snapshot(&self) -> Result<LibraryResponse, PersistenceError> {
+        let status = self.persistence.load_library_status().await?;
         let snapshot = self.persistence.load_library_snapshot().await?;
 
-        Ok(snapshot.into_response())
+        Ok(snapshot.into_response(status))
+    }
+
+    pub async fn status(&self) -> Result<LibraryStatusResponse, PersistenceError> {
+        let status = self.persistence.load_library_status().await?;
+
+        Ok(status.into_response())
     }
 
     pub async fn media_item(&self, media_id: Uuid) -> Result<Option<MediaItem>, PersistenceError> {
@@ -341,11 +348,14 @@ impl LibraryService {
             }
         }
 
+        let status = self.persistence.load_library_status().await?;
         let snapshot = self.persistence.load_library_snapshot().await?;
         let indexed_item_count = snapshot.items.len();
         let scanned_root_count = snapshot.roots.len();
 
         Ok(LibraryScanResponse {
+            revision: status.revision,
+            has_pending_background_work: status.has_pending_background_work,
             roots: snapshot.roots,
             items: snapshot.items,
             scanned_root_count,
@@ -356,10 +366,21 @@ impl LibraryService {
 }
 
 impl LibrarySnapshot {
-    fn into_response(self) -> LibraryResponse {
+    fn into_response(self, status: LibraryStatusSnapshot) -> LibraryResponse {
         LibraryResponse {
+            revision: status.revision,
+            has_pending_background_work: status.has_pending_background_work,
             roots: self.roots,
             items: self.items,
+        }
+    }
+}
+
+impl LibraryStatusSnapshot {
+    fn into_response(self) -> LibraryStatusResponse {
+        LibraryStatusResponse {
+            revision: self.revision,
+            has_pending_background_work: self.has_pending_background_work,
         }
     }
 }

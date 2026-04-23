@@ -128,6 +128,8 @@ export type LibraryRoot = {
 };
 
 export type LibraryResponse = {
+  revision: number;
+  hasPendingBackgroundWork: boolean;
   roots: LibraryRoot[];
   items: MediaItem[];
 };
@@ -144,6 +146,11 @@ export type LibraryScanResponse = LibraryResponse & {
   scannedRootCount: number;
   indexedItemCount: number;
   scannedAt: string;
+};
+
+export type LibraryStatusResponse = {
+  revision: number;
+  hasPendingBackgroundWork: boolean;
 };
 
 export type SnapshotEvent = {

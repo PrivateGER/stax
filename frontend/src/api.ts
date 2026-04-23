@@ -3,6 +3,7 @@ import type {
   HealthResponse,
   LibraryResponse,
   LibraryScanResponse,
+  LibraryStatusResponse,
   Room,
   RoomsResponse,
   StreamCopySummary,
@@ -36,6 +37,7 @@ async function request<T>(url: string, options: RequestOptions = {}): Promise<T>
 export const api = {
   health: () => request<HealthResponse>("/api/health"),
   library: () => request<LibraryResponse>("/api/library"),
+  libraryStatus: () => request<LibraryStatusResponse>("/api/library/status"),
   rooms: () => request<RoomsResponse>("/api/rooms"),
 
   scan: () =>

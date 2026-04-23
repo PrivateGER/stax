@@ -11,6 +11,7 @@ import type {
   HealthResponse,
   LibraryRoot,
   MediaItem,
+  LibraryResponse,
   Room,
 } from "./types";
 
@@ -25,6 +26,8 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [scanning, setScanning] = useState(false);
   const [libraryError, setLibraryError] = useState<string | null>(null);
+  const [libraryRevision, setLibraryRevision] = useState(0);
+  const [hasPendingBackgroundWork, setHasPendingBackgroundWork] = useState(false);
   const [clientName, setClientNameState] = useState<string>(() => {
     if (typeof window === "undefined") return randomName();
     const stored = window.localStorage.getItem(CLIENT_NAME_KEY);
@@ -41,6 +44,13 @@ export default function App() {
     }
   }, []);
 
+  const applyLibraryResponse = useCallback((libraryResponse: LibraryResponse) => {
+    setLibraryRevision(libraryResponse.revision);
+    setHasPendingBackgroundWork(libraryResponse.hasPendingBackgroundWork);
+    setRoots(libraryResponse.roots);
+    setItems(libraryResponse.items);
+  }, []);
+
   const refresh = useCallback(async () => {
     setLoading(true);
     setLibraryError(null);
@@ -53,8 +63,7 @@ export default function App() {
       ]);
 
       setHealth(healthResponse);
-      setRoots(libraryResponse.roots);
-      setItems(libraryResponse.items);
+      applyLibraryResponse(libraryResponse);
       setRooms(roomsResponse.rooms);
     } catch (error) {
       setLibraryError(
@@ -63,50 +72,68 @@ export default function App() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [applyLibraryResponse]);
 
   useEffect(() => {
     void refresh();
   }, [refresh]);
 
-  // The backend now runs the library scan in three stages: walk → probe
-  // → thumbnail. The walk returns synchronously with NULL probe and
-  // thumbnail columns for new/changed files; background pools fill them
-  // in afterwards. Poll until *both* stages have completed for every
-  // item, so freshly-probed metadata and freshly-generated thumbnails
-  // appear without a manual refresh. Stops itself once nothing is
-  // pending.
-  const hasPendingBackgroundWork = items.some(
-    (item) =>
-      (item.probedAt === null && item.probeError === null) ||
-      (item.thumbnailGeneratedAt === null && item.thumbnailError === null) ||
-      item.preparationState === "preparing",
-  );
+  const shouldPollLibraryStatus = route.name === "library" && hasPendingBackgroundWork;
 
   useEffect(() => {
-    if (!hasPendingBackgroundWork) return;
+    if (!shouldPollLibraryStatus) return;
 
-    const interval = window.setInterval(async () => {
+    let active = true;
+
+    const pollStatus = async () => {
+      if (typeof document !== "undefined" && document.visibilityState !== "visible") {
+        return;
+      }
+
       try {
-        const libraryResponse = await api.library();
-        setRoots(libraryResponse.roots);
-        setItems(libraryResponse.items);
+        const status = await api.libraryStatus();
+        if (!active) return;
+
+        if (status.revision !== libraryRevision) {
+          const libraryResponse = await api.library();
+          if (!active) return;
+          applyLibraryResponse(libraryResponse);
+          return;
+        }
+
+        if (!status.hasPendingBackgroundWork) {
+          setHasPendingBackgroundWork(false);
+        }
       } catch {
         // Ignore transient polling errors — the next tick will retry, and
         // a real outage is already surfaced by the initial refresh path.
       }
+    };
+
+    const interval = window.setInterval(() => {
+      void pollStatus();
     }, 10_000);
 
-    return () => window.clearInterval(interval);
-  }, [hasPendingBackgroundWork]);
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        void pollStatus();
+      }
+    };
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+
+    return () => {
+      active = false;
+      window.clearInterval(interval);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, [applyLibraryResponse, libraryRevision, shouldPollLibraryStatus]);
 
   const handleRescan = useCallback(async () => {
     try {
       setScanning(true);
       setLibraryError(null);
       const payload = await api.scan();
-      setRoots(payload.roots);
-      setItems(payload.items);
+      applyLibraryResponse(payload);
     } catch (error) {
       setLibraryError(
         error instanceof Error ? error.message : "Could not scan the library.",
@@ -114,7 +141,7 @@ export default function App() {
     } finally {
       setScanning(false);
     }
-  }, []);
+  }, [applyLibraryResponse]);
 
   const handleRoomCreated = useCallback((room: Room) => {
     setRooms((existing) => {
