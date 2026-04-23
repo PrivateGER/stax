@@ -153,10 +153,23 @@ export type LibraryStatusResponse = {
   hasPendingBackgroundWork: boolean;
 };
 
+export type Participant = {
+  id: string;
+  name: string;
+  driftSeconds: number | null;
+};
+
 export type SnapshotEvent = {
   type: "snapshot";
   room: Room;
   connectionCount: number;
+  participants: Participant[];
+};
+
+export type ParticipantsUpdatedEvent = {
+  type: "participantsUpdated";
+  roomId: string;
+  participants: Participant[];
 };
 
 export type PlaybackUpdatedEvent = {
@@ -201,6 +214,7 @@ export type SocketEvent =
   | PlaybackUpdatedEvent
   | MediaChangedEvent
   | PresenceChangedEvent
+  | ParticipantsUpdatedEvent
   | DriftCorrectionEvent
   | SocketErrorEvent
   | PongEvent;

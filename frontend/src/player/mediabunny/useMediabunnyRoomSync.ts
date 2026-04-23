@@ -15,6 +15,7 @@ type Options = {
   socket: RoomSocketApi;
   item: MediaItem | null;
   onAutoplayBlocked: (message: string) => void;
+  onResync?: (deltaSeconds: number) => void;
 };
 
 // How far local playback has to diverge from the room clock before a local
@@ -34,6 +35,7 @@ export function useMediabunnyRoomSync({
   socket,
   item,
   onAutoplayBlocked,
+  onResync,
 }: Options): void {
   const live = socket.connectionState === "live";
   const ready = playerState.ready;
@@ -46,10 +48,12 @@ export function useMediabunnyRoomSync({
   const sendRef = useRef(socket.send);
   const latencyRef = useRef(socket.oneWayLatencyMs);
   const pendingSeekRef = useRef<PendingSeek | null>(null);
+  const onResyncRef = useRef(onResync);
   roomRef.current = socket.room;
   receiptRef.current = socket.authoritativeReceiptAtMs;
   sendRef.current = socket.send;
   latencyRef.current = socket.oneWayLatencyMs;
+  onResyncRef.current = onResync;
 
   useEffect(() => {
     pendingSeekRef.current = null;
@@ -182,6 +186,7 @@ export function useMediabunnyRoomSync({
     if (!controller) return;
 
     void controller.seek(socket.lastCorrection.expectedPositionSeconds);
+    onResyncRef.current?.(socket.lastCorrection.deltaSeconds);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [socket.lastCorrection, live, item?.id, ready]);
 

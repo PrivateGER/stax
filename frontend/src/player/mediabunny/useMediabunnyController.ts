@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type RefObject } from "react";
+import { startTransition, useEffect, useRef, useState, type RefObject } from "react";
 
 import { streamUrl } from "../../api";
 import type { MediaItem } from "../../types";
@@ -16,6 +16,10 @@ const INITIAL_STATE: MediabunnyState = {
   duration: 0,
   hasVideo: false,
   hasAudio: false,
+  audioBufferedSeconds: 0,
+  audioRecentLateByMs: 0,
+  audioWorstLateByMs: 0,
+  audioLateStartCount: 0,
   audioTracks: [],
   selectedAudioTrackId: null,
   volume: 0.7,
@@ -51,12 +55,17 @@ export function useMediabunnyController(
     setState(controller.state);
 
     const refresh = () => setState(controller.state);
+    const refreshTimeupdate = () => {
+      startTransition(() => {
+        setState(controller.state);
+      });
+    };
     const offs = [
       controller.on("ready", refresh),
       controller.on("play", refresh),
       controller.on("pause", refresh),
       controller.on("seeked", refresh),
-      controller.on("timeupdate", refresh),
+      controller.on("timeupdate", refreshTimeupdate),
       controller.on("audiochange", refresh),
       controller.on("ended", refresh),
       controller.on("error", (message) => {

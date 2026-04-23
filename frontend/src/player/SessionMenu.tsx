@@ -79,6 +79,24 @@ export function SessionMenu({
             <p className="muted">{presenceText(socket)}</p>
           </div>
 
+          {socket.participants.length > 0 ? (
+            <ul className="watcher-list">
+              {socket.participants.map((participant) => (
+                <li className="watcher-row" key={participant.id}>
+                  <span className="watcher-name">
+                    {participant.name}
+                    {participant.name === clientName ? (
+                      <span className="watcher-self muted"> (you)</span>
+                    ) : null}
+                  </span>
+                  <span className={driftClass(participant.driftSeconds)}>
+                    {formatDrift(participant.driftSeconds)}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          ) : null}
+
           <button
             className="ghost-button wide"
             onClick={() => void copyInvite()}
@@ -134,4 +152,19 @@ function presenceText(socket: RoomSocketApi): string {
   if (socket.connectionState !== "live") return "Not connected.";
   if (socket.presenceCount <= 1) return "You're the only one here.";
   return `${socket.presenceCount} watcher${socket.presenceCount === 1 ? "" : "s"} connected.`;
+}
+
+function formatDrift(driftSeconds: number | null): string {
+  if (driftSeconds === null) return "—";
+  if (Math.abs(driftSeconds) < 0.05) return "in sync";
+  const sign = driftSeconds > 0 ? "+" : "−";
+  return `${sign}${Math.abs(driftSeconds).toFixed(2)}s`;
+}
+
+function driftClass(driftSeconds: number | null): string {
+  if (driftSeconds === null) return "watcher-drift muted";
+  const magnitude = Math.abs(driftSeconds);
+  if (magnitude < 0.35) return "watcher-drift in-sync";
+  if (magnitude < 1.5) return "watcher-drift nudge";
+  return "watcher-drift out-of-sync";
 }

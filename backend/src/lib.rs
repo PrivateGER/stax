@@ -54,9 +54,9 @@ use persistence::{Persistence, PersistenceError, StreamCopyRecord, StreamCopyReq
 use probes::{ProbeConfig, ProbeJob, ProbeWorkerPool};
 use protocol::{
     ClientSocketMessage, CreateRoomRequest, CreateStreamCopyRequest, HealthResponse,
-    LibraryResponse, LibraryScanResponse, LibraryStatusResponse, MediaItem, PlaybackAction,
-    PlaybackMode, Room, RoomSocketQuery, RoomsResponse, ServerEvent, StreamCopyStatus,
-    StreamCopySummary, SubtitleMode, SubtitleSourceKind, is_text_subtitle_codec,
+    LibraryResponse, LibraryScanResponse, LibraryStatusResponse, MediaItem, Participant,
+    PlaybackAction, PlaybackMode, Room, RoomSocketQuery, RoomsResponse, ServerEvent,
+    StreamCopyStatus, StreamCopySummary, SubtitleMode, SubtitleSourceKind, is_text_subtitle_codec,
 };
 use stream_copies::{StreamCopyConfig, StreamCopyJob, StreamCopyWorkerPool};
 use streaming::{
@@ -94,6 +94,7 @@ struct RoomHub {
     persistence: Persistence,
     library: LibraryService,
     connection_count: AtomicUsize,
+    participants: RwLock<HashMap<Uuid, Participant>>,
     events: broadcast::Sender<ServerEvent>,
     cleanup_tx: mpsc::UnboundedSender<Uuid>,
     cleanup_task: TokioMutex<Option<JoinHandle<()>>>,
@@ -130,10 +131,42 @@ impl RoomHub {
             persistence,
             library,
             connection_count: AtomicUsize::new(0),
+            participants: RwLock::new(HashMap::new()),
             events,
             cleanup_tx,
             cleanup_task: TokioMutex::new(None),
             empty_room_grace,
+        }
+    }
+
+    async fn participant_list(&self) -> Vec<Participant> {
+        let guard = self.participants.read().await;
+        let mut list: Vec<Participant> = guard.values().cloned().collect();
+        list.sort_by(|left, right| left.name.cmp(&right.name).then(left.id.cmp(&right.id)));
+        list
+    }
+
+    async fn add_participant(&self, id: Uuid, name: String) {
+        let mut guard = self.participants.write().await;
+        guard.insert(
+            id,
+            Participant {
+                id,
+                name,
+                drift_seconds: None,
+            },
+        );
+    }
+
+    async fn remove_participant(&self, id: Uuid) {
+        let mut guard = self.participants.write().await;
+        guard.remove(&id);
+    }
+
+    async fn update_participant_drift(&self, id: Uuid, drift_seconds: f64) {
+        let mut guard = self.participants.write().await;
+        if let Some(entry) = guard.get_mut(&id) {
+            entry.drift_seconds = Some(drift_seconds);
         }
     }
 
@@ -194,6 +227,7 @@ impl RoomHub {
         &self,
         command: ClientSocketMessage,
         actor: &str,
+        connection_id: Uuid,
     ) -> Result<SocketDispatch, &'static str> {
         // SelectMedia needs to resolve the incoming media id against the
         // library before touching room state, so it owns its own write-lock
@@ -266,9 +300,18 @@ impl RoomHub {
             ClientSocketMessage::ReportPosition { position_seconds } => {
                 let reported_position_seconds = normalize_reported_position(position_seconds)?;
                 let drift = room.clock.report_drift(now, reported_position_seconds);
+                let room_id = room.id;
+                drop(room);
+
+                self.update_participant_drift(connection_id, drift.delta_seconds)
+                    .await;
+                self.broadcast(ServerEvent::ParticipantsUpdated {
+                    room_id,
+                    participants: self.participant_list().await,
+                });
 
                 return Ok(SocketDispatch::Direct(ServerEvent::DriftCorrection {
-                    room_id: room.id,
+                    room_id,
                     actor: actor.to_string(),
                     reported_position_seconds: drift.reported_position_seconds,
                     expected_position_seconds: drift.expected_position_seconds,
@@ -1313,18 +1356,23 @@ async fn handle_room_socket(
 ) {
     let mut room_events = room.subscribe();
     let connection_count = room.join().await;
+    let connection_id = Uuid::new_v4();
+    room.add_participant(connection_id, client_name.clone()).await;
     let snapshot = room.snapshot().await;
+    let participants = room.participant_list().await;
 
     if send_server_event(
         &mut socket,
         ServerEvent::Snapshot {
             room: snapshot,
             connection_count,
+            participants: participants.clone(),
         },
     )
     .await
     .is_err()
     {
+        room.remove_participant(connection_id).await;
         room.leave().await;
         return;
     }
@@ -1335,6 +1383,10 @@ async fn handle_room_socket(
         actor: client_name.clone(),
         joined: true,
     });
+    room.broadcast(ServerEvent::ParticipantsUpdated {
+        room_id,
+        participants,
+    });
 
     loop {
         tokio::select! {
@@ -1343,7 +1395,7 @@ async fn handle_room_socket(
                     Some(Ok(Message::Text(text))) => {
                         match serde_json::from_str::<ClientSocketMessage>(text.as_str()) {
                             Ok(command) => {
-                                match room.apply_socket_message(command, &client_name).await {
+                                match room.apply_socket_message(command, &client_name, connection_id).await {
                                     Ok(SocketDispatch::Broadcast(event)) => room.broadcast(event),
                                     Ok(SocketDispatch::Direct(event)) => {
                                         if send_server_event(&mut socket, event).await.is_err() {
@@ -1405,6 +1457,7 @@ async fn handle_room_socket(
                             ServerEvent::Snapshot {
                                 room: room.snapshot().await,
                                 connection_count: room.connection_count(),
+                                participants: room.participant_list().await,
                             },
                         ).await.is_err() {
                             break;
@@ -1416,6 +1469,7 @@ async fn handle_room_socket(
         }
     }
 
+    room.remove_participant(connection_id).await;
     let connection_count = room.leave().await;
 
     room.broadcast(ServerEvent::PresenceChanged {
@@ -1423,6 +1477,10 @@ async fn handle_room_socket(
         connection_count,
         actor: client_name,
         joined: false,
+    });
+    room.broadcast(ServerEvent::ParticipantsUpdated {
+        room_id,
+        participants: room.participant_list().await,
     });
 }
 
@@ -1641,12 +1699,15 @@ mod tests {
         ))
         .await;
 
+        let connection_id = Uuid::new_v4();
+        room.add_participant(connection_id, "operator".into()).await;
         let event = room
             .apply_socket_message(
                 ClientSocketMessage::ReportPosition {
                     position_seconds: 2.2,
                 },
                 "operator",
+                connection_id,
             )
             .await
             .unwrap();
@@ -1674,12 +1735,14 @@ mod tests {
         ))
         .await;
 
+        let connection_id = Uuid::new_v4();
         room.apply_socket_message(
             ClientSocketMessage::Play {
                 position_seconds: Some(5.0),
                 client_one_way_ms: None,
             },
             "operator",
+            connection_id,
         )
         .await
         .unwrap();
@@ -1693,6 +1756,7 @@ mod tests {
                     client_one_way_ms: None,
                 },
                 "operator",
+                connection_id,
             )
             .await
             .unwrap();

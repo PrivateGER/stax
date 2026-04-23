@@ -78,6 +78,42 @@ export default function App() {
     void refresh();
   }, [refresh]);
 
+  const shouldPollRooms = route.name === "library" || route.name === "title";
+
+  useEffect(() => {
+    if (!shouldPollRooms) return;
+
+    let active = true;
+    const tick = async () => {
+      if (typeof document !== "undefined" && document.visibilityState !== "visible") {
+        return;
+      }
+      try {
+        const response = await api.rooms();
+        if (!active) return;
+        setRooms(response.rooms);
+      } catch {
+        // Transient — try again next tick.
+      }
+    };
+
+    const interval = window.setInterval(() => {
+      void tick();
+    }, 10_000);
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        void tick();
+      }
+    };
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+
+    return () => {
+      active = false;
+      window.clearInterval(interval);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, [shouldPollRooms]);
+
   const shouldPollLibraryStatus = route.name === "library" && hasPendingBackgroundWork;
 
   useEffect(() => {
@@ -196,6 +232,7 @@ export default function App() {
             items={items}
             loading={loading}
             onRescan={() => void handleRescan()}
+            rooms={rooms}
             roots={roots}
             scanning={scanning}
           />

@@ -67,13 +67,49 @@ export function useActiveSubtitleCue(
   const activeCues = useMemo(() => {
     if (!selectedKey) return [];
 
-    const visible = cues
-      .filter((cue) => cue.start <= currentTime && currentTime < cue.end)
-      .map((cue) => cue.text.trim())
-      .filter((cue) => cue.length > 0);
+    const anchorIndex = findLastCueStartingBeforeOrAt(cues, currentTime);
+    if (anchorIndex === -1) return [];
+
+    let firstVisibleIndex = anchorIndex;
+    while (
+      firstVisibleIndex > 0 &&
+      cues[firstVisibleIndex - 1] &&
+      currentTime < cues[firstVisibleIndex - 1].end
+    ) {
+      firstVisibleIndex -= 1;
+    }
+
+    const visible: string[] = [];
+    for (let index = firstVisibleIndex; index < cues.length; index += 1) {
+      const cue = cues[index];
+      if (!cue || cue.start > currentTime) break;
+      if (currentTime >= cue.end) continue;
+      const text = cue.text.trim();
+      if (text.length > 0) visible.push(text);
+    }
 
     return Array.from(new Set(visible));
   }, [cues, currentTime, selectedKey]);
 
   return { activeCues, error };
+}
+
+function findLastCueStartingBeforeOrAt(cues: WebVttCue[], currentTime: number): number {
+  let low = 0;
+  let high = cues.length - 1;
+  let result = -1;
+
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+    const cue = cues[mid];
+    if (!cue) break;
+    if (cue.start <= currentTime) {
+      result = mid;
+      low = mid + 1;
+    } else {
+      high = mid - 1;
+    }
+  }
+
+  return result;
 }

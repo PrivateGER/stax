@@ -30,6 +30,10 @@ export type MediabunnyState = {
   duration: number;
   hasVideo: boolean;
   hasAudio: boolean;
+  audioBufferedSeconds: number;
+  audioRecentLateByMs: number;
+  audioWorstLateByMs: number;
+  audioLateStartCount: number;
   audioTracks: MediabunnyTrackInfo[];
   selectedAudioTrackId: string | null;
   volume: number;
@@ -65,7 +69,11 @@ export class MediabunnyController {
   private videoFrameIterator: AsyncGenerator<WrappedCanvas, void, unknown> | null = null;
   private audioBufferIterator: AsyncGenerator<WrappedAudioBuffer, void, unknown> | null = null;
   private nextFrame: WrappedCanvas | null = null;
-  private queuedAudioNodes = new Set<AudioBufferSourceNode>();
+  private queuedAudioNodes = new Map<AudioBufferSourceNode, number>();
+  private audioLateStartCount = 0;
+  private audioWorstLateByMs = 0;
+  private audioRecentLateByMs = 0;
+  private audioRecentLateAtMs = -Infinity;
 
   /** Incremented on seek; in-flight async work checks this to bail out after a new seek. */
   private asyncId = 0;
@@ -74,6 +82,16 @@ export class MediabunnyController {
   private lastTimeUpdateEmitAt = 0;
   /** Emit `timeupdate` at most this often (ms). Keeps React renders bounded. */
   private static TIMEUPDATE_INTERVAL_MS = 250;
+  /**
+   * Keep enough decoded audio scheduled ahead to ride out short main-thread or
+   * decode hiccups without an audible underrun.
+   */
+  private static AUDIO_LOOKAHEAD_SECONDS = 6;
+  /**
+   * Give decoded audio a short preroll window before playback time starts
+   * advancing so chunks are ready before they become due.
+   */
+  private static AUDIO_PREROLL_SECONDS = 0.05;
 
   private volumeValue = 0.7;
   private mutedValue = false;
@@ -109,6 +127,10 @@ export class MediabunnyController {
       duration: this.duration,
       hasVideo: this.videoTrack !== null,
       hasAudio: this.audioTrack !== null,
+      audioBufferedSeconds: this.getBufferedAudioSeconds(),
+      audioRecentLateByMs: this.getRecentAudioLateByMs(),
+      audioWorstLateByMs: this.audioWorstLateByMs,
+      audioLateStartCount: this.audioLateStartCount,
       audioTracks: this.audioTrackInfos,
       selectedAudioTrackId: this.audioTrack ? String(this.audioTrack.id) : null,
       volume: this.volumeValue,
@@ -131,7 +153,9 @@ export class MediabunnyController {
       await this.startVideoIterator();
     }
 
-    this.audioContextStartTime = this.audioContext.currentTime;
+    this.audioContextStartTime =
+      this.audioContext.currentTime +
+      (this.audioTrack ? MediabunnyController.AUDIO_PREROLL_SECONDS : 0);
     this.playing = true;
 
     if (this.audioSink) {
@@ -211,7 +235,9 @@ export class MediabunnyController {
         await this.audioContext.resume();
       }
 
-      this.audioContextStartTime = this.audioContext.currentTime;
+      this.audioContextStartTime =
+        this.audioContext.currentTime +
+        MediabunnyController.AUDIO_PREROLL_SECONDS;
       this.playing = true;
       this.audioBufferIterator = this.audioSink.buffers(this.playbackTimeAtStart);
       void this.runAudioIterator();
@@ -251,7 +277,7 @@ export class MediabunnyController {
   private stopAudioOutput(): void {
     void this.audioBufferIterator?.return();
     this.audioBufferIterator = null;
-    for (const node of this.queuedAudioNodes) {
+    for (const node of this.queuedAudioNodes.keys()) {
       try {
         node.stop();
       } catch {
@@ -330,7 +356,7 @@ export class MediabunnyController {
       this.audioTrackInfos = availableAudioTracks.map((track) => describeAudioTrack(track));
       this.audioTrack = audioTrack;
 
-      this.audioContext = new AudioContext({ sampleRate: audioTrack?.sampleRate });
+      this.audioContext = new AudioContext();
       this.gainNode = this.audioContext.createGain();
       this.gainNode.connect(this.audioContext.destination);
       this.applyGain();
@@ -376,8 +402,7 @@ export class MediabunnyController {
     const secondFrame = (await this.videoFrameIterator.next()).value ?? null;
     this.nextFrame = secondFrame;
     if (firstFrame) {
-      this.context.clearRect(0, 0, this.canvas.width, this.canvas.height);
-      this.context.drawImage(firstFrame.canvas, 0, 0);
+      this.drawFrame(firstFrame);
     }
   }
 
@@ -407,8 +432,7 @@ export class MediabunnyController {
     }
 
     if (this.nextFrame && this.nextFrame.timestamp <= playbackTime) {
-      this.context.clearRect(0, 0, this.canvas.width, this.canvas.height);
-      this.context.drawImage(this.nextFrame.canvas, 0, 0);
+      this.drawFrame(this.nextFrame);
       this.nextFrame = null;
       void this.advanceVideoFrame();
     }
@@ -422,6 +446,7 @@ export class MediabunnyController {
 
   private async advanceVideoFrame(): Promise<void> {
     const localAsyncId = this.asyncId;
+    let latestOverdueFrame: WrappedCanvas | null = null;
     while (true) {
       const iterator = this.videoFrameIterator;
       if (!iterator) return;
@@ -434,13 +459,20 @@ export class MediabunnyController {
         // moved on (seek, disposal), there's nothing useful to do.
         return;
       }
-      if (!candidate) return;
+      if (!candidate) {
+        if (latestOverdueFrame) {
+          this.drawFrame(latestOverdueFrame);
+        }
+        return;
+      }
       if (localAsyncId !== this.asyncId || this.disposed) return;
       const playbackTime = this.getPlaybackTime();
       if (candidate.timestamp <= playbackTime) {
-        this.context.clearRect(0, 0, this.canvas.width, this.canvas.height);
-        this.context.drawImage(candidate.canvas, 0, 0);
+        latestOverdueFrame = candidate;
       } else {
+        if (latestOverdueFrame) {
+          this.drawFrame(latestOverdueFrame);
+        }
         this.nextFrame = candidate;
         return;
       }
@@ -464,44 +496,84 @@ export class MediabunnyController {
     iterator: AsyncGenerator<WrappedAudioBuffer, void, unknown>,
   ): Promise<void> {
     if (!this.audioContext || !this.gainNode) return;
-    for await (const { buffer, timestamp } of iterator) {
+    for await (const { buffer, timestamp, duration } of iterator) {
       if (this.disposed) return;
       const node = this.audioContext.createBufferSource();
       node.buffer = buffer;
       node.connect(this.gainNode);
       const startTimestamp =
         this.audioContextStartTime + timestamp - this.playbackTimeAtStart;
-      if (startTimestamp >= this.audioContext.currentTime) {
+      const lateBySeconds = Math.max(0, this.audioContext.currentTime - startTimestamp);
+      if (lateBySeconds > 0) {
+        this.recordAudioLateStart(lateBySeconds);
+      }
+      if (lateBySeconds === 0) {
         node.start(startTimestamp);
       } else {
         node.start(
           this.audioContext.currentTime,
-          this.audioContext.currentTime - startTimestamp,
+          lateBySeconds,
         );
       }
-      this.queuedAudioNodes.add(node);
+      const bufferedUntil = timestamp + Math.max(duration, buffer.duration);
+      this.queuedAudioNodes.set(node, bufferedUntil);
       node.onended = () => {
         this.queuedAudioNodes.delete(node);
       };
       // Slow the loop if we're running well ahead of real-time.
-      if (timestamp - this.getPlaybackTime() >= 1) {
+      if (
+        bufferedUntil - this.getPlaybackTime() >=
+        MediabunnyController.AUDIO_LOOKAHEAD_SECONDS
+      ) {
         await new Promise<void>((resolve) => {
           const id = window.setInterval(() => {
-            if (this.disposed || timestamp - this.getPlaybackTime() < 1) {
+            if (
+              this.disposed ||
+              bufferedUntil - this.getPlaybackTime() <
+                MediabunnyController.AUDIO_LOOKAHEAD_SECONDS
+            ) {
               window.clearInterval(id);
               resolve();
             }
-          }, 100);
+          }, 50);
         });
       }
     }
   }
 
+  private drawFrame(frame: WrappedCanvas): void {
+    this.context.clearRect(0, 0, this.canvas.width, this.canvas.height);
+    this.context.drawImage(frame.canvas, 0, 0);
+  }
+
+  private getBufferedAudioSeconds(): number {
+    if (!this.audioTrack || this.queuedAudioNodes.size === 0) return 0;
+    const playbackTime = this.getPlaybackTime();
+    let bufferedSeconds = 0;
+    for (const bufferedUntil of this.queuedAudioNodes.values()) {
+      bufferedSeconds = Math.max(bufferedSeconds, bufferedUntil - playbackTime);
+    }
+    return Number(Math.max(0, bufferedSeconds).toFixed(3));
+  }
+
+  private getRecentAudioLateByMs(): number {
+    if (performance.now() - this.audioRecentLateAtMs > 3000) return 0;
+    return this.audioRecentLateByMs;
+  }
+
+  private recordAudioLateStart(lateBySeconds: number): void {
+    const lateByMs = Math.round(lateBySeconds * 1000);
+    if (lateByMs <= 0) return;
+    this.audioLateStartCount += 1;
+    this.audioWorstLateByMs = Math.max(this.audioWorstLateByMs, lateByMs);
+    this.audioRecentLateByMs = lateByMs;
+    this.audioRecentLateAtMs = performance.now();
+  }
+
   private getPlaybackTime(): number {
     if (this.playing && this.audioContext) {
       return (
-        this.audioContext.currentTime -
-        this.audioContextStartTime +
+        Math.max(0, this.audioContext.currentTime - this.audioContextStartTime) +
         this.playbackTimeAtStart
       );
     }

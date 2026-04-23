@@ -398,6 +398,24 @@ async fn next_event(
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
 ) -> ServerEvent {
+    loop {
+        let event = next_event_any(socket).await;
+        // ParticipantsUpdated is a high-frequency auxiliary event (fires on
+        // join/leave and every drift report). Most tests step through events
+        // looking for the domain change they triggered, so silently skip it
+        // by default. Tests that need to observe it use next_event_any.
+        if matches!(event, ServerEvent::ParticipantsUpdated { .. }) {
+            continue;
+        }
+        return event;
+    }
+}
+
+async fn next_event_any(
+    socket: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) -> ServerEvent {
     let message = timeout(Duration::from_secs(2), socket.next())
         .await
         .expect("timed out waiting for websocket event")
@@ -415,11 +433,26 @@ async fn assert_no_event(
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
 ) {
-    let result = timeout(Duration::from_millis(250), socket.next()).await;
-    assert!(
-        result.is_err(),
-        "expected no websocket event, but one arrived"
-    );
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        match timeout(remaining, socket.next()).await {
+            Err(_) => return,
+            Ok(Some(Ok(Message::Text(text)))) => {
+                let event: ServerEvent = serde_json::from_str(text.as_str()).unwrap();
+                if matches!(event, ServerEvent::ParticipantsUpdated { .. }) {
+                    continue;
+                }
+                panic!("expected no websocket event, but one arrived: {event:?}");
+            }
+            Ok(Some(Ok(_))) => continue,
+            Ok(Some(Err(error))) => panic!("websocket transport error: {error:?}"),
+            Ok(None) => panic!("websocket stream closed unexpectedly"),
+        }
+    }
 }
 
 fn compression_test_client() -> Client {

@@ -4,6 +4,7 @@ import { socketUrl } from "./api";
 import type {
   ConnectionState,
   DriftCorrectionEvent,
+  Participant,
   Room,
   SocketEvent,
 } from "./types";
@@ -23,6 +24,7 @@ export type RoomSocketState = {
   connectionState: ConnectionState;
   room: Room | null;
   presenceCount: number;
+  participants: Participant[];
   error: string | null;
   lastCorrection: DriftCorrectionEvent | null;
   authoritativeReceiptAtMs: number | null;
@@ -42,6 +44,7 @@ const IDLE_STATE: RoomSocketState = {
   connectionState: "offline",
   room: null,
   presenceCount: 0,
+  participants: [],
   error: null,
   lastCorrection: null,
   authoritativeReceiptAtMs: null,
@@ -124,6 +127,7 @@ export function useRoomSocket(roomId: string | null, clientName: string): RoomSo
             connectionState: "live",
             room: message.room,
             presenceCount: message.connectionCount,
+            participants: message.participants,
             error: null,
             lastCorrection: null,
             authoritativeReceiptAtMs: receipt,
@@ -164,6 +168,12 @@ export function useRoomSocket(roomId: string | null, clientName: string): RoomSo
             presenceCount: message.connectionCount,
             activity: `${message.actor} ${message.joined ? "joined" : "left"}`,
           }));
+          return;
+        }
+
+        if (message.type === "participantsUpdated") {
+          if (message.roomId !== roomId) return;
+          setState((current) => ({ ...current, participants: message.participants }));
           return;
         }
 

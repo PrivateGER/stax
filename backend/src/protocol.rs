@@ -57,6 +57,14 @@ pub enum DriftCorrectionAction {
     Seek,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Participant {
+    pub id: Uuid,
+    pub name: String,
+    pub drift_seconds: Option<f64>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateRoomRequest {
@@ -111,6 +119,7 @@ pub enum ServerEvent {
     Snapshot {
         room: Room,
         connection_count: usize,
+        participants: Vec<Participant>,
     },
     PlaybackUpdated {
         room: Room,
@@ -126,6 +135,10 @@ pub enum ServerEvent {
         connection_count: usize,
         actor: String,
         joined: bool,
+    },
+    ParticipantsUpdated {
+        room_id: Uuid,
+        participants: Vec<Participant>,
     },
     DriftCorrection {
         room_id: Uuid,

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
 import { api } from "../api";
 import { displayMediaTitle } from "../format";
@@ -12,6 +12,7 @@ import { deriveSubtitleSources } from "../player/subtitleSources";
 import { UnplayableNotice } from "../player/UnplayableNotice";
 import { useActiveSubtitleCue } from "../player/useActiveSubtitleCue";
 import { navigate } from "../router";
+import { ToastViewport, useToasts } from "../Toasts";
 import type { MediaItem, Room } from "../types";
 import { useRoomSocket } from "../useRoomSocket";
 import { useStreamCopyProgress } from "../useStreamCopyProgress";
@@ -65,10 +66,24 @@ export function PlayerPage({
 
   const socket = useRoomSocket(roomId, clientName);
   const watchTogether = useWatchTogether(item, onRoomCreated);
+  const toasts = useToasts();
 
   const { controllerRef, canvasRef, state } = useMediabunnyController(
     item,
     setPlayerError,
+  );
+
+  const handleResync = useCallback(
+    (deltaSeconds: number) => {
+      const magnitude = Math.abs(deltaSeconds);
+      if (magnitude < 0.05) return;
+      const direction = deltaSeconds > 0 ? "ahead" : "behind";
+      toasts.show(
+        `Re-syncing with the room — you were ${magnitude.toFixed(2)}s ${direction}.`,
+        "info",
+      );
+    },
+    [toasts],
   );
 
   useMediabunnyRoomSync({
@@ -77,6 +92,7 @@ export function PlayerPage({
     socket,
     item,
     onAutoplayBlocked: setPlayerError,
+    onResync: handleResync,
   });
 
   const selectedSubtitleSource =
@@ -236,6 +252,8 @@ export function PlayerPage({
           }}
         />
       ) : null}
+
+      <ToastViewport dismiss={toasts.dismiss} toasts={toasts.toasts} />
     </div>
   );
 }

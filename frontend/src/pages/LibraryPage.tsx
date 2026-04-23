@@ -10,11 +10,12 @@ import {
   posterInitials,
 } from "../format";
 import { navigate } from "../router";
-import type { LibraryRoot, MediaItem } from "../types";
+import type { LibraryRoot, MediaItem, Room } from "../types";
 
 type Props = {
   items: MediaItem[];
   roots: LibraryRoot[];
+  rooms: Room[];
   folder: string | null;
   loading: boolean;
   scanning: boolean;
@@ -25,6 +26,7 @@ type Props = {
 export function LibraryPage({
   items,
   roots,
+  rooms,
   folder,
   loading,
   scanning,
@@ -35,6 +37,19 @@ export function LibraryPage({
 
   const tree = useMemo(() => buildFolderTree(items, roots), [items, roots]);
   const currentNode = useMemo(() => findFolder(tree, folder), [tree, folder]);
+
+  const itemsById = useMemo(() => {
+    const map = new Map<string, MediaItem>();
+    for (const item of items) map.set(item.id, item);
+    return map;
+  }, [items]);
+
+  const liveSessions = useMemo(() => {
+    if (rooms.length === 0) return [];
+    return [...rooms]
+      .filter((room) => room.mediaId !== null)
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+  }, [rooms]);
 
   const recent = useMemo(
     () =>
@@ -123,6 +138,8 @@ export function LibraryPage({
         <FolderView
           currentNode={currentNode}
           folder={folder}
+          itemsById={itemsById}
+          liveSessions={folder === null ? liveSessions : []}
           loading={loading}
           recent={folder === null ? recent : []}
         />
@@ -172,11 +189,15 @@ function Breadcrumb({ folder }: { folder: string }) {
 function FolderView({
   currentNode,
   folder,
+  itemsById,
+  liveSessions,
   loading,
   recent,
 }: {
   currentNode: FolderNode | null;
   folder: string | null;
+  itemsById: Map<string, MediaItem>;
+  liveSessions: Room[];
   loading: boolean;
   recent: MediaItem[];
 }) {
@@ -202,6 +223,26 @@ function FolderView({
 
   return (
     <>
+      {isRoot && liveSessions.length > 0 ? (
+        <section className="library-section">
+          <div className="library-section-head">
+            <h2>Live now</h2>
+            <span className="muted">
+              {liveSessions.length} session{liveSessions.length === 1 ? "" : "s"}
+            </span>
+          </div>
+          <div className="poster-row poster-row-compact">
+            {liveSessions.map((room) => (
+              <LiveSessionCard
+                item={room.mediaId ? (itemsById.get(room.mediaId) ?? null) : null}
+                key={room.id}
+                room={room}
+              />
+            ))}
+          </div>
+        </section>
+      ) : null}
+
       {isRoot && recent.length > 0 ? (
         <section className="library-section">
           <div className="library-section-head">
@@ -352,6 +393,48 @@ function PosterCard({ item }: { item: MediaItem }) {
         </h3>
         <p className="poster-sub muted">
           {badges.length > 0 ? badges.join(" · ") : (item.extension ?? "media").toUpperCase()}
+        </p>
+      </div>
+    </button>
+  );
+}
+
+function LiveSessionCard({ item, room }: { item: MediaItem | null; room: Room }) {
+  const mediaTitle = item ? displayMediaTitle(item) : (room.mediaTitle ?? "Unknown title");
+  const hasThumbnail = item?.thumbnailGeneratedAt != null;
+  const thumbnailAspectRatio = item ? mediaAspectRatio(item.width, item.height) : null;
+  const posterArtStyle =
+    hasThumbnail && thumbnailAspectRatio ? { aspectRatio: thumbnailAspectRatio } : undefined;
+  const isPlaying = room.playbackState.status === "playing";
+  const mediaId = room.mediaId;
+
+  return (
+    <button
+      className="poster-card"
+      disabled={mediaId === null}
+      onClick={() => {
+        if (mediaId === null) return;
+        navigate({ name: "watch", mediaId, roomId: room.id });
+      }}
+      type="button"
+    >
+      <div className="poster-art" style={posterArtStyle}>
+        {hasThumbnail && item ? (
+          <img alt="" className="poster-image" loading="lazy" src={thumbnailUrl(item.id)} />
+        ) : (
+          <span className="poster-initials">{posterInitials(mediaTitle)}</span>
+        )}
+        <span className="live-session-badge">
+          <span className="session-pill-dot live" aria-hidden="true" />
+          Live
+        </span>
+      </div>
+      <div className="poster-meta">
+        <h3 className="poster-title" title={room.name}>
+          {room.name}
+        </h3>
+        <p className="poster-sub muted" title={mediaTitle}>
+          {isPlaying ? "Playing" : "Paused"} · {mediaTitle}
         </p>
       </div>
     </button>
