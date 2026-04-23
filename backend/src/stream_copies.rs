@@ -291,6 +291,16 @@ struct StreamCopyOutcome {
     content_type: &'static str,
 }
 
+struct FfmpegStreamCopyRequest<'a> {
+    ffmpeg_command: &'a Path,
+    media_item: &'a MediaItem,
+    media_path: &'a Path,
+    output_path: &'a Path,
+    default_audio_ordinal: Option<usize>,
+    burned_filter: Option<&'a str>,
+    hw_accel: &'a FfmpegHardwareAcceleration,
+}
+
 async fn build_stream_copy(
     media_item: &MediaItem,
     copy: &StreamCopyRecord,
@@ -316,53 +326,64 @@ async fn build_stream_copy(
     let final_subtitle_path = output_dir.join("subtitle.vtt");
     let temp_subtitle_path = temp_path_for_final(&final_subtitle_path);
 
-    cleanup_path(&temp_output_path).await;
-    cleanup_path(&temp_subtitle_path).await;
+    let result = async {
+        cleanup_path(&temp_output_path).await;
+        cleanup_path(&temp_subtitle_path).await;
 
-    let default_audio_ordinal = default_audio_stream_ordinal(media_item, copy)?;
-    let burned_filter = if copy.subtitle_mode == SubtitleMode::Burned {
-        Some(build_burn_subtitle_filter(media_item, copy, &media_path)?)
-    } else {
-        None
-    };
+        let default_audio_ordinal = default_audio_stream_ordinal(media_item, copy)?;
+        let burned_filter = if copy.subtitle_mode == SubtitleMode::Burned {
+            Some(build_burn_subtitle_filter(media_item, copy, &media_path)?)
+        } else {
+            None
+        };
 
-    run_ffmpeg_stream_copy(
-        ffmpeg_command,
-        media_item,
-        &media_path,
-        &temp_output_path,
-        default_audio_ordinal,
-        burned_filter.as_deref(),
-        hw_accel,
-        progress,
-    )
-    .await?;
-
-    cleanup_path(&final_output_path).await;
-    fs::rename(&temp_output_path, &final_output_path)
-        .await
-        .map_err(|error| format!("failed to finalize stream copy: {error}"))?;
-
-    let subtitle_path = if copy.subtitle_mode == SubtitleMode::Sidecar {
-        prepare_sidecar_subtitle(
+        let request = FfmpegStreamCopyRequest {
             ffmpeg_command,
             media_item,
-            copy,
-            &media_path,
-            &temp_subtitle_path,
-            &final_subtitle_path,
-        )
-        .await?
-    } else {
-        cleanup_path(&final_subtitle_path).await;
-        None
-    };
+            media_path: &media_path,
+            output_path: &temp_output_path,
+            default_audio_ordinal,
+            burned_filter: burned_filter.as_deref(),
+            hw_accel,
+        };
+        run_ffmpeg_stream_copy(request, progress).await?;
 
-    Ok(StreamCopyOutcome {
-        output_path: final_output_path.to_string_lossy().to_string(),
-        subtitle_path: subtitle_path.map(|path| path.to_string_lossy().to_string()),
-        content_type,
-    })
+        cleanup_path(&final_output_path).await;
+        fs::rename(&temp_output_path, &final_output_path)
+            .await
+            .map_err(|error| format!("failed to finalize stream copy: {error}"))?;
+
+        let subtitle_path = if copy.subtitle_mode == SubtitleMode::Sidecar {
+            prepare_sidecar_subtitle(
+                ffmpeg_command,
+                media_item,
+                copy,
+                &media_path,
+                &temp_subtitle_path,
+                &final_subtitle_path,
+            )
+            .await?
+        } else {
+            cleanup_path(&final_subtitle_path).await;
+            None
+        };
+
+        Ok(StreamCopyOutcome {
+            output_path: final_output_path.to_string_lossy().to_string(),
+            subtitle_path: subtitle_path.map(|path| path.to_string_lossy().to_string()),
+            content_type,
+        })
+    }
+    .await;
+
+    if result.is_err() {
+        cleanup_path(&temp_output_path).await;
+        cleanup_path(&temp_subtitle_path).await;
+        cleanup_path(&final_output_path).await;
+        cleanup_path(&final_subtitle_path).await;
+    }
+
+    result
 }
 
 async fn prepare_sidecar_subtitle(
@@ -444,15 +465,18 @@ async fn prepare_sidecar_subtitle(
 }
 
 async fn run_ffmpeg_stream_copy(
-    ffmpeg_command: &Path,
-    media_item: &MediaItem,
-    media_path: &Path,
-    output_path: &Path,
-    default_audio_ordinal: Option<usize>,
-    burned_filter: Option<&str>,
-    hw_accel: &FfmpegHardwareAcceleration,
+    request: FfmpegStreamCopyRequest<'_>,
     progress: &SharedStreamCopyProgress,
 ) -> Result<(), String> {
+    let FfmpegStreamCopyRequest {
+        ffmpeg_command,
+        media_item,
+        media_path,
+        output_path,
+        default_audio_ordinal,
+        burned_filter,
+        hw_accel,
+    } = request;
     let has_video = media_item.video_codec.is_some();
     let browser_safe_video = media_item
         .video_codec
@@ -497,8 +521,7 @@ async fn run_ffmpeg_stream_copy(
     } else {
         // Place the default track first so MediaBunny's getPrimaryAudioTrack
         // lands on the user's selection, then append the rest in source order.
-        let mut output_order: Vec<usize> =
-            Vec::with_capacity(media_item.audio_streams.len());
+        let mut output_order: Vec<usize> = Vec::with_capacity(media_item.audio_streams.len());
         if let Some(ordinal) = default_audio_ordinal {
             output_order.push(ordinal);
         }
@@ -521,9 +544,7 @@ async fn run_ffmpeg_stream_copy(
                     .arg(format!("-c:a:{output_audio_index}"))
                     .arg("copy");
             } else {
-                command
-                    .arg(format!("-c:a:{output_audio_index}"))
-                    .arg("aac");
+                command.arg(format!("-c:a:{output_audio_index}")).arg("aac");
                 command
                     .arg(format!("-b:a:{output_audio_index}"))
                     .arg("192k");
