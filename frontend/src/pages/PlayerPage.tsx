@@ -104,10 +104,7 @@ export function PlayerPage({
       setCreatingStreamCopy(true);
       setStreamCopyError(null);
       const response = await api.createStreamCopy(item.id, {
-        audioStreamIndex:
-          item.audioStreams.find((stream) => stream.default)?.index ??
-          item.audioStreams[0]?.index ??
-          null,
+        audioStreamIndex: null,
         subtitleMode: "off",
         subtitle: null,
       });

@@ -51,14 +51,6 @@ export function TitlePage({ item, rooms, onRoomCreated, onRefresh }: Props) {
       onRefresh,
     });
 
-  const audioOptions = useMemo(
-    () =>
-      (item?.audioStreams ?? []).map((stream, index) => ({
-        value: stream.index,
-        label: formatAudioStreamLabel(stream, index + 1),
-      })),
-    [item?.audioStreams],
-  );
   const subtitleOptions = useMemo<SubtitleOption[]>(() => {
     if (!item) return [];
     const sidecarOptions = item.subtitleTracks.map((track, index) => ({
@@ -79,9 +71,6 @@ export function TitlePage({ item, rooms, onRoomCreated, onRefresh }: Props) {
 
   const [creatingStreamCopy, setCreatingStreamCopy] = useState(false);
   const [streamCopyError, setStreamCopyError] = useState<string | null>(null);
-  const [audioStreamIndex, setAudioStreamIndex] = useState<number | null>(
-    () => defaultAudioIndex(item),
-  );
   const [subtitleMode, setSubtitleMode] = useState<SubtitleMode>("off");
   const [subtitleSelection, setSubtitleSelection] = useState<string>(
     () => subtitleOptions[0]?.value ?? "",
@@ -94,7 +83,6 @@ export function TitlePage({ item, rooms, onRoomCreated, onRefresh }: Props) {
   const [prevItemId, setPrevItemId] = useState<string | null>(item?.id ?? null);
   if ((item?.id ?? null) !== prevItemId) {
     setPrevItemId(item?.id ?? null);
-    setAudioStreamIndex(defaultAudioIndex(item));
     setSubtitleMode("off");
     setSubtitleSelection(subtitleOptions[0]?.value ?? "");
     setStreamCopyError(null);
@@ -134,7 +122,7 @@ export function TitlePage({ item, rooms, onRoomCreated, onRefresh }: Props) {
     if (!item) return;
 
     const request: CreateStreamCopyRequest = {
-      audioStreamIndex,
+      audioStreamIndex: null,
       subtitleMode,
       subtitle:
         subtitleMode === "off"
@@ -260,27 +248,6 @@ export function TitlePage({ item, rooms, onRoomCreated, onRefresh }: Props) {
               </p>
 
               <StreamCopyProgress summary={liveStreamCopy} />
-
-              <label className="input-stack">
-                <span className="label-text">Audio track</span>
-                <select
-                  onChange={(event) => {
-                    const value = event.target.value;
-                    setAudioStreamIndex(value === "" ? null : Number(value));
-                  }}
-                  value={audioStreamIndex ?? ""}
-                >
-                  {audioOptions.length === 0 ? (
-                    <option value="">No audio</option>
-                  ) : (
-                    audioOptions.map((option) => (
-                      <option key={option.value} value={option.value}>
-                        {option.label}
-                      </option>
-                    ))
-                  )}
-                </select>
-              </label>
 
               <label className="input-stack">
                 <span className="label-text">Subtitles</span>
@@ -413,15 +380,6 @@ export function TitlePage({ item, rooms, onRoomCreated, onRefresh }: Props) {
         ) : null}
       </section>
     </article>
-  );
-}
-
-function defaultAudioIndex(item: MediaItem | null): number | null {
-  if (!item) return null;
-  return (
-    item.audioStreams.find((stream) => stream.default)?.index ??
-    item.audioStreams[0]?.index ??
-    null
   );
 }
 
