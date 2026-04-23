@@ -15,11 +15,11 @@ use reqwest::header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_RANGE, RANGE};
 use syncplay_backend::{
     build_app,
     library::LibraryConfig,
-    load_state, load_state_with_library,
+    load_state, load_state_with_library, load_state_with_library_and_grace,
     persistence::Persistence,
     protocol::{
         CreateStreamCopyRequest, DriftCorrectionAction, LibraryResponse, LibraryScanResponse,
-        LibraryStatusResponse, Room, RoomsResponse, ServerEvent, StreamCopyStatus,
+        LibraryStatusResponse, PlaybackStatus, Room, RoomsResponse, ServerEvent, StreamCopyStatus,
         StreamCopySummary,
     },
     seeded_state,
@@ -62,6 +62,17 @@ impl TestServer {
     async fn spawn_with_library_config(config: LibraryConfig) -> Self {
         let persistence = Persistence::open_in_memory().await.unwrap();
         let app = build_app(load_state_with_library(persistence, config).await.unwrap());
+
+        Self::spawn_with_app(app).await
+    }
+
+    async fn spawn_with_grace(grace: Duration) -> Self {
+        let persistence = Persistence::open_in_memory().await.unwrap();
+        let app = build_app(
+            load_state_with_library_and_grace(persistence, LibraryConfig::default(), grace)
+                .await
+                .unwrap(),
+        );
 
         Self::spawn_with_app(app).await
     }
@@ -3093,5 +3104,375 @@ async fn create_stream_copy_rejects_non_text_embedded_subtitle_for_sidecar_mode(
             .await
             .unwrap()
             .contains("cannot be converted")
+    );
+}
+
+#[tokio::test]
+async fn select_media_swaps_room_media_and_resets_clock() {
+    let temp_dir = TempDir::new().unwrap();
+    let root = temp_dir.path().join("library");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("first.mp4"), b"first").unwrap();
+    fs::write(root.join("second.mp4"), b"second").unwrap();
+    let server = TestServer::spawn_with_library_roots(vec![root]).await;
+
+    let scan = server.scan_library().await;
+    let first = scan
+        .items
+        .iter()
+        .find(|item| item.relative_path == "first.mp4")
+        .unwrap()
+        .clone();
+    let second = scan
+        .items
+        .iter()
+        .find(|item| item.relative_path == "second.mp4")
+        .unwrap()
+        .clone();
+
+    let created: Room = server
+        .client
+        .post(format!("{}/api/rooms", server.base_url))
+        .json(&serde_json::json!({
+            "name": "Swap Room",
+            "mediaId": first.id.to_string(),
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let mut socket = connect_room_socket(&server, &created.id.to_string(), "Operator").await;
+
+    // Drain snapshot + presence.
+    let _ = next_event(&mut socket).await;
+    let _ = next_event(&mut socket).await;
+
+    // Advance the clock so we can verify the reset.
+    socket
+        .send(Message::Text(
+            serde_json::json!({ "type": "play", "positionSeconds": 12.5 })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let _ = next_event(&mut socket).await;
+
+    socket
+        .send(Message::Text(
+            serde_json::json!({
+                "type": "selectMedia",
+                "mediaId": second.id.to_string(),
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    match next_event(&mut socket).await {
+        ServerEvent::MediaChanged { room, actor } => {
+            assert_eq!(actor, "Operator");
+            assert_eq!(room.media_id, Some(second.id));
+            assert_eq!(room.media_title.as_deref(), Some(second.file_name.as_str()));
+            assert_eq!(room.playback_state.status, PlaybackStatus::Paused);
+            assert_eq!(room.playback_state.position_seconds, 0.0);
+            assert_eq!(room.playback_state.anchor_position_seconds, 0.0);
+        }
+        other => panic!("expected media changed event, got {other:?}"),
+    }
+
+    // The REST snapshot should reflect the new media after persistence.
+    let refreshed = server
+        .rooms()
+        .await
+        .rooms
+        .into_iter()
+        .find(|entry| entry.id == created.id)
+        .unwrap();
+    assert_eq!(refreshed.media_id, Some(second.id));
+    assert_eq!(refreshed.playback_state.position_seconds, 0.0);
+}
+
+#[tokio::test]
+async fn select_media_broadcasts_change_to_other_clients() {
+    let temp_dir = TempDir::new().unwrap();
+    let root = temp_dir.path().join("library");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("a.mp4"), b"a").unwrap();
+    fs::write(root.join("b.mp4"), b"b").unwrap();
+    let server = TestServer::spawn_with_library_roots(vec![root]).await;
+
+    let scan = server.scan_library().await;
+    let a = scan.items.iter().find(|i| i.relative_path == "a.mp4").unwrap().clone();
+    let b = scan.items.iter().find(|i| i.relative_path == "b.mp4").unwrap().clone();
+
+    let created: Room = server
+        .client
+        .post(format!("{}/api/rooms", server.base_url))
+        .json(&serde_json::json!({
+            "name": "Shared Room",
+            "mediaId": a.id.to_string(),
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let mut alpha = connect_room_socket(&server, &created.id.to_string(), "Alpha").await;
+    let _ = next_event(&mut alpha).await; // snapshot
+    let _ = next_event(&mut alpha).await; // presence
+    let mut bravo = connect_room_socket(&server, &created.id.to_string(), "Bravo").await;
+    let _ = next_event(&mut bravo).await; // snapshot for bravo
+    let _ = next_event(&mut alpha).await; // presence for bravo join on alpha
+    let _ = next_event(&mut bravo).await; // presence for self
+
+    alpha
+        .send(Message::Text(
+            serde_json::json!({
+                "type": "selectMedia",
+                "mediaId": b.id.to_string(),
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    for socket in [&mut alpha, &mut bravo] {
+        match next_event(socket).await {
+            ServerEvent::MediaChanged { room, .. } => {
+                assert_eq!(room.media_id, Some(b.id));
+            }
+            other => panic!("expected media changed, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn select_media_rejects_unknown_media_id() {
+    let temp_dir = TempDir::new().unwrap();
+    let root = temp_dir.path().join("library");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("known.mp4"), b"known").unwrap();
+    let server = TestServer::spawn_with_library_roots(vec![root]).await;
+
+    let scan = server.scan_library().await;
+    let known = scan.items.into_iter().next().unwrap();
+
+    let created: Room = server
+        .client
+        .post(format!("{}/api/rooms", server.base_url))
+        .json(&serde_json::json!({
+            "name": "Rejecting Room",
+            "mediaId": known.id.to_string(),
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let mut socket = connect_room_socket(&server, &created.id.to_string(), "Operator").await;
+    let _ = next_event(&mut socket).await; // snapshot
+    let _ = next_event(&mut socket).await; // presence
+
+    let phantom = uuid::Uuid::new_v4();
+    socket
+        .send(Message::Text(
+            serde_json::json!({
+                "type": "selectMedia",
+                "mediaId": phantom.to_string(),
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    match next_event(&mut socket).await {
+        ServerEvent::Error { message } => {
+            assert!(message.to_lowercase().contains("library"), "{message}");
+        }
+        other => panic!("expected error event, got {other:?}"),
+    }
+
+    // Room media stays pointed at the original item after the rejection.
+    let refreshed = server
+        .rooms()
+        .await
+        .rooms
+        .into_iter()
+        .find(|room| room.id == created.id)
+        .unwrap();
+    assert_eq!(refreshed.media_id, Some(known.id));
+}
+
+#[tokio::test]
+async fn empty_room_is_deleted_after_grace_period() {
+    let server = TestServer::spawn_with_grace(Duration::from_millis(200)).await;
+
+    let created: Room = server
+        .client
+        .post(format!("{}/api/rooms", server.base_url))
+        .json(&serde_json::json!({ "name": "Ephemeral" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert!(
+        server
+            .rooms()
+            .await
+            .rooms
+            .iter()
+            .any(|room| room.id == created.id)
+    );
+
+    tokio::time::sleep(Duration::from_millis(450)).await;
+
+    assert!(
+        server
+            .rooms()
+            .await
+            .rooms
+            .iter()
+            .all(|room| room.id != created.id),
+        "empty room should have been cleaned up after the grace period"
+    );
+}
+
+#[tokio::test]
+async fn client_join_cancels_pending_cleanup() {
+    let server = TestServer::spawn_with_grace(Duration::from_millis(200)).await;
+
+    let created: Room = server
+        .client
+        .post(format!("{}/api/rooms", server.base_url))
+        .json(&serde_json::json!({ "name": "Staying Alive" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    // Connect before the grace elapses so the pending cleanup is aborted.
+    let mut socket = connect_room_socket(&server, &created.id.to_string(), "Operator").await;
+    let _ = next_event(&mut socket).await; // snapshot
+    let _ = next_event(&mut socket).await; // presence
+
+    tokio::time::sleep(Duration::from_millis(450)).await;
+
+    assert!(
+        server
+            .rooms()
+            .await
+            .rooms
+            .iter()
+            .any(|room| room.id == created.id),
+        "cleanup should have been cancelled by the joining client"
+    );
+}
+
+#[tokio::test]
+async fn last_client_leaving_triggers_cleanup_after_grace_period() {
+    let server = TestServer::spawn_with_grace(Duration::from_millis(200)).await;
+
+    let created: Room = server
+        .client
+        .post(format!("{}/api/rooms", server.base_url))
+        .json(&serde_json::json!({ "name": "Short Lived" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let mut socket = connect_room_socket(&server, &created.id.to_string(), "Operator").await;
+    let _ = next_event(&mut socket).await; // snapshot
+    let _ = next_event(&mut socket).await; // presence
+
+    socket.send(Message::Close(None)).await.unwrap();
+    drop(socket);
+
+    tokio::time::sleep(Duration::from_millis(450)).await;
+
+    assert!(
+        server
+            .rooms()
+            .await
+            .rooms
+            .iter()
+            .all(|room| room.id != created.id),
+        "room should be cleaned up after last client leaves"
+    );
+}
+
+#[tokio::test]
+async fn persisted_empty_room_is_cleaned_up_after_restart() {
+    let temp_dir = TempDir::new().unwrap();
+    let database_path = temp_dir.path().join("syncplay.db");
+
+    // First boot: create a room and then let the process exit. Use the
+    // default long grace here so the room survives to disk.
+    let created: Room = {
+        let first = TestServer::spawn_persistent(&database_path).await;
+        let room = first
+            .client
+            .post(format!("{}/api/rooms", first.base_url))
+            .json(&serde_json::json!({ "name": "Leftover" }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        drop(first);
+        room
+    };
+
+    // Second boot: short grace, so the persisted-but-empty room falls out
+    // of the index on its own without anyone connecting.
+    let persistence = Persistence::open_at(&database_path).await.unwrap();
+    let app = build_app(
+        load_state_with_library_and_grace(
+            persistence,
+            LibraryConfig::default(),
+            Duration::from_millis(200),
+        )
+        .await
+        .unwrap(),
+    );
+    let second = TestServer::spawn_with_app(app).await;
+
+    assert!(
+        second
+            .rooms()
+            .await
+            .rooms
+            .iter()
+            .any(|room| room.id == created.id)
+    );
+
+    tokio::time::sleep(Duration::from_millis(450)).await;
+
+    assert!(
+        second
+            .rooms()
+            .await
+            .rooms
+            .iter()
+            .all(|room| room.id != created.id)
     );
 }

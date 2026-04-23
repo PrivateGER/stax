@@ -70,10 +70,11 @@ type SharedRooms = Arc<RwLock<HashMap<Uuid, SharedRoom>>>;
 type SharedRoom = Arc<RoomHub>;
 
 const ROOM_EVENT_BUFFER: usize = 64;
-/// Grace period before a room with no connected clients is deleted.
-/// Tolerates brief reconnects (refresh, network blip) without destroying
-/// a session.
-const EMPTY_ROOM_GRACE: Duration = Duration::from_secs(120);
+/// Default grace period before a room with no connected clients is
+/// deleted. Tolerates brief reconnects (refresh, network blip) without
+/// destroying a session. Integration tests can shrink this via
+/// `load_state_with_library_and_grace`.
+pub const DEFAULT_EMPTY_ROOM_GRACE: Duration = Duration::from_secs(120);
 
 #[derive(Clone)]
 pub struct AppState {
@@ -84,6 +85,7 @@ pub struct AppState {
     thumbnails: ThumbnailWorkerPool,
     probes: ProbeWorkerPool,
     cleanup_tx: mpsc::UnboundedSender<Uuid>,
+    empty_room_grace: Duration,
 }
 
 #[derive(Debug)]
@@ -95,6 +97,7 @@ struct RoomHub {
     events: broadcast::Sender<ServerEvent>,
     cleanup_tx: mpsc::UnboundedSender<Uuid>,
     cleanup_task: TokioMutex<Option<JoinHandle<()>>>,
+    empty_room_grace: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -118,6 +121,7 @@ impl RoomHub {
         persistence: Persistence,
         library: LibraryService,
         cleanup_tx: mpsc::UnboundedSender<Uuid>,
+        empty_room_grace: Duration,
     ) -> Self {
         let (events, _) = broadcast::channel(ROOM_EVENT_BUFFER);
 
@@ -129,6 +133,7 @@ impl RoomHub {
             events,
             cleanup_tx,
             cleanup_task: TokioMutex::new(None),
+            empty_room_grace,
         }
     }
 
@@ -170,8 +175,9 @@ impl RoomHub {
         }
         let room_id = self.room.read().await.id;
         let tx = self.cleanup_tx.clone();
+        let grace = self.empty_room_grace;
         let handle = tokio::spawn(async move {
-            tokio::time::sleep(EMPTY_ROOM_GRACE).await;
+            tokio::time::sleep(grace).await;
             // The receiver task double-checks connection_count before
             // deleting, so a race with a late join after this send is
             // harmless.
@@ -368,6 +374,14 @@ pub async fn load_state_with_library(
     persistence: Persistence,
     library_config: LibraryConfig,
 ) -> Result<AppState, PersistenceError> {
+    load_state_with_library_and_grace(persistence, library_config, DEFAULT_EMPTY_ROOM_GRACE).await
+}
+
+pub async fn load_state_with_library_and_grace(
+    persistence: Persistence,
+    library_config: LibraryConfig,
+    empty_room_grace: Duration,
+) -> Result<AppState, PersistenceError> {
     let stream_copy_config = StreamCopyConfig {
         cache_dir: library_config
             .stream_copy_cache_dir()
@@ -459,6 +473,7 @@ pub async fn load_state_with_library(
                     persistence.clone(),
                     library.clone(),
                     cleanup_tx.clone(),
+                    empty_room_grace,
                 )),
             )
         })
@@ -483,6 +498,7 @@ pub async fn load_state_with_library(
         thumbnails,
         probes,
         cleanup_tx,
+        empty_room_grace,
     })
 }
 
@@ -1245,6 +1261,7 @@ async fn create_room(
         state.persistence.clone(),
         state.library.clone(),
         state.cleanup_tx.clone(),
+        state.empty_room_grace,
     ));
     // No clients yet, so the cleanup timer starts ticking immediately.
     // A connecting client within 2 minutes cancels it.
@@ -1532,7 +1549,13 @@ mod tests {
         let persistence = Persistence::open_in_memory().await.unwrap();
         let library = LibraryService::new(persistence.clone(), LibraryConfig::default());
         let (cleanup_tx, cleanup_rx) = mpsc::unbounded_channel();
-        let hub = Arc::new(RoomHub::new(room, persistence, library, cleanup_tx));
+        let hub = Arc::new(RoomHub::new(
+            room,
+            persistence,
+            library,
+            cleanup_tx,
+            DEFAULT_EMPTY_ROOM_GRACE,
+        ));
         (hub, cleanup_rx)
     }
 
