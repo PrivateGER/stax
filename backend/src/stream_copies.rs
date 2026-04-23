@@ -1,6 +1,5 @@
 use std::{
     collections::HashMap,
-    env,
     path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
@@ -61,20 +60,6 @@ impl Default for StreamCopyConfig {
             hw_accel: FfmpegHardwareAcceleration::None,
             max_concurrent: DEFAULT_WORKERS,
         }
-    }
-}
-
-impl StreamCopyConfig {
-    pub fn with_env_overrides(mut self) -> Self {
-        if let Some(value) = env::var("STAX_STREAM_COPY_WORKERS")
-            .ok()
-            .and_then(|raw| raw.parse::<usize>().ok())
-            .filter(|value| *value > 0)
-        {
-            self.max_concurrent = value;
-        }
-
-        self
     }
 }
 

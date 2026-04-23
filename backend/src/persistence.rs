@@ -1,4 +1,4 @@
-use std::{collections::HashMap, env, error::Error, fmt, path::Path};
+use std::{collections::HashMap, error::Error, fmt, path::Path};
 
 use sqlx::{
     Pool, Row, Sqlite,
@@ -193,12 +193,6 @@ pub enum PersistenceError {
 }
 
 impl Persistence {
-    pub async fn open_from_env() -> Result<Self, PersistenceError> {
-        let database_path = env::var("STAX_DATABASE_PATH").unwrap_or_else(|_| "stax.db".into());
-
-        Self::open_at(database_path).await
-    }
-
     pub async fn open_at(path: impl AsRef<Path>) -> Result<Self, PersistenceError> {
         let options = SqliteConnectOptions::new()
             .filename(path)

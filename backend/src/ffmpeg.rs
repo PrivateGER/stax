@@ -1,7 +1,6 @@
-use std::{env, path::PathBuf};
+use std::path::PathBuf;
 
 use tokio::process::Command;
-use tracing::warn;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum FfmpegHardwareAcceleration {
@@ -17,30 +16,6 @@ pub enum FfmpegHardwareAcceleration {
 }
 
 impl FfmpegHardwareAcceleration {
-    pub fn from_env() -> Self {
-        let Some(raw) = env::var("STAX_HW_ACCEL").ok() else {
-            return Self::None;
-        };
-
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "" | "none" | "off" | "false" => Self::None,
-            "auto" => Self::Auto,
-            "nvenc" | "cuda" => Self::Nvenc,
-            "vaapi" => Self::Vaapi {
-                device: vaapi_device_from_env(),
-            },
-            "qsv" => Self::Qsv,
-            "videotoolbox" => Self::Videotoolbox,
-            unknown => {
-                warn!(
-                    value = unknown,
-                    "unknown STAX_HW_ACCEL value; falling back to software"
-                );
-                Self::None
-            }
-        }
-    }
-
     pub fn h264_encoder(&self) -> &'static str {
         match self {
             Self::None | Self::Auto => "libx264",
@@ -115,11 +90,8 @@ pub fn apply_input_acceleration_with_hw_frames(
     }
 }
 
-fn vaapi_device_from_env() -> PathBuf {
-    env::var_os("STAX_VAAPI_DEVICE")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/dev/dri/renderD128"))
+pub fn default_vaapi_device() -> PathBuf {
+    PathBuf::from("/dev/dri/renderD128")
 }
 
 #[cfg(test)]

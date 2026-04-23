@@ -30,8 +30,8 @@ use crate::{
         PlaybackMode, SubtitleStream, SubtitleTrack,
     },
     thumbnails::{
-        default_ffmpeg_command, default_thumbnail_cache_dir, ffmpeg_command_from_env,
-        thumbnail_cache_dir_from_env, thumbnail_is_up_to_date, thumbnail_path_for,
+        default_ffmpeg_command, default_thumbnail_cache_dir, thumbnail_is_up_to_date,
+        thumbnail_path_for,
     },
 };
 
@@ -131,21 +131,6 @@ impl Default for LibraryConfig {
 }
 
 impl LibraryConfig {
-    pub fn from_env() -> Self {
-        let mut config = match env::var_os("STAX_LIBRARY_ROOTS") {
-            Some(raw_paths) => Self::from_paths(env::split_paths(&raw_paths)),
-            None => Self::default(),
-        };
-        config.probe_command = probe_command_from_env();
-        config.ffmpeg_command = ffmpeg_command_from_env();
-        config.hw_accel = FfmpegHardwareAcceleration::from_env();
-        config.thumbnail_cache_dir = thumbnail_cache_dir_from_env();
-        config.stream_copy_cache_dir = stream_copy_cache_dir_from_env();
-        config.probe_workers = probe_workers_from_env();
-        config.walk_workers = walk_workers_from_env();
-        config
-    }
-
     pub fn from_paths(paths: impl IntoIterator<Item = PathBuf>) -> Self {
         let current_dir = env::current_dir().ok();
         let normalized = paths
@@ -217,6 +202,11 @@ impl LibraryConfig {
         self.thumbnail_cache_dir.as_deref()
     }
 
+    pub fn without_thumbnail_cache_dir(mut self) -> Self {
+        self.thumbnail_cache_dir = None;
+        self
+    }
+
     pub fn with_stream_copy_cache_dir(mut self, path: impl Into<PathBuf>) -> Self {
         self.stream_copy_cache_dir = Some(path.into());
         self
@@ -224,6 +214,11 @@ impl LibraryConfig {
 
     pub fn stream_copy_cache_dir(&self) -> Option<&Path> {
         self.stream_copy_cache_dir.as_deref()
+    }
+
+    pub fn without_stream_copy_cache_dir(mut self) -> Self {
+        self.stream_copy_cache_dir = None;
+        self
     }
 
     pub fn with_probe_workers(mut self, probe_workers: usize) -> Self {
@@ -1247,40 +1242,24 @@ fn default_probe_command() -> Option<PathBuf> {
     Some(PathBuf::from("ffprobe"))
 }
 
-fn probe_command_from_env() -> Option<PathBuf> {
-    match env::var_os("STAX_FFPROBE_BIN") {
-        Some(value) if value.is_empty() => None,
-        Some(value) => Some(PathBuf::from(value)),
-        None => default_probe_command(),
-    }
+pub fn default_probe_command_option() -> Option<PathBuf> {
+    default_probe_command()
 }
 
 fn default_stream_copy_cache_dir() -> PathBuf {
     PathBuf::from("stax-stream-copies")
 }
 
-fn stream_copy_cache_dir_from_env() -> Option<PathBuf> {
-    match env::var_os("STAX_STREAM_COPY_DIR") {
-        Some(value) if value.is_empty() => None,
-        Some(value) => Some(PathBuf::from(value)),
-        None => Some(default_stream_copy_cache_dir()),
-    }
+pub fn default_stream_copy_cache_dir_option() -> Option<PathBuf> {
+    Some(default_stream_copy_cache_dir())
 }
 
-fn probe_workers_from_env() -> usize {
-    env::var("STAX_PROBE_WORKERS")
-        .ok()
-        .and_then(|raw| raw.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_PROBE_WORKERS)
+pub fn default_probe_workers() -> usize {
+    DEFAULT_PROBE_WORKERS
 }
 
-fn walk_workers_from_env() -> usize {
-    env::var("STAX_WALK_WORKERS")
-        .ok()
-        .and_then(|raw| raw.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_WALK_WORKERS)
+pub fn default_walk_workers() -> usize {
+    DEFAULT_WALK_WORKERS
 }
 
 fn normalize_root_path(path: PathBuf, current_dir: Option<&Path>) -> Option<PathBuf> {

@@ -21,7 +21,7 @@
 //!      the same 30-second cold-open frame" problem.
 
 use std::{
-    env, fs,
+    fs,
     path::{Path, PathBuf},
     sync::Arc,
     time::Instant,
@@ -70,24 +70,7 @@ impl Default for ThumbnailConfig {
     }
 }
 
-impl ThumbnailConfig {
-    /// Pick up env-driven overrides on top of the supplied baseline. Caller
-    /// supplies the ffmpeg/cache-dir defaults from `LibraryConfig` so the
-    /// two configs stay aligned (both already follow `STAX_FFMPEG_BIN`
-    /// and `STAX_THUMBNAIL_DIR`); this only adds the worker-count
-    /// override that's specific to thumbnail generation.
-    pub fn with_env_overrides(mut self) -> Self {
-        if let Some(value) = env::var("STAX_THUMBNAIL_WORKERS")
-            .ok()
-            .and_then(|raw| raw.parse::<usize>().ok())
-            .filter(|value| *value > 0)
-        {
-            self.max_concurrent = value;
-        }
-
-        self
-    }
-}
+impl ThumbnailConfig {}
 
 #[derive(Clone, Debug)]
 pub struct ThumbnailJob {
@@ -584,24 +567,16 @@ pub fn default_thumbnail_cache_dir() -> PathBuf {
     PathBuf::from(DEFAULT_THUMBNAIL_CACHE_DIR)
 }
 
-pub fn thumbnail_cache_dir_from_env() -> Option<PathBuf> {
-    match env::var_os("STAX_THUMBNAIL_DIR") {
-        Some(value) if value.is_empty() => None,
-        Some(value) => Some(PathBuf::from(value)),
-        None => Some(default_thumbnail_cache_dir()),
-    }
+pub fn default_thumbnail_cache_dir_option() -> Option<PathBuf> {
+    Some(default_thumbnail_cache_dir())
 }
 
 pub fn default_ffmpeg_command() -> Option<PathBuf> {
     Some(PathBuf::from("ffmpeg"))
 }
 
-pub fn ffmpeg_command_from_env() -> Option<PathBuf> {
-    match env::var_os("STAX_FFMPEG_BIN") {
-        Some(value) if value.is_empty() => None,
-        Some(value) => Some(PathBuf::from(value)),
-        None => default_ffmpeg_command(),
-    }
+pub fn default_ffmpeg_command_option() -> Option<PathBuf> {
+    default_ffmpeg_command()
 }
 
 #[cfg(test)]

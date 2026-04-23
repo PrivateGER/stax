@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
-    env,
+    net::SocketAddr,
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -75,6 +76,9 @@ const ROOM_EVENT_BUFFER: usize = 64;
 /// destroying a session. Integration tests can shrink this via
 /// `load_state_with_library_and_grace`.
 pub const DEFAULT_EMPTY_ROOM_GRACE: Duration = Duration::from_secs(120);
+pub const DEFAULT_API_ADDR: &str = "127.0.0.1:3001";
+pub const DEFAULT_DATABASE_PATH: &str = "stax.db";
+pub const DEFAULT_LOG_FILTER: &str = "stax_backend=debug,tower_http=info";
 
 #[derive(Clone)]
 pub struct AppState {
@@ -86,6 +90,47 @@ pub struct AppState {
     probes: ProbeWorkerPool,
     cleanup_tx: mpsc::UnboundedSender<Uuid>,
     empty_room_grace: Duration,
+    frontend_origin: Option<HeaderValue>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RuntimeConfig {
+    pub database_path: PathBuf,
+    pub library: LibraryConfig,
+    pub stream_copy_workers: usize,
+    pub thumbnail_workers: usize,
+    pub frontend_origin: Option<String>,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            database_path: PathBuf::from(DEFAULT_DATABASE_PATH),
+            library: LibraryConfig::default(),
+            stream_copy_workers: 1,
+            thumbnail_workers: 2,
+            frontend_origin: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ServerConfig {
+    pub api_addr: SocketAddr,
+    pub runtime: RuntimeConfig,
+    pub log_filter: String,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            api_addr: DEFAULT_API_ADDR
+                .parse()
+                .expect("default API address should parse"),
+            runtime: RuntimeConfig::default(),
+            log_filter: DEFAULT_LOG_FILTER.to_string(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -404,11 +449,6 @@ impl RoomRecord {
     }
 }
 
-pub async fn state_from_env() -> Result<AppState, PersistenceError> {
-    let persistence = Persistence::open_from_env().await?;
-    load_state_with_library(persistence, LibraryConfig::from_env()).await
-}
-
 pub async fn load_state(persistence: Persistence) -> Result<AppState, PersistenceError> {
     load_state_with_library(persistence, LibraryConfig::default()).await
 }
@@ -425,28 +465,61 @@ pub async fn load_state_with_library_and_grace(
     library_config: LibraryConfig,
     empty_room_grace: Duration,
 ) -> Result<AppState, PersistenceError> {
+    load_state_with_runtime_and_grace(
+        persistence,
+        RuntimeConfig {
+            library: library_config,
+            ..RuntimeConfig::default()
+        },
+        empty_room_grace,
+    )
+    .await
+}
+
+pub async fn load_state_from_runtime(config: RuntimeConfig) -> Result<AppState, PersistenceError> {
+    let persistence = Persistence::open_at(&config.database_path).await?;
+    load_state_with_runtime(persistence, config).await
+}
+
+pub async fn load_state_with_runtime(
+    persistence: Persistence,
+    config: RuntimeConfig,
+) -> Result<AppState, PersistenceError> {
+    load_state_with_runtime_and_grace(persistence, config, DEFAULT_EMPTY_ROOM_GRACE).await
+}
+
+pub async fn load_state_with_runtime_and_grace(
+    persistence: Persistence,
+    config: RuntimeConfig,
+    empty_room_grace: Duration,
+) -> Result<AppState, PersistenceError> {
+    let frontend_origin = config.frontend_origin.as_ref().map(|origin| {
+        HeaderValue::from_str(origin).expect("frontend origin must be a valid HTTP header value")
+    });
     let stream_copy_config = StreamCopyConfig {
-        cache_dir: library_config
+        cache_dir: config
+            .library
             .stream_copy_cache_dir()
             .map(std::path::Path::to_path_buf),
-        ffmpeg_command: library_config
+        ffmpeg_command: config
+            .library
             .ffmpeg_command()
             .map(std::path::Path::to_path_buf),
-        hw_accel: library_config.hw_accel().clone(),
-        ..StreamCopyConfig::default()
-    }
-    .with_env_overrides();
+        hw_accel: config.library.hw_accel().clone(),
+        max_concurrent: config.stream_copy_workers.max(1),
+    };
     let thumbnail_config = ThumbnailConfig {
-        cache_dir: library_config
+        cache_dir: config
+            .library
             .thumbnail_cache_dir()
             .map(std::path::Path::to_path_buf),
-        ffmpeg_command: library_config
+        ffmpeg_command: config
+            .library
             .ffmpeg_command()
             .map(std::path::Path::to_path_buf),
-        hw_accel: library_config.hw_accel().clone(),
-        ..ThumbnailConfig::default()
-    }
-    .with_env_overrides();
+        hw_accel: config.library.hw_accel().clone(),
+        max_concurrent: config.thumbnail_workers.max(1),
+    };
     // Shared across the background scan pools. The gate lets the project
     // pause new probe/thumbnail work around any future foreground work that
     // needs the same library mount.
@@ -455,10 +528,11 @@ pub async fn load_state_with_library_and_grace(
         ThumbnailWorkerPool::spawn(thumbnail_config, persistence.clone(), scan_gate.clone());
 
     let probe_config = ProbeConfig {
-        probe_command: library_config
+        probe_command: config
+            .library
             .probe_command()
             .map(std::path::Path::to_path_buf),
-        max_concurrent: library_config.probe_workers(),
+        max_concurrent: config.library.probe_workers(),
     };
     let probes = ProbeWorkerPool::spawn(
         probe_config,
@@ -467,7 +541,7 @@ pub async fn load_state_with_library_and_grace(
         scan_gate.clone(),
     );
 
-    let library = LibraryService::new(persistence.clone(), library_config);
+    let library = LibraryService::new(persistence.clone(), config.library);
     library.sync_config().await?;
     let stream_copies =
         StreamCopyWorkerPool::spawn(stream_copy_config, persistence.clone(), library.clone());
@@ -542,6 +616,7 @@ pub async fn load_state_with_library_and_grace(
         probes,
         cleanup_tx,
         empty_room_grace,
+        frontend_origin,
     })
 }
 
@@ -583,6 +658,7 @@ pub async fn seeded_state() -> AppState {
 }
 
 pub fn build_app(state: AppState) -> Router {
+    let frontend_origin = state.frontend_origin.clone();
     let compression = CompressionLayer::new().compress_when(
         DefaultPredicate::new()
             .and(NotForContentType::const_new("audio/"))
@@ -618,7 +694,7 @@ pub fn build_app(state: AppState) -> Router {
 
     add_frontend_fallback(app)
         .layer(compression)
-        .layer(build_cors())
+        .layer(build_cors_with_origin(frontend_origin))
         .layer(TraceLayer::new_for_http())
 }
 
@@ -632,30 +708,22 @@ fn add_frontend_fallback(app: Router) -> Router {
     app
 }
 
-fn build_cors() -> CorsLayer {
-    match env::var("STAX_FRONTEND_ORIGIN") {
-        Ok(origin) => {
-            let origin =
-                HeaderValue::from_str(&origin).expect("STAX_FRONTEND_ORIGIN must be valid");
-
-            CorsLayer::new()
-                .allow_origin(origin)
-                .allow_methods([Method::GET, Method::POST])
-                .allow_headers(Any)
-        }
-        Err(_) => CorsLayer::new()
+fn build_cors_with_origin(origin: Option<HeaderValue>) -> CorsLayer {
+    match origin {
+        Some(origin) => CorsLayer::new()
+            .allow_origin(origin)
+            .allow_methods([Method::GET, Method::POST])
+            .allow_headers(Any),
+        None => CorsLayer::new()
             .allow_origin(Any)
             .allow_methods([Method::GET, Method::POST])
             .allow_headers(Any),
     }
 }
 
-pub fn init_tracing() {
+pub fn init_tracing(log_filter: &str) {
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "stax_backend=debug,tower_http=info".into()),
-        )
+        .with_env_filter(tracing_subscriber::EnvFilter::new(log_filter))
         .with_target(false)
         .compact()
         .init();
