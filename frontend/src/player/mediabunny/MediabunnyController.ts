@@ -204,10 +204,6 @@ export class MediabunnyController {
     this.setMuted(!this.mutedValue);
   }
 
-  getAudioTracks(): MediabunnyTrackInfo[] {
-    return this.audioTrackInfos;
-  }
-
   async selectAudioTrack(id: string): Promise<void> {
     if (!this.ready || this.disposed) return;
 

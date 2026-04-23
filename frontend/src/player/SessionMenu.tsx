@@ -18,8 +18,28 @@ export function SessionMenu({
 }: Props) {
   const [open, setOpen] = useState(false);
   const [copied, setCopied] = useState(false);
+  // Local draft so in-progress typing doesn't churn the websocket — the
+  // connection rebuilds whenever `clientName` changes, so we commit only
+  // on blur/Enter.
+  const [nameDraft, setNameDraft] = useState(clientName);
+  const [prevClientName, setPrevClientName] = useState(clientName);
   const panelRef = useRef<HTMLDivElement | null>(null);
   const buttonRef = useRef<HTMLButtonElement | null>(null);
+
+  if (clientName !== prevClientName) {
+    setPrevClientName(clientName);
+    setNameDraft(clientName);
+  }
+
+  const commitName = (value: string) => {
+    const trimmed = value.trim();
+    if (trimmed.length === 0) {
+      setNameDraft(clientName);
+      return;
+    }
+    if (trimmed === clientName) return;
+    onClientNameChange(trimmed);
+  };
 
   useEffect(() => {
     if (!open) return;
@@ -109,9 +129,17 @@ export function SessionMenu({
             <span className="label-text">Your name</span>
             <div className="name-input-row">
               <input
-                onChange={(event) => onClientNameChange(event.target.value)}
+                onBlur={(event) => commitName(event.target.value)}
+                onChange={(event) => setNameDraft(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") {
+                    event.preventDefault();
+                    commitName(event.currentTarget.value);
+                    event.currentTarget.blur();
+                  }
+                }}
                 placeholder="Browser Viewer"
-                value={clientName}
+                value={nameDraft}
               />
               <button
                 className="ghost-button"

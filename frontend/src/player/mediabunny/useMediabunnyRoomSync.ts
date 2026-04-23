@@ -67,14 +67,18 @@ export function useMediabunnyRoomSync({
   }, []);
 
   // Periodically report our position so the server can classify drift.
+  // Depend only on primitive triggers; `sendRef` stays current above so we
+  // don't rebuild the interval when upstream objects get new identities
+  // (e.g. the 250ms clock tick below).
+  const hasRoom = socket.room !== null;
   useEffect(() => {
-    if (!live || !item || !socket.room || !ready) return;
+    if (!live || !item || !hasRoom || !ready) return;
 
     const interval = window.setInterval(() => {
       const controller = controllerRef.current;
       if (!controller) return;
       if (hasActivePendingSeek(pendingSeekRef, monotonicNow())) return;
-      socket.send({
+      sendRef.current({
         type: "reportPosition",
         positionSeconds: Number(
           Math.max(0, controller.state.currentTime).toFixed(3),
@@ -83,7 +87,7 @@ export function useMediabunnyRoomSync({
     }, 2000);
 
     return () => window.clearInterval(interval);
-  }, [live, item, socket.room, socket, ready, controllerRef]);
+  }, [live, item, hasRoom, ready, controllerRef]);
 
   // Follow the room's authoritative state.
   useEffect(() => {

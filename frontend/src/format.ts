@@ -74,11 +74,6 @@ export function mediaBadges(item: MediaItem): string[] {
   return badges.filter((value): value is string => Boolean(value));
 }
 
-export function formatSignedDelta(value: number) {
-  const prefix = value >= 0 ? "+" : "";
-  return `${prefix}${value.toFixed(2)}`;
-}
-
 export function posterInitials(title: string) {
   const words = title.split(/\s+/).filter(Boolean);
 

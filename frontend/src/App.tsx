@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { api } from "./api";
 import { AdminPage } from "./pages/AdminPage";
@@ -186,8 +186,12 @@ export default function App() {
     });
   }, []);
 
-  const findItem = (mediaId: string) =>
-    items.find((item) => item.id === mediaId) ?? null;
+  const itemsById = useMemo(() => {
+    const map = new Map<string, MediaItem>();
+    for (const item of items) map.set(item.id, item);
+    return map;
+  }, [items]);
+  const findItem = (mediaId: string) => itemsById.get(mediaId) ?? null;
 
   return (
     <div className="app">

@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 
-import type { AudioTrackEntry } from "./useAudioTracks";
 import type { SubtitleSource } from "./subtitleSources";
+
+type AudioTrackEntry = { id: string; label: string };
 
 type Props = {
   subtitleSources: SubtitleSource[];
