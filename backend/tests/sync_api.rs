@@ -12,7 +12,7 @@ use axum::Router;
 use futures_util::{SinkExt, StreamExt, future::join_all};
 use reqwest::Client;
 use reqwest::header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_RANGE, RANGE};
-use syncplay_backend::{
+use stax_backend::{
     build_app,
     library::LibraryConfig,
     load_state, load_state_with_library, load_state_with_library_and_grace,
@@ -176,9 +176,9 @@ impl TestServer {
         &self,
         timeout_duration: Duration,
         mut predicate: F,
-    ) -> syncplay_backend::protocol::MediaItem
+    ) -> stax_backend::protocol::MediaItem
     where
-        F: FnMut(&syncplay_backend::protocol::MediaItem) -> bool,
+        F: FnMut(&stax_backend::protocol::MediaItem) -> bool,
     {
         let deadline = std::time::Instant::now() + timeout_duration;
         loop {
@@ -334,7 +334,7 @@ impl TestServer {
         &self,
         media_id: &str,
         expected: &str,
-    ) -> syncplay_backend::protocol::MediaItem {
+    ) -> stax_backend::protocol::MediaItem {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
             let library = self.library().await;
@@ -1111,7 +1111,7 @@ async fn concurrent_room_creation_returns_unique_rooms_and_preserves_all_entries
 #[tokio::test]
 async fn startup_does_not_seed_preview_room() {
     let temp_dir = TempDir::new().unwrap();
-    let database_path = temp_dir.path().join("syncplay.db");
+    let database_path = temp_dir.path().join("stax.db");
 
     let server = TestServer::spawn_persistent(&database_path).await;
     let rooms = server.rooms().await.rooms;
@@ -1122,7 +1122,7 @@ async fn startup_does_not_seed_preview_room() {
 #[tokio::test]
 async fn library_index_survives_restart() {
     let temp_dir = TempDir::new().unwrap();
-    let database_path = temp_dir.path().join("syncplay.db");
+    let database_path = temp_dir.path().join("stax.db");
     let root = temp_dir.path().join("library");
     fs::create_dir_all(&root).unwrap();
     fs::write(root.join("movie.mp4"), b"movie").unwrap();
@@ -1149,7 +1149,7 @@ async fn library_index_survives_restart() {
 #[tokio::test]
 async fn library_probe_metadata_survives_restart() {
     let temp_dir = TempDir::new().unwrap();
-    let database_path = temp_dir.path().join("syncplay.db");
+    let database_path = temp_dir.path().join("stax.db");
     let root = temp_dir.path().join("library");
     fs::create_dir_all(&root).unwrap();
     fs::write(root.join("movie.mp4"), b"movie").unwrap();
@@ -1202,7 +1202,7 @@ JSON
 #[tokio::test]
 async fn library_subtitles_survive_restart() {
     let temp_dir = TempDir::new().unwrap();
-    let database_path = temp_dir.path().join("syncplay.db");
+    let database_path = temp_dir.path().join("stax.db");
     let root = temp_dir.path().join("library");
     fs::create_dir_all(&root).unwrap();
     fs::write(root.join("movie.mp4"), b"movie").unwrap();
@@ -1232,7 +1232,7 @@ async fn library_subtitles_survive_restart() {
 #[tokio::test]
 async fn removing_a_library_root_from_config_cascades_its_indexed_items_on_restart() {
     let temp_dir = TempDir::new().unwrap();
-    let database_path = temp_dir.path().join("syncplay.db");
+    let database_path = temp_dir.path().join("stax.db");
     let movies_root = temp_dir.path().join("movies");
     let music_root = temp_dir.path().join("music");
     fs::create_dir_all(&movies_root).unwrap();
@@ -1609,7 +1609,7 @@ async fn websocket_malformed_payload_returns_parse_error_and_recovers() {
 #[tokio::test]
 async fn persisted_room_state_survives_restart() {
     let temp_dir = TempDir::new().unwrap();
-    let database_path = temp_dir.path().join("syncplay.db");
+    let database_path = temp_dir.path().join("stax.db");
 
     let first_server = TestServer::spawn_persistent(&database_path).await;
     let create_response = first_server
@@ -1786,7 +1786,7 @@ async fn pause_without_position_uses_authoritative_clock_progress() {
         ServerEvent::PlaybackUpdated { room, .. } => {
             assert_eq!(
                 room.playback_state.status,
-                syncplay_backend::protocol::PlaybackStatus::Paused
+                stax_backend::protocol::PlaybackStatus::Paused
             );
             assert!(room.playback_state.position_seconds >= 5.2);
             assert_eq!(
@@ -2026,7 +2026,7 @@ async fn playback_updates_broadcast_in_order_to_other_clients() {
             room,
         } => {
             assert_eq!(actor, "Alpha");
-            assert_eq!(action, syncplay_backend::protocol::PlaybackAction::Play);
+            assert_eq!(action, stax_backend::protocol::PlaybackAction::Play);
             assert_eq!(room.playback_state.position_seconds, 3.0);
         }
         other => panic!("expected play update on observer, got {other:?}"),
@@ -2039,7 +2039,7 @@ async fn playback_updates_broadcast_in_order_to_other_clients() {
             room,
         } => {
             assert_eq!(actor, "Alpha");
-            assert_eq!(action, syncplay_backend::protocol::PlaybackAction::Seek);
+            assert_eq!(action, stax_backend::protocol::PlaybackAction::Seek);
             assert_eq!(room.playback_state.position_seconds, 7.5);
         }
         other => panic!("expected seek update on observer, got {other:?}"),
@@ -2820,11 +2820,11 @@ async fn stream_endpoint_returns_409_when_stream_copy_is_missing() {
         .unwrap();
     assert_eq!(
         item.playback_mode,
-        syncplay_backend::protocol::PlaybackMode::NeedsPreparation
+        stax_backend::protocol::PlaybackMode::NeedsPreparation
     );
     assert_eq!(
         item.preparation_state,
-        syncplay_backend::protocol::PreparationState::NeedsPreparation
+        stax_backend::protocol::PreparationState::NeedsPreparation
     );
 
     let response = server
@@ -2871,7 +2871,7 @@ async fn create_stream_copy_returns_409_for_direct_playable_media() {
             &item.id.to_string(),
             &CreateStreamCopyRequest {
                 audio_stream_index: item.audio_streams.first().map(|stream| stream.index),
-                subtitle_mode: syncplay_backend::protocol::SubtitleMode::Off,
+                subtitle_mode: stax_backend::protocol::SubtitleMode::Off,
                 subtitle: None,
             },
         )
@@ -2917,7 +2917,7 @@ async fn create_stream_copy_exposes_preparing_state_while_job_runs() {
             &item.id.to_string(),
             &CreateStreamCopyRequest {
                 audio_stream_index: item.audio_streams.first().map(|stream| stream.index),
-                subtitle_mode: syncplay_backend::protocol::SubtitleMode::Off,
+                subtitle_mode: stax_backend::protocol::SubtitleMode::Off,
                 subtitle: None,
             },
         )
@@ -2929,7 +2929,7 @@ async fn create_stream_copy_exposes_preparing_state_while_job_runs() {
         .await;
     assert_eq!(
         preparing.preparation_state,
-        syncplay_backend::protocol::PreparationState::Preparing
+        stax_backend::protocol::PreparationState::Preparing
     );
 }
 
@@ -2974,7 +2974,7 @@ async fn get_stream_copy_exposes_live_progress_while_job_runs() {
             &item.id.to_string(),
             &CreateStreamCopyRequest {
                 audio_stream_index: item.audio_streams.first().map(|stream| stream.index),
-                subtitle_mode: syncplay_backend::protocol::SubtitleMode::Off,
+                subtitle_mode: stax_backend::protocol::SubtitleMode::Off,
                 subtitle: None,
             },
         )
@@ -3042,9 +3042,9 @@ async fn prepared_stream_copy_serves_prepared_media_and_vtt_subtitle() {
             &item.id.to_string(),
             &CreateStreamCopyRequest {
                 audio_stream_index: item.audio_streams.first().map(|stream| stream.index),
-                subtitle_mode: syncplay_backend::protocol::SubtitleMode::Sidecar,
-                subtitle: Some(syncplay_backend::protocol::StreamCopySubtitleSelection {
-                    kind: syncplay_backend::protocol::SubtitleSourceKind::Sidecar,
+                subtitle_mode: stax_backend::protocol::SubtitleMode::Sidecar,
+                subtitle: Some(stax_backend::protocol::StreamCopySubtitleSelection {
+                    kind: stax_backend::protocol::SubtitleSourceKind::Sidecar,
                     index: 0,
                 }),
             },
@@ -3057,7 +3057,7 @@ async fn prepared_stream_copy_serves_prepared_media_and_vtt_subtitle() {
         .await;
     assert_eq!(
         prepared.preparation_state,
-        syncplay_backend::protocol::PreparationState::Prepared
+        stax_backend::protocol::PreparationState::Prepared
     );
 
     let media_response = server
@@ -3121,9 +3121,9 @@ async fn create_stream_copy_rejects_non_text_embedded_subtitle_for_sidecar_mode(
             &item.id.to_string(),
             &CreateStreamCopyRequest {
                 audio_stream_index: item.audio_streams.first().map(|stream| stream.index),
-                subtitle_mode: syncplay_backend::protocol::SubtitleMode::Sidecar,
-                subtitle: Some(syncplay_backend::protocol::StreamCopySubtitleSelection {
-                    kind: syncplay_backend::protocol::SubtitleSourceKind::Embedded,
+                subtitle_mode: stax_backend::protocol::SubtitleMode::Sidecar,
+                subtitle: Some(stax_backend::protocol::StreamCopySubtitleSelection {
+                    kind: stax_backend::protocol::SubtitleSourceKind::Embedded,
                     index: 2,
                 }),
             },
@@ -3240,8 +3240,18 @@ async fn select_media_broadcasts_change_to_other_clients() {
     let server = TestServer::spawn_with_library_roots(vec![root]).await;
 
     let scan = server.scan_library().await;
-    let a = scan.items.iter().find(|i| i.relative_path == "a.mp4").unwrap().clone();
-    let b = scan.items.iter().find(|i| i.relative_path == "b.mp4").unwrap().clone();
+    let a = scan
+        .items
+        .iter()
+        .find(|i| i.relative_path == "a.mp4")
+        .unwrap()
+        .clone();
+    let b = scan
+        .items
+        .iter()
+        .find(|i| i.relative_path == "b.mp4")
+        .unwrap()
+        .clone();
 
     let created: Room = server
         .client
@@ -3455,7 +3465,7 @@ async fn last_client_leaving_triggers_cleanup_after_grace_period() {
 #[tokio::test]
 async fn persisted_empty_room_is_cleaned_up_after_restart() {
     let temp_dir = TempDir::new().unwrap();
-    let database_path = temp_dir.path().join("syncplay.db");
+    let database_path = temp_dir.path().join("stax.db");
 
     // First boot: create a room and then let the process exit. Use the
     // default long grace here so the room survives to disk.

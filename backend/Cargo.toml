@@ -1,5 +1,5 @@
 [package]
-name = "syncplay-backend"
+name = "stax-backend"
 version = "0.1.0"
 edition = "2024"
 

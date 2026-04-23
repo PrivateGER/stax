@@ -1,6 +1,6 @@
-use std::{env, net::SocketAddr};
+use std::net::SocketAddr;
 
-use syncplay_backend::{build_app, init_tracing, shutdown_signal, state_from_env};
+use stax_backend::{build_app, env_config, init_tracing, shutdown_signal, state_from_env};
 use tracing::info;
 
 #[tokio::main]
@@ -13,12 +13,13 @@ async fn main() {
             .expect("backend state should initialize"),
     );
 
-    let bind_address = env::var("SYNCPLAY_API_ADDR").unwrap_or_else(|_| "127.0.0.1:3001".into());
+    let bind_address = env_config::var("STAX_API_ADDR", "SYNCPLAY_API_ADDR")
+        .unwrap_or_else(|_| "127.0.0.1:3001".into());
     let socket_addr: SocketAddr = bind_address
         .parse()
-        .expect("SYNCPLAY_API_ADDR must be a valid host:port pair");
+        .expect("STAX_API_ADDR must be a valid host:port pair");
 
-    info!("syncplay backend listening on http://{socket_addr}");
+    info!("stax backend listening on http://{socket_addr}");
 
     let listener = tokio::net::TcpListener::bind(socket_addr)
         .await

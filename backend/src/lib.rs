@@ -1,6 +1,5 @@
 use std::{
     collections::HashMap,
-    env,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -35,6 +34,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 pub mod clock;
+pub mod env_config;
 pub mod ffmpeg;
 pub mod library;
 pub mod persistence;
@@ -633,10 +633,10 @@ fn add_frontend_fallback(app: Router) -> Router {
 }
 
 fn build_cors() -> CorsLayer {
-    match env::var("SYNCPLAY_FRONTEND_ORIGIN") {
+    match env_config::var("STAX_FRONTEND_ORIGIN", "SYNCPLAY_FRONTEND_ORIGIN") {
         Ok(origin) => {
             let origin =
-                HeaderValue::from_str(&origin).expect("SYNCPLAY_FRONTEND_ORIGIN must be valid");
+                HeaderValue::from_str(&origin).expect("STAX_FRONTEND_ORIGIN must be valid");
 
             CorsLayer::new()
                 .allow_origin(origin)
@@ -654,7 +654,7 @@ pub fn init_tracing() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "syncplay_backend=debug,tower_http=info".into()),
+                .unwrap_or_else(|_| "stax_backend=debug,tower_http=info".into()),
         )
         .with_target(false)
         .compact()
@@ -690,7 +690,7 @@ pub async fn shutdown_signal() {
 async fn health() -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok",
-        service: "syncplay-backend",
+        service: "stax-backend",
         version: env!("CARGO_PKG_VERSION"),
     })
 }
@@ -1357,7 +1357,8 @@ async fn handle_room_socket(
     let mut room_events = room.subscribe();
     let connection_count = room.join().await;
     let connection_id = Uuid::new_v4();
-    room.add_participant(connection_id, client_name.clone()).await;
+    room.add_participant(connection_id, client_name.clone())
+        .await;
     let snapshot = room.snapshot().await;
     let participants = room.participant_list().await;
 
@@ -1517,7 +1518,10 @@ fn sanitize_client_name(client_name: Option<String>) -> String {
 /// peer projections run ahead of reality.
 const MAX_CLIENT_ONE_WAY_MS: u32 = 2_000;
 
-fn back_date_for_client_latency(now: OffsetDateTime, client_one_way_ms: Option<u32>) -> OffsetDateTime {
+fn back_date_for_client_latency(
+    now: OffsetDateTime,
+    client_one_way_ms: Option<u32>,
+) -> OffsetDateTime {
     let clamped = client_one_way_ms.unwrap_or(0).min(MAX_CLIENT_ONE_WAY_MS);
     now - TimeDuration::milliseconds(clamped as i64)
 }

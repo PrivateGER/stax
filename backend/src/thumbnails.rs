@@ -21,7 +21,7 @@
 //!      the same 30-second cold-open frame" problem.
 
 use std::{
-    env, fs,
+    fs,
     path::{Path, PathBuf},
     sync::Arc,
     time::Instant,
@@ -37,12 +37,16 @@ use uuid::Uuid;
 
 use crate::{
     clock::format_timestamp,
+    env_config::{
+        default_path as default_data_path, var as configured_var, var_os as configured_var_os,
+    },
     ffmpeg::{FfmpegHardwareAcceleration, apply_input_acceleration},
     persistence::{PendingThumbnail, Persistence},
     scan_gate::ScanGate,
 };
 
-const DEFAULT_THUMBNAIL_CACHE_DIR: &str = "syncplay-thumbnails";
+const DEFAULT_THUMBNAIL_CACHE_DIR: &str = "stax-thumbnails";
+const LEGACY_THUMBNAIL_CACHE_DIR: &str = "syncplay-thumbnails";
 const DEFAULT_WORKERS: usize = 2;
 const THUMBNAIL_WIDTH: u32 = 480;
 /// Image extensions tried for sidecar art, in order of preference.
@@ -73,11 +77,11 @@ impl Default for ThumbnailConfig {
 impl ThumbnailConfig {
     /// Pick up env-driven overrides on top of the supplied baseline. Caller
     /// supplies the ffmpeg/cache-dir defaults from `LibraryConfig` so the
-    /// two configs stay aligned (both already follow `SYNCPLAY_FFMPEG_BIN`
-    /// and `SYNCPLAY_THUMBNAIL_DIR`); this only adds the worker-count
+    /// two configs stay aligned (both already follow `STAX_FFMPEG_BIN`
+    /// and `STAX_THUMBNAIL_DIR`); this only adds the worker-count
     /// override that's specific to thumbnail generation.
     pub fn with_env_overrides(mut self) -> Self {
-        if let Some(value) = env::var("SYNCPLAY_THUMBNAIL_WORKERS")
+        if let Some(value) = configured_var("STAX_THUMBNAIL_WORKERS", "SYNCPLAY_THUMBNAIL_WORKERS")
             .ok()
             .and_then(|raw| raw.parse::<usize>().ok())
             .filter(|value| *value > 0)
@@ -581,11 +585,11 @@ pub fn thumbnail_seek_seconds(duration_seconds: Option<f64>) -> f64 {
 }
 
 pub fn default_thumbnail_cache_dir() -> PathBuf {
-    PathBuf::from(DEFAULT_THUMBNAIL_CACHE_DIR)
+    default_data_path(DEFAULT_THUMBNAIL_CACHE_DIR, LEGACY_THUMBNAIL_CACHE_DIR)
 }
 
 pub fn thumbnail_cache_dir_from_env() -> Option<PathBuf> {
-    match env::var_os("SYNCPLAY_THUMBNAIL_DIR") {
+    match configured_var_os("STAX_THUMBNAIL_DIR", "SYNCPLAY_THUMBNAIL_DIR") {
         Some(value) if value.is_empty() => None,
         Some(value) => Some(PathBuf::from(value)),
         None => Some(default_thumbnail_cache_dir()),
@@ -597,7 +601,7 @@ pub fn default_ffmpeg_command() -> Option<PathBuf> {
 }
 
 pub fn ffmpeg_command_from_env() -> Option<PathBuf> {
-    match env::var_os("SYNCPLAY_FFMPEG_BIN") {
+    match configured_var_os("STAX_FFMPEG_BIN", "SYNCPLAY_FFMPEG_BIN") {
         Some(value) if value.is_empty() => None,
         Some(value) => Some(PathBuf::from(value)),
         None => default_ffmpeg_command(),
