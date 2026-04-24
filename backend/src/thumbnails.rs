@@ -70,8 +70,6 @@ impl Default for ThumbnailConfig {
     }
 }
 
-impl ThumbnailConfig {}
-
 #[derive(Clone, Debug)]
 pub struct ThumbnailJob {
     pub media_id: Uuid,
@@ -567,16 +565,8 @@ pub fn default_thumbnail_cache_dir() -> PathBuf {
     PathBuf::from(DEFAULT_THUMBNAIL_CACHE_DIR)
 }
 
-pub fn default_thumbnail_cache_dir_option() -> Option<PathBuf> {
-    Some(default_thumbnail_cache_dir())
-}
-
 pub fn default_ffmpeg_command() -> Option<PathBuf> {
     Some(PathBuf::from("ffmpeg"))
-}
-
-pub fn default_ffmpeg_command_option() -> Option<PathBuf> {
-    default_ffmpeg_command()
 }
 
 #[cfg(test)]

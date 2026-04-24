@@ -1272,16 +1272,8 @@ fn default_probe_command() -> Option<PathBuf> {
     Some(PathBuf::from("ffprobe"))
 }
 
-pub fn default_probe_command_option() -> Option<PathBuf> {
-    default_probe_command()
-}
-
 fn default_stream_copy_cache_dir() -> PathBuf {
     PathBuf::from("stax-stream-copies")
-}
-
-pub fn default_stream_copy_cache_dir_option() -> Option<PathBuf> {
-    Some(default_stream_copy_cache_dir())
 }
 
 pub fn default_probe_workers() -> usize {
