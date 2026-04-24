@@ -1,55 +1,14 @@
-# Syncplay
+# Stax
 
-Starter monorepo for a synced media server with a Rust backend and React frontend.
+A small Plex/Jellyfin-shaped media server experiment with a Rust backend and a
+React frontend. It indexes local media, serves browser-playable streams,
+generates thumbnails, and has watch-together rooms with synchronized
+playback over WebSockets.
 
-## Stack
+This project is 100% LLM slop. Do not run it on the public internet, trust it
+with anything important, or mistake it for production software. It's not. I do not give a shit.
 
-- Backend: Rust, Axum, Tokio
-- Frontend: React, TypeScript, Vite
-
-## Layout
-
-- `backend/`: Rust API server, room clock, websocket protocol, and integration tests
-- `frontend/`: browser UI for library browsing, playback, and optional Watch Together sessions
-- `docs/`: architecture and implementation planning documents
-
-## Architecture
-
-- See [docs/architecture.md](/home/latte/WebstormProjects/syncplay/docs/architecture.md) for the target system design and phased implementation roadmap.
-
-## Product Direction
-
-- See [docs/product-direction.md](/home/latte/WebstormProjects/syncplay/docs/product-direction.md) for the intended Plex-like, library-first product shape and UX guardrails.
-
-## Quick start
-
-### Backend
-
-```bash
-cd backend
-cargo run
-```
-
-The API listens on `http://127.0.0.1:3001` by default.
-Room and playback state now persist in SQLite. Set `SYNCPLAY_DATABASE_PATH=/path/to/syncplay.db` to override the default `backend/syncplay.db` location when running from the backend directory.
-Set `SYNCPLAY_LIBRARY_ROOTS=/media/movies:/media/shows` to configure one or more library roots for indexing on Unix-like systems.
-Set `SYNCPLAY_FFPROBE_BIN=/usr/local/bin/ffprobe` to override the probe binary used for media metadata extraction.
-Set `SYNCPLAY_FFMPEG_BIN=/usr/local/bin/ffmpeg` (or empty to disable) to control the binary used for thumbnail generation, and `SYNCPLAY_THUMBNAIL_DIR=/var/lib/syncplay/thumbnails` to choose where generated thumbnails are cached on disk.
-Set `SYNCPLAY_HW_ACCEL=nvenc|vaapi|qsv|videotoolbox|auto|none` to enable FFmpeg hardware acceleration for video-heavy paths. VAAPI uses `SYNCPLAY_VAAPI_DEVICE=/dev/dri/renderD128` by default.
-
-### Frontend
-
-```bash
-cd frontend
-npm install
-npm run dev
-```
-
-The Vite dev server listens on `http://127.0.0.1:5173` and proxies `/api` requests to the backend.
-
-### Release binary
-
-Release builds embed the compiled frontend assets into the backend binary:
+Release builds embed the frontend into the backend binary:
 
 ```bash
 cd frontend
@@ -60,60 +19,11 @@ cd ../backend
 cargo build --release
 ```
 
-The release binary serves the SPA from the backend origin, for example `http://127.0.0.1:3001/`, while keeping `/api/...` reserved for API routes.
-
-## Current endpoints
-
-- `GET /api/health`
-- `GET /api/library`
-- `POST /api/library/scan`
-- `GET /api/media/:media_id/stream`
-- `GET /api/media/:media_id/subtitles/:track_index`
-- `GET /api/media/:media_id/subtitles/embedded/:stream_index`
-- `GET /api/media/:media_id/thumbnail`
-- `GET /api/rooms`
-- `POST /api/rooms`
-- `GET /api/rooms/:room_id/ws`
-
-## Realtime protocol
-
-The room WebSocket accepts JSON playback commands:
-
-- `{"type":"play","positionSeconds":12.3}`
-- `{"type":"pause","positionSeconds":12.3}`
-- `{"type":"seek","positionSeconds":42.0}`
-- `{"type":"reportPosition","positionSeconds":42.4}`
-
-The backend sends JSON events for:
-
-- initial room snapshots
-- playback updates
-- presence changes
-- drift correction suggestions
-- protocol errors
-
-Room snapshots and playback updates now include authoritative clock metadata:
-
-- `positionSeconds`: effective position at the time the event was emitted
-- `anchorPositionSeconds`: server-side anchor position used for the room clock
-- `clockUpdatedAt`: when the room clock anchor last changed
-- `emittedAt`: when the current state snapshot was generated
-- `playbackRate`: current server playback rate
-- `driftToleranceSeconds`: delta considered “in sync”
-
-## Testing
-
-### Backend
+Example backend run:
 
 ```bash
-cd backend
-cargo test
+./target/release/stax-backend \
+  --api-addr 0.0.0.0:3001 \
+  --library-root /path/to/media \
+  --database-path ./stax.db
 ```
-
-The backend now includes unit tests plus integration tests that exercise real HTTP and WebSocket flows, including validation failures and drift correction behavior.
-Those tests also cover restart recovery against a real SQLite database, repeated library rescans for changed or deleted files, stubbed `ffprobe` metadata extraction success and failure paths, sidecar subtitle discovery and persistence, subtitle streaming with on-the-fly SRT to WebVTT conversion, and byte-range media streaming.
-
-## Next steps
-
-- Add room-selected media so the synchronized player is tied to room state instead of a local preview choice
-- Add browser tests for two-tab pause/play/seek behavior with the real player
