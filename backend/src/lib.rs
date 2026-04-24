@@ -52,7 +52,7 @@ mod frontend_assets;
 use clock::{AuthoritativePlaybackClock, format_timestamp, round_to};
 use library::{LibraryConfig, LibraryService};
 use persistence::{Persistence, PersistenceError, StreamCopyRecord, StreamCopyRequestRecord};
-use probes::{ProbeConfig, ProbeJob, ProbeWorkerPool};
+use probes::{ProbeConfig, ProbeWorkerPool};
 use protocol::{
     ClientSocketMessage, CreateRoomRequest, CreateStreamCopyRequest, HealthResponse,
     LibraryResponse, LibraryScanResponse, LibraryStatusResponse, MediaItem, Participant,
@@ -65,7 +65,7 @@ use streaming::{
     stream_media_response, stream_subtitle_response, stream_thumbnail_response,
     stream_webvtt_file_response, unsatisfiable_range_response,
 };
-use thumbnails::{ThumbnailConfig, ThumbnailJob, ThumbnailWorkerPool};
+use thumbnails::{ThumbnailConfig, ThumbnailWorkerPool};
 
 type SharedRooms = Arc<RwLock<HashMap<Uuid, SharedRoom>>>;
 type SharedRoom = Arc<RoomHub>;
@@ -670,6 +670,7 @@ pub fn build_app(state: AppState) -> Router {
         .route("/api/library", get(list_library))
         .route("/api/library/status", get(library_status))
         .route("/api/library/scan", post(scan_library))
+        .route("/api/media/{media_id}", get(get_media))
         .route("/api/media/{media_id}/stream", get(stream_media))
         .route(
             "/api/media/{media_id}/stream-copy",
@@ -804,41 +805,31 @@ async fn scan_library(
         ApiError::internal("Failed to scan library.")
     })?;
 
-    // Stage 1 (the walk) is now finished — every discovered file has a
-    // row in `media_items`. Hand the per-item work off to the background
-    // pools so the HTTP response returns immediately:
-    //
-    // - Items with no probe yet (new or changed since last scan) go to
-    //   the probe pool. A successful probe will chain its own thumbnail
-    //   job, so we explicitly *don't* enqueue a thumbnail here — that
-    //   would race the probe and waste an ffmpeg invocation on the
-    //   wrong codec/duration assumptions.
-    // - Items that came back from cache already have probe data; if
-    //   they're missing a thumbnail (cache row was kept but thumbnail
-    //   was never generated, or generation failed and was cleared) we
-    //   enqueue a thumbnail directly.
-    let mut probes_enqueued = 0usize;
-    let mut thumbnails_enqueued = 0usize;
-    for item in &response.items {
-        let needs_probe = item.probed_at.is_none() && item.probe_error.is_none();
-        if needs_probe {
-            state.probes.enqueue(ProbeJob {
-                media_id: item.id,
-                media_path: std::path::PathBuf::from(&item.root_path).join(&item.relative_path),
-                root_path: std::path::PathBuf::from(&item.root_path),
-                extension: item.extension.clone(),
-            });
-            probes_enqueued += 1;
-        } else if item.thumbnail_generated_at.is_none() && item.thumbnail_error.is_none() {
-            state.thumbnails.enqueue(ThumbnailJob {
-                media_id: item.id,
-                media_path: std::path::PathBuf::from(&item.root_path).join(&item.relative_path),
-                video_codec: item.video_codec.clone(),
-                duration_seconds: item.duration_seconds,
-            });
-            thumbnails_enqueued += 1;
-        }
-    }
+    // Stage 1 (the walk) is now finished — every discovered file has a row
+    // in `media_items`. Hand background work off using internal pending-job
+    // queries so the public library summary can stay lean.
+    let pending_probes = state
+        .persistence
+        .list_pending_probes()
+        .await
+        .map_err(|error| {
+            warn!(%error, "failed to load pending probes after scan");
+            ApiError::internal("Failed to enqueue library scan work.")
+        })?;
+    let probes_enqueued = pending_probes.len();
+    state.probes.enqueue_pending(pending_probes);
+
+    let pending_thumbnails =
+        state
+            .persistence
+            .list_pending_thumbnails()
+            .await
+            .map_err(|error| {
+                warn!(%error, "failed to load pending thumbnails after scan");
+                ApiError::internal("Failed to enqueue library scan work.")
+            })?;
+    let thumbnails_enqueued = pending_thumbnails.len();
+    state.thumbnails.enqueue_pending(pending_thumbnails);
     tracing::info!(
         scanned = response.items.len(),
         probes_enqueued,
@@ -847,6 +838,16 @@ async fn scan_library(
     );
 
     Ok(Json(response))
+}
+
+async fn get_media(
+    State(state): State<AppState>,
+    Path(media_id): Path<Uuid>,
+) -> Result<Json<MediaItem>, ApiError> {
+    let media_item =
+        load_media_item(&state, media_id, "get_media", "Failed to load media.").await?;
+
+    Ok(Json(media_item))
 }
 
 async fn stream_media(

@@ -19,8 +19,8 @@ use stax_backend::{
     persistence::Persistence,
     protocol::{
         CreateStreamCopyRequest, DriftCorrectionAction, LibraryResponse, LibraryScanResponse,
-        LibraryStatusResponse, PlaybackStatus, Room, RoomsResponse, ServerEvent, StreamCopyStatus,
-        StreamCopySummary,
+        LibraryStatusResponse, MediaItem, MediaSummary, PlaybackStatus, Room, RoomsResponse,
+        ServerEvent, StreamCopyStatus, StreamCopySummary,
     },
     seeded_state,
 };
@@ -155,6 +155,19 @@ impl TestServer {
             .unwrap()
     }
 
+    async fn media(&self, media_id: &str) -> MediaItem {
+        self.client
+            .get(format!("{}/api/media/{media_id}", self.base_url))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
+    }
+
     async fn library_status(&self) -> LibraryStatusResponse {
         self.client
             .get(format!("{}/api/library/status", self.base_url))
@@ -176,9 +189,9 @@ impl TestServer {
         &self,
         timeout_duration: Duration,
         mut predicate: F,
-    ) -> stax_backend::protocol::MediaItem
+    ) -> MediaSummary
     where
-        F: FnMut(&stax_backend::protocol::MediaItem) -> bool,
+        F: FnMut(&MediaSummary) -> bool,
     {
         let deadline = std::time::Instant::now() + timeout_duration;
         loop {
@@ -208,7 +221,7 @@ impl TestServer {
             let pending = library
                 .items
                 .iter()
-                .filter(|item| item.probed_at.is_none() && item.probe_error.is_none())
+                .filter(|item| item.duration_seconds.is_none() && item.probe_error.is_none())
                 .count();
             if pending == 0 {
                 return library;
@@ -230,7 +243,7 @@ impl TestServer {
             let probe_pending = library
                 .items
                 .iter()
-                .filter(|item| item.probed_at.is_none() && item.probe_error.is_none())
+                .filter(|item| item.duration_seconds.is_none() && item.probe_error.is_none())
                 .count();
             let thumb_pending = library
                 .items
@@ -330,11 +343,7 @@ impl TestServer {
         }
     }
 
-    async fn wait_for_preparation_state(
-        &self,
-        media_id: &str,
-        expected: &str,
-    ) -> stax_backend::protocol::MediaItem {
+    async fn wait_for_preparation_state(&self, media_id: &str, expected: &str) -> MediaSummary {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
             let library = self.library().await;
@@ -809,7 +818,7 @@ JSON
     // Probes now run in the background after the walk returns; refetch
     // once the pool has caught up so we see the populated metadata.
     let library = server.wait_for_probes_complete().await;
-    let item = &library.items[0];
+    let item = server.media(&library.items[0].id.to_string()).await;
 
     assert_eq!(item.duration_seconds, Some(95.375));
     assert_eq!(
@@ -851,7 +860,6 @@ exit 2
     let library = server.wait_for_probes_complete().await;
     let item = &library.items[0];
 
-    assert!(item.probed_at.is_some());
     assert_eq!(item.duration_seconds, None);
     assert!(
         item.probe_error
@@ -1055,7 +1063,7 @@ async fn library_scan_discovers_sidecar_subtitles() {
     let server = TestServer::spawn_with_library_roots(vec![root]).await;
 
     let scan = server.scan_library().await;
-    let item = &scan.items[0];
+    let item = server.media(&scan.items[0].id.to_string()).await;
 
     assert_eq!(item.subtitle_tracks.len(), 2);
     assert_eq!(item.subtitle_tracks[0].relative_path, "movie.en.srt");
@@ -1177,7 +1185,8 @@ JSON
 
     first_server.scan_library().await;
     let probed = first_server.wait_for_probes_complete().await;
-    assert_eq!(probed.items[0].video_codec.as_deref(), Some("vp9"));
+    let probed_item = first_server.media(&probed.items[0].id.to_string()).await;
+    assert_eq!(probed_item.video_codec.as_deref(), Some("vp9"));
 
     drop(first_server);
 
@@ -1187,7 +1196,9 @@ JSON
     )
     .await;
     let restored_library = second_server.library().await;
-    let item = &restored_library.items[0];
+    let item = second_server
+        .media(&restored_library.items[0].id.to_string())
+        .await;
 
     assert_eq!(item.duration_seconds, Some(42.0));
     assert_eq!(item.container_name.as_deref(), Some("matroska,webm"));
@@ -1215,16 +1226,19 @@ async fn library_subtitles_survive_restart() {
     let first_server =
         TestServer::spawn_persistent_with_library(&database_path, vec![root.clone()]).await;
     let first_scan = first_server.scan_library().await;
-    assert_eq!(first_scan.items[0].subtitle_tracks.len(), 1);
+    assert_eq!(first_scan.items[0].subtitle_track_count, 1);
 
     drop(first_server);
 
     let second_server = TestServer::spawn_persistent_with_library(&database_path, vec![root]).await;
     let restored_library = second_server.library().await;
+    let restored_item = second_server
+        .media(&restored_library.items[0].id.to_string())
+        .await;
 
-    assert_eq!(restored_library.items[0].subtitle_tracks.len(), 1);
+    assert_eq!(restored_library.items[0].subtitle_track_count, 1);
     assert_eq!(
-        restored_library.items[0].subtitle_tracks[0].relative_path,
+        restored_item.subtitle_tracks[0].relative_path,
         "movie.en.srt"
     );
 }
@@ -2819,10 +2833,6 @@ async fn stream_endpoint_returns_409_when_stream_copy_is_missing() {
         .next()
         .unwrap();
     assert_eq!(
-        item.playback_mode,
-        stax_backend::protocol::PlaybackMode::NeedsPreparation
-    );
-    assert_eq!(
         item.preparation_state,
         stax_backend::protocol::PreparationState::NeedsPreparation
     );
@@ -2870,7 +2880,7 @@ async fn create_stream_copy_returns_409_for_direct_playable_media() {
         .create_stream_copy(
             &item.id.to_string(),
             &CreateStreamCopyRequest {
-                audio_stream_index: item.audio_streams.first().map(|stream| stream.index),
+                audio_stream_index: None,
                 subtitle_mode: stax_backend::protocol::SubtitleMode::Off,
                 subtitle: None,
             },
@@ -2916,7 +2926,7 @@ async fn create_stream_copy_exposes_preparing_state_while_job_runs() {
         .create_stream_copy(
             &item.id.to_string(),
             &CreateStreamCopyRequest {
-                audio_stream_index: item.audio_streams.first().map(|stream| stream.index),
+                audio_stream_index: None,
                 subtitle_mode: stax_backend::protocol::SubtitleMode::Off,
                 subtitle: None,
             },
@@ -2973,7 +2983,7 @@ async fn get_stream_copy_exposes_live_progress_while_job_runs() {
         .create_stream_copy(
             &item.id.to_string(),
             &CreateStreamCopyRequest {
-                audio_stream_index: item.audio_streams.first().map(|stream| stream.index),
+                audio_stream_index: None,
                 subtitle_mode: stax_backend::protocol::SubtitleMode::Off,
                 subtitle: None,
             },
@@ -3041,7 +3051,7 @@ async fn prepared_stream_copy_serves_prepared_media_and_vtt_subtitle() {
         .create_stream_copy(
             &item.id.to_string(),
             &CreateStreamCopyRequest {
-                audio_stream_index: item.audio_streams.first().map(|stream| stream.index),
+                audio_stream_index: None,
                 subtitle_mode: stax_backend::protocol::SubtitleMode::Sidecar,
                 subtitle: Some(stax_backend::protocol::StreamCopySubtitleSelection {
                     kind: stax_backend::protocol::SubtitleSourceKind::Sidecar,
@@ -3120,7 +3130,7 @@ async fn create_stream_copy_rejects_non_text_embedded_subtitle_for_sidecar_mode(
         .create_stream_copy(
             &item.id.to_string(),
             &CreateStreamCopyRequest {
-                audio_stream_index: item.audio_streams.first().map(|stream| stream.index),
+                audio_stream_index: None,
                 subtitle_mode: stax_backend::protocol::SubtitleMode::Sidecar,
                 subtitle: Some(stax_backend::protocol::StreamCopySubtitleSelection {
                     kind: stax_backend::protocol::SubtitleSourceKind::Embedded,

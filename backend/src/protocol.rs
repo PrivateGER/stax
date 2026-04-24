@@ -396,11 +396,31 @@ pub struct MediaItem {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
+pub struct MediaSummary {
+    pub id: Uuid,
+    pub root_path: String,
+    pub relative_path: String,
+    pub file_name: String,
+    pub extension: Option<String>,
+    pub size_bytes: u64,
+    pub indexed_at: String,
+    pub duration_seconds: Option<f64>,
+    pub probe_error: Option<String>,
+    pub subtitle_track_count: usize,
+    pub audio_stream_count: usize,
+    pub subtitle_stream_count: usize,
+    pub thumbnail_generated_at: Option<String>,
+    pub thumbnail_error: Option<String>,
+    pub preparation_state: PreparationState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct LibraryResponse {
     pub revision: u64,
     pub has_pending_background_work: bool,
     pub roots: Vec<LibraryRoot>,
-    pub items: Vec<MediaItem>,
+    pub items: Vec<MediaSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -409,7 +429,7 @@ pub struct LibraryScanResponse {
     pub revision: u64,
     pub has_pending_background_work: bool,
     pub roots: Vec<LibraryRoot>,
-    pub items: Vec<MediaItem>,
+    pub items: Vec<MediaSummary>,
     pub scanned_root_count: usize,
     pub indexed_item_count: usize,
     pub scanned_at: String,

@@ -519,25 +519,35 @@ fn walk_dir(
 
         let mut stats = WalkStats::default();
 
-        // Persist this directory's media files. Writes go to a single
-        // SQLite connection so parallelism here would just queue at the
-        // pool — process serially to keep the code simple.
+        // Persist this directory's media files in one SQLite transaction.
+        // A 4000-file library can otherwise spend most of a scan paying
+        // per-row commit and revision-bump overhead.
+        let mut records = Vec::with_capacity(media.len());
+        let mut record_cache_flags = Vec::with_capacity(media.len());
         for candidate in media {
             match build_walk_record(&context, candidate) {
                 Ok((record, is_cached)) => {
-                    let media_id = record.id;
-                    if let Err(error) = context.persistence.upsert_walk_record(&record).await {
-                        warn!(%media_id, %error, "failed to upsert walk record");
-                        continue;
-                    }
-                    stats.kept_ids.push(media_id);
-                    if is_cached {
-                        stats.cached += 1;
-                    } else {
-                        stats.pending += 1;
-                    }
+                    record_cache_flags.push(is_cached);
+                    records.push(record);
                 }
                 Err(error) => warn!(%error, "skipping media file with malformed walk record"),
+            }
+        }
+        if let Err(error) = context.persistence.upsert_walk_records(&records).await {
+            warn!(
+                dir = %dir.display(),
+                count = records.len(),
+                %error,
+                "failed to upsert directory media records"
+            );
+        } else {
+            for (record, is_cached) in records.iter().zip(record_cache_flags) {
+                stats.kept_ids.push(record.id);
+                if is_cached {
+                    stats.cached += 1;
+                } else {
+                    stats.pending += 1;
+                }
             }
         }
 
@@ -710,6 +720,23 @@ fn classify_directory(root_path: &Path, dir: &Path, indexed_at: &str) -> DirCont
     media_entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
     let mut media = Vec::with_capacity(media_entries.len());
+    let mut subtitles_by_media_stem: HashMap<String, Vec<usize>> = HashMap::new();
+    for (index, (_, sub_stem, _)) in subtitle_entries.iter().enumerate() {
+        subtitles_by_media_stem
+            .entry(sub_stem.clone())
+            .or_default()
+            .push(index);
+
+        // Preserve the existing "media-stem.language.srt" matching while
+        // avoiding an all-subtitles scan for every media file.
+        for (dot_index, _) in sub_stem.match_indices('.') {
+            subtitles_by_media_stem
+                .entry(sub_stem[..dot_index].to_string())
+                .or_default()
+                .push(index);
+        }
+    }
+
     for (path, metadata, media_stem, extension) in media_entries {
         let modified_system = metadata.modified().ok();
         let modified_at = modified_system
@@ -731,9 +758,12 @@ fn classify_directory(root_path: &Path, dir: &Path, indexed_at: &str) -> DirCont
             .map(|value| value.to_string_lossy().to_string())
             .unwrap_or_else(|| relative_path.clone());
 
-        let mut subtitle_tracks: Vec<SubtitleTrack> = subtitle_entries
-            .iter()
-            .filter_map(|(sub_path, sub_stem, sub_ext)| {
+        let mut subtitle_tracks: Vec<SubtitleTrack> = subtitles_by_media_stem
+            .get(&media_stem)
+            .into_iter()
+            .flatten()
+            .filter_map(|index| {
+                let (sub_path, sub_stem, sub_ext) = &subtitle_entries[*index];
                 build_sidecar_track(root_path, &media_stem, sub_path, sub_stem, sub_ext)
             })
             .collect();

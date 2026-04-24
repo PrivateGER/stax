@@ -11,9 +11,9 @@ use crate::{
     RoomRecord,
     clock::{AuthoritativePlaybackClock, PlaybackClockCheckpoint, format_timestamp},
     protocol::{
-        AudioStream, LibraryRoot, MediaItem, PlaybackMode, PlaybackStatus, PreparationState,
-        StreamCopyStatus, StreamCopySubtitleSelection, StreamCopySummary, SubtitleMode,
-        SubtitleSourceKind, SubtitleStream, SubtitleTrack,
+        AudioStream, LibraryRoot, MediaItem, MediaSummary, PlaybackMode, PlaybackStatus,
+        PreparationState, StreamCopyStatus, StreamCopySubtitleSelection, StreamCopySummary,
+        SubtitleMode, SubtitleSourceKind, SubtitleStream, SubtitleTrack,
     },
 };
 
@@ -27,7 +27,7 @@ pub struct Persistence {
 #[derive(Debug, Clone)]
 pub(crate) struct LibrarySnapshot {
     pub roots: Vec<LibraryRoot>,
-    pub items: Vec<MediaItem>,
+    pub items: Vec<MediaSummary>,
 }
 
 #[derive(Debug, Clone)]
@@ -340,23 +340,12 @@ impl Persistence {
                 size_bytes,
                 modified_at,
                 indexed_at,
-                content_type,
                 duration_seconds,
-                container_name,
-                video_codec,
-                audio_codec,
-                width,
-                height,
-                probed_at,
                 probe_error,
                 subtitle_tracks_json,
                 thumbnail_generated_at,
                 thumbnail_error,
                 playback_mode,
-                video_profile,
-                video_level,
-                video_pix_fmt,
-                video_bit_depth,
                 audio_streams_json,
                 subtitle_streams_json,
                 stream_copies.source_size_bytes AS stream_copy_source_size_bytes,
@@ -387,7 +376,7 @@ impl Persistence {
                 .collect::<Result<Vec<_>, _>>()?,
             items: item_rows
                 .into_iter()
-                .map(map_row_to_media_item)
+                .map(map_row_to_media_summary)
                 .collect::<Result<Vec<_>, _>>()?,
         })
     }
@@ -842,7 +831,37 @@ impl Persistence {
     /// + reset thumbnail state, so the row is picked up by both the
     ///   background probe pool and (after probe completes) the thumbnail
     ///   pool.
+    pub async fn upsert_walk_records(
+        &self,
+        records: &[WalkRecord],
+    ) -> Result<(), PersistenceError> {
+        if records.is_empty() {
+            return Ok(());
+        }
+
+        let mut transaction = self.pool.begin().await?;
+        for record in records {
+            Self::execute_upsert_walk_record(&mut transaction, record).await?;
+        }
+        bump_library_revision(&mut *transaction).await?;
+        transaction.commit().await?;
+
+        Ok(())
+    }
+
     pub async fn upsert_walk_record(&self, record: &WalkRecord) -> Result<(), PersistenceError> {
+        let mut transaction = self.pool.begin().await?;
+        Self::execute_upsert_walk_record(&mut transaction, record).await?;
+        bump_library_revision(&mut *transaction).await?;
+        transaction.commit().await?;
+
+        Ok(())
+    }
+
+    async fn execute_upsert_walk_record(
+        transaction: &mut sqlx::Transaction<'_, Sqlite>,
+        record: &WalkRecord,
+    ) -> Result<(), PersistenceError> {
         let (
             duration_seconds,
             container_name,
@@ -994,9 +1013,8 @@ impl Persistence {
         .bind(video_bit_depth.map(i64::from))
         .bind(audio_streams_json)
         .bind(subtitle_streams_json)
-        .execute(&self.pool)
+        .execute(&mut **transaction)
         .await?;
-        bump_library_revision(&self.pool).await?;
 
         Ok(())
     }
@@ -1413,6 +1431,58 @@ fn map_row_to_library_root(row: sqlx::sqlite::SqliteRow) -> Result<LibraryRoot, 
     })
 }
 
+fn map_row_to_media_summary(
+    row: sqlx::sqlite::SqliteRow,
+) -> Result<MediaSummary, PersistenceError> {
+    let id = row.try_get::<String, _>("id")?;
+    let size_bytes = row.try_get::<i64, _>("size_bytes")?;
+    let subtitle_tracks_json = row.try_get::<String, _>("subtitle_tracks_json")?;
+    let audio_streams_json = row.try_get::<String, _>("audio_streams_json")?;
+    let subtitle_streams_json = row.try_get::<String, _>("subtitle_streams_json")?;
+    let playback_mode_raw = row.try_get::<String, _>("playback_mode")?;
+    let playback_mode = PlaybackMode::from_str_opt(&playback_mode_raw).ok_or_else(|| {
+        PersistenceError::InvalidData(format!(
+            "invalid stored playback_mode '{playback_mode_raw}'"
+        ))
+    })?;
+    let media_uuid = Uuid::parse_str(&id).map_err(|error| {
+        PersistenceError::InvalidData(format!("invalid stored media id '{id}': {error}"))
+    })?;
+    if size_bytes < 0 {
+        return Err(PersistenceError::InvalidData(format!(
+            "invalid stored media size '{size_bytes}'"
+        )));
+    }
+
+    let size_bytes = size_bytes as u64;
+    let modified_at = row.try_get::<String, _>("modified_at")?;
+    let current_stream_copy = map_joined_stream_copy_record(&row)?.filter(|record| {
+        record.source_size_bytes == size_bytes && record.source_modified_at == modified_at
+    });
+    let preparation_state = preparation_state_for(playback_mode, current_stream_copy.as_ref());
+    let subtitle_track_count = deserialize_subtitle_tracks(&subtitle_tracks_json)?.len();
+    let audio_stream_count = deserialize_audio_streams(&audio_streams_json)?.len();
+    let subtitle_stream_count = deserialize_subtitle_streams(&subtitle_streams_json)?.len();
+
+    Ok(MediaSummary {
+        id: media_uuid,
+        root_path: row.try_get("root_path")?,
+        relative_path: row.try_get("relative_path")?,
+        file_name: row.try_get("file_name")?,
+        extension: row.try_get("extension")?,
+        size_bytes,
+        indexed_at: row.try_get("indexed_at")?,
+        duration_seconds: row.try_get("duration_seconds")?,
+        probe_error: row.try_get("probe_error")?,
+        subtitle_track_count,
+        audio_stream_count,
+        subtitle_stream_count,
+        thumbnail_generated_at: row.try_get("thumbnail_generated_at")?,
+        thumbnail_error: row.try_get("thumbnail_error")?,
+        preparation_state,
+    })
+}
+
 fn map_row_to_media_item(row: sqlx::sqlite::SqliteRow) -> Result<MediaItem, PersistenceError> {
     let id = row.try_get::<String, _>("id")?;
     let size_bytes = row.try_get::<i64, _>("size_bytes")?;
@@ -1439,22 +1509,13 @@ fn map_row_to_media_item(row: sqlx::sqlite::SqliteRow) -> Result<MediaItem, Pers
     let current_stream_copy = map_joined_stream_copy_record(&row)?.filter(|record| {
         record.source_size_bytes == size_bytes && record.source_modified_at == modified_at
     });
-    let (preparation_state, stream_copy) = match playback_mode {
-        PlaybackMode::Direct => (PreparationState::Direct, None),
-        PlaybackMode::Unsupported => (PreparationState::Unsupported, None),
-        PlaybackMode::NeedsPreparation => match current_stream_copy {
-            Some(record) => {
-                let state = match record.status {
-                    StreamCopyStatus::Queued | StreamCopyStatus::Running => {
-                        PreparationState::Preparing
-                    }
-                    StreamCopyStatus::Ready => PreparationState::Prepared,
-                    StreamCopyStatus::Failed => PreparationState::Failed,
-                };
-                (state, Some(stream_copy_summary_for(media_uuid, &record)))
-            }
-            None => (PreparationState::NeedsPreparation, None),
-        },
+    let preparation_state = preparation_state_for(playback_mode, current_stream_copy.as_ref());
+    let stream_copy = if playback_mode == PlaybackMode::NeedsPreparation {
+        current_stream_copy
+            .as_ref()
+            .map(|record| stream_copy_summary_for(media_uuid, record))
+    } else {
+        None
     };
 
     Ok(MediaItem {
@@ -1488,6 +1549,24 @@ fn map_row_to_media_item(row: sqlx::sqlite::SqliteRow) -> Result<MediaItem, Pers
         subtitle_streams: deserialize_subtitle_streams(&subtitle_streams_json)?,
         stream_copy,
     })
+}
+
+fn preparation_state_for(
+    playback_mode: PlaybackMode,
+    current_stream_copy: Option<&StreamCopyRecord>,
+) -> PreparationState {
+    match playback_mode {
+        PlaybackMode::Direct => PreparationState::Direct,
+        PlaybackMode::Unsupported => PreparationState::Unsupported,
+        PlaybackMode::NeedsPreparation => match current_stream_copy {
+            Some(record) => match record.status {
+                StreamCopyStatus::Queued | StreamCopyStatus::Running => PreparationState::Preparing,
+                StreamCopyStatus::Ready => PreparationState::Prepared,
+                StreamCopyStatus::Failed => PreparationState::Failed,
+            },
+            None => PreparationState::NeedsPreparation,
+        },
+    }
 }
 
 fn map_joined_stream_copy_record(
