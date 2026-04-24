@@ -1,8 +1,8 @@
-use std::{collections::HashMap, error::Error, fmt, path::Path};
+use std::{collections::HashMap, error::Error, fmt, path::Path, time::Duration};
 
 use sqlx::{
     Pool, Row, Sqlite,
-    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
 };
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
@@ -197,23 +197,35 @@ impl Persistence {
         let options = SqliteConnectOptions::new()
             .filename(path)
             .create_if_missing(true)
-            .foreign_keys(true);
+            .foreign_keys(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Normal)
+            .busy_timeout(Duration::from_secs(5))
+            .pragma("cache_size", "-32768")
+            .pragma("mmap_size", "268435456")
+            .pragma("temp_store", "MEMORY");
 
-        Self::open_with_options(options).await
+        Self::open_with_options(options, 4).await
     }
 
     pub async fn open_in_memory() -> Result<Self, PersistenceError> {
         let options = SqliteConnectOptions::new()
             .filename(":memory:")
             .create_if_missing(true)
-            .foreign_keys(true);
+            .foreign_keys(true)
+            .busy_timeout(Duration::from_secs(5))
+            .pragma("cache_size", "-32768")
+            .pragma("temp_store", "MEMORY");
 
-        Self::open_with_options(options).await
+        Self::open_with_options(options, 1).await
     }
 
-    async fn open_with_options(options: SqliteConnectOptions) -> Result<Self, PersistenceError> {
+    async fn open_with_options(
+        options: SqliteConnectOptions,
+        max_connections: u32,
+    ) -> Result<Self, PersistenceError> {
         let pool = SqlitePoolOptions::new()
-            .max_connections(1)
+            .max_connections(max_connections)
             .connect_with(options)
             .await?;
 
