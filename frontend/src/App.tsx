@@ -12,6 +12,7 @@ import type {
   HealthResponse,
   LibraryRoot,
   MediaItem,
+  MediaSummary,
   LibraryResponse,
   Room,
 } from "./types";
@@ -23,7 +24,8 @@ export default function App() {
   const route = useRoute();
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [roots, setRoots] = useState<LibraryRoot[]>([]);
-  const [items, setItems] = useState<MediaItem[]>([]);
+  const [items, setItems] = useState<MediaSummary[]>([]);
+  const [itemDetails, setItemDetails] = useState<Map<string, MediaItem>>(() => new Map());
   const [rooms, setRooms] = useState<Room[]>([]);
   const [loading, setLoading] = useState(true);
   const [scanning, setScanning] = useState(false);
@@ -62,6 +64,7 @@ export default function App() {
     setHasPendingBackgroundWork(libraryResponse.hasPendingBackgroundWork);
     setRoots(libraryResponse.roots);
     setItems(libraryResponse.items);
+    setItemDetails(new Map());
   }, []);
 
   const refresh = useCallback(async () => {
@@ -208,11 +211,48 @@ export default function App() {
   }, []);
 
   const itemsById = useMemo(() => {
-    const map = new Map<string, MediaItem>();
+    const map = new Map<string, MediaSummary>();
     for (const item of items) map.set(item.id, item);
     return map;
   }, [items]);
-  const findItem = (mediaId: string) => itemsById.get(mediaId) ?? null;
+  const selectedMediaId =
+    route.name === "title" || route.name === "watch" ? route.mediaId : null;
+  const selectedItem = selectedMediaId
+    ? (itemDetails.get(selectedMediaId) ?? null)
+    : null;
+  const selectedSummary = selectedMediaId
+    ? (itemsById.get(selectedMediaId) ?? null)
+    : null;
+
+  useEffect(() => {
+    if (!selectedMediaId) return;
+
+    let active = true;
+    const loadMedia = async () => {
+      try {
+        const media = await api.media(selectedMediaId);
+        if (!active) return;
+        setItemDetails((existing) => {
+          const next = new Map(existing);
+          next.set(media.id, media);
+          return next;
+        });
+      } catch {
+        if (!active) return;
+        setItemDetails((existing) => {
+          const next = new Map(existing);
+          next.delete(selectedMediaId);
+          return next;
+        });
+      }
+    };
+
+    void loadMedia();
+
+    return () => {
+      active = false;
+    };
+  }, [libraryRevision, selectedMediaId]);
 
   const activeSession = useMemo(() => {
     if (!activeRoomId) return null;
@@ -295,25 +335,33 @@ export default function App() {
         ) : null}
 
         {route.name === "title" ? (
-          <TitlePage
-            item={findItem(route.mediaId)}
-            onRoomCreated={handleRoomCreated}
-            onRefresh={() => void refresh()}
-            rooms={rooms}
-          />
+          (loading || selectedSummary) && !selectedItem ? (
+            <p className="muted">Loading title…</p>
+          ) : (
+            <TitlePage
+              item={selectedItem}
+              onRoomCreated={handleRoomCreated}
+              onRefresh={() => void refresh()}
+              rooms={rooms}
+            />
+          )
         ) : null}
 
         {route.name === "watch" ? (
-          <PlayerPage
-            clientName={clientName}
-            item={findItem(route.mediaId)}
-            items={items}
-            onClientNameChange={setClientName}
-            onLeaveSession={clearActiveSession}
-            onRefresh={() => void refresh()}
-            onRoomCreated={handleRoomCreated}
-            roomId={route.roomId}
-          />
+          (loading || selectedSummary) && !selectedItem ? (
+            <p className="muted">Loading player…</p>
+          ) : (
+            <PlayerPage
+              clientName={clientName}
+              item={selectedItem}
+              items={items}
+              onClientNameChange={setClientName}
+              onLeaveSession={clearActiveSession}
+              onRefresh={() => void refresh()}
+              onRoomCreated={handleRoomCreated}
+              roomId={route.roomId}
+            />
+          )
         ) : null}
 
         {route.name === "admin" ? (

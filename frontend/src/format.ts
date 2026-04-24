@@ -1,8 +1,14 @@
-import type { AudioStream, MediaItem, SubtitleStream, SubtitleTrack } from "./types";
+import type {
+  AudioStream,
+  MediaItem,
+  MediaSummary,
+  SubtitleStream,
+  SubtitleTrack,
+} from "./types";
 
 let languageDisplayNames: Intl.DisplayNames | null | undefined;
 
-export function displayMediaTitle(item: MediaItem) {
+export function displayMediaTitle(item: Pick<MediaItem | MediaSummary, "fileName">) {
   const baseName = item.fileName.replace(/\.[^.]+$/, "");
   return baseName.replaceAll(/[._]+/g, " ").trim() || item.fileName;
 }
@@ -62,14 +68,17 @@ export function rootFolderName(rootPath: string) {
   return parts[parts.length - 1] ?? rootPath;
 }
 
-export function mediaBadges(item: MediaItem): string[] {
-  const badges = [
-    formatResolution(item.width, item.height),
-    item.videoCodec ? item.videoCodec.toUpperCase() : null,
-    item.subtitleTracks.length > 0
-      ? `CC · ${item.subtitleTracks.length}`
-      : null,
-  ];
+export function mediaBadges(item: MediaItem | MediaSummary): string[] {
+  const subtitleCount =
+    "subtitleTrackCount" in item ? item.subtitleTrackCount : item.subtitleTracks.length;
+  const badges = ["width" in item ? formatResolution(item.width, item.height) : null];
+
+  if ("videoCodec" in item && item.videoCodec) {
+    badges.push(item.videoCodec.toUpperCase());
+  }
+  if (subtitleCount > 0) {
+    badges.push(`CC · ${subtitleCount}`);
+  }
 
   return badges.filter((value): value is string => Boolean(value));
 }

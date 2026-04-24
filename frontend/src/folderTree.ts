@@ -1,5 +1,5 @@
 import { rootFolderName } from "./format";
-import type { LibraryRoot, MediaItem } from "./types";
+import type { LibraryRoot, MediaSummary } from "./types";
 
 export type FolderNode = {
   // Virtual path inside the library tree, e.g. "Movies" or "Movies/Action".
@@ -10,14 +10,14 @@ export type FolderNode = {
   // Subfolders, sorted alphabetically by name.
   children: FolderNode[];
   // Media items that live directly in this folder, sorted by file name.
-  items: MediaItem[];
+  items: MediaSummary[];
   // Total media items at and below this node.
   descendantCount: number;
 };
 
 const ROOT_NAME = "Library";
 
-export function buildFolderTree(items: MediaItem[], roots: LibraryRoot[]): FolderNode {
+export function buildFolderTree(items: MediaSummary[], roots: LibraryRoot[]): FolderNode {
   const root = makeNode("", ROOT_NAME);
 
   // Pre-create one folder per configured library root so empty roots still

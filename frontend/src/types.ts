@@ -121,6 +121,24 @@ export type MediaItem = {
   streamCopy: StreamCopySummary | null;
 };
 
+export type MediaSummary = {
+  id: string;
+  rootPath: string;
+  relativePath: string;
+  fileName: string;
+  extension: string | null;
+  sizeBytes: number;
+  indexedAt: string;
+  durationSeconds: number | null;
+  probeError: string | null;
+  subtitleTrackCount: number;
+  audioStreamCount: number;
+  subtitleStreamCount: number;
+  thumbnailGeneratedAt: string | null;
+  thumbnailError: string | null;
+  preparationState: PreparationState;
+};
+
 export type LibraryRoot = {
   path: string;
   lastScannedAt: string | null;
@@ -131,7 +149,7 @@ export type LibraryResponse = {
   revision: number;
   hasPendingBackgroundWork: boolean;
   roots: LibraryRoot[];
-  items: MediaItem[];
+  items: MediaSummary[];
 };
 
 export type HealthResponse = {

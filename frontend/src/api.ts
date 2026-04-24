@@ -4,6 +4,7 @@ import type {
   LibraryResponse,
   LibraryScanResponse,
   LibraryStatusResponse,
+  MediaItem,
   Room,
   RoomsResponse,
   StreamCopySummary,
@@ -37,6 +38,7 @@ async function request<T>(url: string, options: RequestOptions = {}): Promise<T>
 export const api = {
   health: () => request<HealthResponse>("/api/health"),
   library: () => request<LibraryResponse>("/api/library"),
+  media: (mediaId: string) => request<MediaItem>(`/api/media/${mediaId}`),
   libraryStatus: () => request<LibraryStatusResponse>("/api/library/status"),
   rooms: () => request<RoomsResponse>("/api/rooms"),
 

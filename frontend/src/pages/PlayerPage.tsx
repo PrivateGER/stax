@@ -13,14 +13,14 @@ import { UnplayableNotice } from "../player/UnplayableNotice";
 import { useActiveSubtitleCue } from "../player/useActiveSubtitleCue";
 import { navigate } from "../router";
 import { ToastViewport, useToasts } from "../Toasts";
-import type { MediaItem, Room } from "../types";
+import type { MediaItem, MediaSummary, Room } from "../types";
 import { useRoomSocket } from "../useRoomSocket";
 import { useStreamCopyProgress } from "../useStreamCopyProgress";
 import { useWatchTogether } from "../useWatchTogether";
 
 type Props = {
   item: MediaItem | null;
-  items: MediaItem[];
+  items: MediaSummary[];
   roomId: string | null;
   clientName: string;
   onClientNameChange: (name: string) => void;

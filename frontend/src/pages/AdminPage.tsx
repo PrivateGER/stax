@@ -1,10 +1,10 @@
 import { formatBytes, formatTimeCode, rootFolderName } from "../format";
-import type { HealthResponse, LibraryRoot, MediaItem, Room } from "../types";
+import type { HealthResponse, LibraryRoot, MediaSummary, Room } from "../types";
 
 type Props = {
   health: HealthResponse | null;
   roots: LibraryRoot[];
-  items: MediaItem[];
+  items: MediaSummary[];
   rooms: Room[];
   scanning: boolean;
   onRescan: () => void;

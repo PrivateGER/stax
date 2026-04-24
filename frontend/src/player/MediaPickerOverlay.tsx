@@ -7,10 +7,10 @@ import {
   mediaBadges,
   posterInitials,
 } from "../format";
-import type { MediaItem } from "../types";
+import type { MediaSummary } from "../types";
 
 type Props = {
-  items: MediaItem[];
+  items: MediaSummary[];
   currentMediaId: string | null;
   onSelect: (mediaId: string) => void;
   onClose: () => void;
@@ -45,8 +45,7 @@ export function MediaPickerOverlay({
       [
         item.fileName,
         item.relativePath,
-        item.containerName ?? "",
-        item.videoCodec ?? "",
+        item.extension ?? "",
       ]
         .join(" ")
         .toLowerCase()
@@ -111,7 +110,7 @@ function PickerCard({
   isCurrent,
   onSelect,
 }: {
-  item: MediaItem;
+  item: MediaSummary;
   isCurrent: boolean;
   onSelect: () => void;
 }) {

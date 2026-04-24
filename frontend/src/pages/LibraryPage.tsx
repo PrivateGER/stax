@@ -10,10 +10,10 @@ import {
   posterInitials,
 } from "../format";
 import { navigate } from "../router";
-import type { LibraryRoot, MediaItem, Room } from "../types";
+import type { LibraryRoot, MediaSummary, Room } from "../types";
 
 type Props = {
-  items: MediaItem[];
+  items: MediaSummary[];
   roots: LibraryRoot[];
   rooms: Room[];
   folder: string | null;
@@ -39,7 +39,7 @@ export function LibraryPage({
   const currentNode = useMemo(() => findFolder(tree, folder), [tree, folder]);
 
   const itemsById = useMemo(() => {
-    const map = new Map<string, MediaItem>();
+    const map = new Map<string, MediaSummary>();
     for (const item of items) map.set(item.id, item);
     return map;
   }, [items]);
@@ -74,9 +74,7 @@ export function LibraryPage({
         [
           item.fileName,
           item.relativePath,
-          item.containerName ?? "",
-          item.videoCodec ?? "",
-          item.audioCodec ?? "",
+          item.extension ?? "",
         ]
           .join(" ")
           .toLowerCase()
@@ -197,10 +195,10 @@ function FolderView({
 }: {
   currentNode: FolderNode | null;
   folder: string | null;
-  itemsById: Map<string, MediaItem>;
+  itemsById: Map<string, MediaSummary>;
   liveSessions: Room[];
   loading: boolean;
-  recent: MediaItem[];
+  recent: MediaSummary[];
 }) {
   if (loading && !currentNode) {
     return <p className="muted">Loading library…</p>;
@@ -307,7 +305,7 @@ function SearchResults({
   totalItems,
   loading,
 }: {
-  items: MediaItem[];
+  items: MediaSummary[];
   totalItems: number;
   loading: boolean;
 }) {
@@ -365,7 +363,7 @@ function FolderCard({ node }: { node: FolderNode }) {
   );
 }
 
-function PosterCard({ item }: { item: MediaItem }) {
+function PosterCard({ item }: { item: MediaSummary }) {
   const title = displayMediaTitle(item);
   const badges = mediaBadges(item);
   const hasThumbnail = item.thumbnailGeneratedAt !== null;
@@ -403,7 +401,7 @@ function PosterCard({ item }: { item: MediaItem }) {
   );
 }
 
-function LiveSessionCard({ item, room }: { item: MediaItem | null; room: Room }) {
+function LiveSessionCard({ item, room }: { item: MediaSummary | null; room: Room }) {
   const mediaTitle = item ? displayMediaTitle(item) : (room.mediaTitle ?? "Unknown title");
   const hasThumbnail = item?.thumbnailGeneratedAt != null;
   const isPlaying = room.playbackState.status === "playing";
