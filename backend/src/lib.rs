@@ -493,9 +493,7 @@ pub async fn load_state_with_runtime_and_grace(
     config: RuntimeConfig,
     empty_room_grace: Duration,
 ) -> Result<AppState, PersistenceError> {
-    let frontend_origin = config.frontend_origin.as_ref().map(|origin| {
-        HeaderValue::from_str(origin).expect("frontend origin must be a valid HTTP header value")
-    });
+    let frontend_origin = parse_frontend_origin(config.frontend_origin.as_deref())?;
     let stream_copy_config = StreamCopyConfig {
         cache_dir: config
             .library
@@ -618,6 +616,18 @@ pub async fn load_state_with_runtime_and_grace(
         empty_room_grace,
         frontend_origin,
     })
+}
+
+fn parse_frontend_origin(origin: Option<&str>) -> Result<Option<HeaderValue>, PersistenceError> {
+    origin
+        .map(|value| {
+            HeaderValue::from_str(value).map_err(|error| {
+                PersistenceError::InvalidData(format!(
+                    "frontend origin must be a valid HTTP header value: {error}"
+                ))
+            })
+        })
+        .transpose()
 }
 
 fn spawn_room_cleanup_task(
@@ -1850,6 +1860,19 @@ mod tests {
 
         assert!(client_name.starts_with("viewer-"));
         assert_eq!(client_name.len(), "viewer-".len() + 8);
+    }
+
+    #[test]
+    fn parse_frontend_origin_rejects_invalid_header_values() {
+        let error =
+            parse_frontend_origin(Some("https://frontend.example\r\nx-test: nope")).unwrap_err();
+
+        match error {
+            PersistenceError::InvalidData(message) => {
+                assert!(message.contains("frontend origin must be a valid HTTP header value"));
+            }
+            other => panic!("expected invalid data error, got {other:?}"),
+        }
     }
 
     #[test]
