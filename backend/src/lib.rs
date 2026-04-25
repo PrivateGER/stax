@@ -25,6 +25,7 @@ pub mod clock;
 pub mod ffmpeg;
 pub mod library;
 pub(crate) mod library_probe;
+pub(crate) mod library_routes;
 pub(crate) mod library_walk;
 pub(crate) mod origin;
 pub mod persistence;
@@ -45,14 +46,14 @@ mod frontend_assets;
 use api_error::ApiError;
 use clock::format_timestamp;
 use library::{LibraryConfig, LibraryService};
+use library_routes::{library_status, list_library, scan_library};
 use origin::{build_cors_with_origin, origin_allowed, reject_cross_origin_requests};
 use persistence::{Persistence, PersistenceError, StreamCopyRecord, StreamCopyRequestRecord};
 use probes::{ProbeConfig, ProbeWorkerPool};
 use protocol::{
-    CreateRoomRequest, CreateStreamCopyRequest, HealthResponse, LibraryResponse,
-    LibraryScanResponse, LibraryStatusResponse, MediaItem, PlaybackMode, Room, RoomSocketQuery,
-    RoomsResponse, StreamCopyStatus, StreamCopySummary, SubtitleMode, SubtitleSourceKind,
-    is_text_subtitle_codec,
+    CreateRoomRequest, CreateStreamCopyRequest, HealthResponse, MediaItem, PlaybackMode, Room,
+    RoomSocketQuery, RoomsResponse, StreamCopyStatus, StreamCopySummary, SubtitleMode,
+    SubtitleSourceKind, is_text_subtitle_codec,
 };
 use rooms::handle_room_socket;
 pub(crate) use rooms::{RoomHub, RoomRecord, SharedRoom, SharedRooms};
@@ -461,72 +462,6 @@ async fn list_rooms(State(state): State<AppState>) -> Json<RoomsResponse> {
     snapshots.sort_unstable_by(|left, right| left.name.cmp(&right.name));
 
     Json(RoomsResponse { rooms: snapshots })
-}
-
-async fn list_library(State(state): State<AppState>) -> Result<Json<LibraryResponse>, ApiError> {
-    state.library.snapshot().await.map(Json).map_err(|error| {
-        warn!(%error, "failed to load library snapshot");
-        ApiError::internal("Failed to load library.")
-    })
-}
-
-async fn library_status(
-    State(state): State<AppState>,
-) -> Result<Json<LibraryStatusResponse>, ApiError> {
-    state.library.status().await.map(Json).map_err(|error| {
-        warn!(%error, "failed to load library status");
-        ApiError::internal("Failed to load library status.")
-    })
-}
-
-async fn scan_library(
-    State(state): State<AppState>,
-) -> Result<Json<LibraryScanResponse>, ApiError> {
-    let Ok(_scan_guard) = state.scan_lock.try_lock() else {
-        return Err(ApiError::with_status(
-            StatusCode::CONFLICT,
-            "A library scan is already running.",
-        ));
-    };
-
-    let response = state.library.scan().await.map_err(|error| {
-        warn!(%error, "failed to scan library");
-        ApiError::internal("Failed to scan library.")
-    })?;
-
-    // Stage 1 (the walk) is now finished — every discovered file has a row
-    // in `media_items`. Hand background work off using internal pending-job
-    // queries so the public library summary can stay lean.
-    let pending_probes = state
-        .persistence
-        .list_pending_probes()
-        .await
-        .map_err(|error| {
-            warn!(%error, "failed to load pending probes after scan");
-            ApiError::internal("Failed to enqueue library scan work.")
-        })?;
-    let probes_enqueued = pending_probes.len();
-    state.probes.enqueue_pending(pending_probes);
-
-    let pending_thumbnails =
-        state
-            .persistence
-            .list_pending_thumbnails()
-            .await
-            .map_err(|error| {
-                warn!(%error, "failed to load pending thumbnails after scan");
-                ApiError::internal("Failed to enqueue library scan work.")
-            })?;
-    let thumbnails_enqueued = pending_thumbnails.len();
-    state.thumbnails.enqueue_pending(pending_thumbnails);
-    tracing::info!(
-        scanned = response.items.len(),
-        probes_enqueued,
-        thumbnails_enqueued,
-        "library scan completed; background jobs enqueued"
-    );
-
-    Ok(Json(response))
 }
 
 async fn get_media(
