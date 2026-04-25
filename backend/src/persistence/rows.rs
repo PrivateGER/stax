@@ -142,7 +142,7 @@ pub(crate) fn map_row_to_media_item(
     let stream_copy = if playback_mode == PlaybackMode::NeedsPreparation {
         current_stream_copy
             .as_ref()
-            .map(|record| super::persistence::stream_copy_summary_for(media_uuid, record))
+            .map(|record| super::stream_copy_summary_for(media_uuid, record))
     } else {
         None
     };

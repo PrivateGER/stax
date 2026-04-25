@@ -10,18 +10,20 @@ use uuid::Uuid;
 use crate::{
     RoomRecord,
     clock::format_timestamp,
-    persistence_rows::{
-        deserialize_audio_streams, deserialize_subtitle_streams, map_row_to_library_root,
-        map_row_to_media_item, map_row_to_media_summary, map_row_to_room_record,
-        map_row_to_stream_copy_record, parse_optional_u8, parse_optional_u32,
-        playback_status_to_str, serialize_audio_streams, serialize_subtitle_streams,
-        serialize_subtitle_tracks,
-    },
     protocol::{
         AudioStream, LibraryRoot, MediaItem, MediaSummary, PlaybackMode, StreamCopyStatus,
         StreamCopySubtitleSelection, StreamCopySummary, SubtitleMode, SubtitleSourceKind,
         SubtitleStream, SubtitleTrack,
     },
+};
+
+mod rows;
+
+use rows::{
+    deserialize_audio_streams, deserialize_subtitle_streams, map_row_to_library_root,
+    map_row_to_media_item, map_row_to_media_summary, map_row_to_room_record,
+    map_row_to_stream_copy_record, parse_optional_u8, parse_optional_u32, playback_status_to_str,
+    serialize_audio_streams, serialize_subtitle_streams, serialize_subtitle_tracks,
 };
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");

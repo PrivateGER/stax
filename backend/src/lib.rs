@@ -23,7 +23,6 @@ pub mod ffmpeg;
 pub mod library;
 pub(crate) mod origin;
 pub mod persistence;
-pub(crate) mod persistence_rows;
 pub mod probes;
 pub mod protocol;
 pub(crate) mod rooms;
