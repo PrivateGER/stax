@@ -75,6 +75,7 @@ type SharedRooms = Arc<RwLock<HashMap<Uuid, SharedRoom>>>;
 type SharedRoom = Arc<RoomHub>;
 
 const ROOM_EVENT_BUFFER: usize = 64;
+const MAX_DISPLAY_NAME_CHARS: usize = 120;
 /// Default grace period before a room with no connected clients is
 /// deleted. Tolerates brief reconnects (refresh, network blip) without
 /// destroying a session. Integration tests can shrink this via
@@ -1392,10 +1393,20 @@ async fn create_room(
     if trimmed_name.is_empty() {
         return Err(ApiError::bad_request("Room name is required"));
     }
+    if trimmed_name.chars().count() > MAX_DISPLAY_NAME_CHARS {
+        return Err(ApiError::bad_request("Room name is too long."));
+    }
 
     let provided_media_title = payload
         .media_title
-        .map(|value| value.trim().to_string())
+        .map(|value| {
+            let trimmed = value.trim();
+            if trimmed.chars().count() > MAX_DISPLAY_NAME_CHARS {
+                return Err(ApiError::bad_request("Media title is too long."));
+            }
+            Ok(trimmed.to_string())
+        })
+        .transpose()?
         .filter(|value| !value.is_empty());
 
     let (media_id, media_title) = match payload.media_id {
@@ -1652,10 +1663,19 @@ fn sanitize_client_name(client_name: Option<String>) -> String {
     client_name
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+        .map(|value| truncate_chars(value, MAX_DISPLAY_NAME_CHARS))
         .unwrap_or_else(|| {
             let fallback = Uuid::new_v4();
             format!("viewer-{}", &fallback.to_string()[..8])
         })
+}
+
+fn truncate_chars(value: String, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value;
+    }
+
+    value.chars().take(max_chars).collect()
 }
 
 /// Ceiling on client-reported one-way latency, in milliseconds. Clients sending
@@ -1792,6 +1812,46 @@ mod tests {
                     .uri("/api/rooms")
                     .header("content-type", "application/json")
                     .body(Body::from(r#"{"name":"   "}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn create_room_rejects_oversized_name() {
+        let oversized = "a".repeat(MAX_DISPLAY_NAME_CHARS + 1);
+        let response = test_app()
+            .await
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/rooms")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(r#"{{"name":"{oversized}"}}"#)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn create_room_rejects_oversized_media_title() {
+        let oversized = "a".repeat(MAX_DISPLAY_NAME_CHARS + 1);
+        let response = test_app()
+            .await
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/rooms")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"name":"Movie Lab","mediaTitle":"{oversized}"}}"#
+                    )))
                     .unwrap(),
             )
             .await
@@ -1962,6 +2022,13 @@ mod tests {
 
         assert!(client_name.starts_with("viewer-"));
         assert_eq!(client_name.len(), "viewer-".len() + 8);
+    }
+
+    #[test]
+    fn sanitize_client_name_truncates_oversized_names() {
+        let client_name = sanitize_client_name(Some("a".repeat(MAX_DISPLAY_NAME_CHARS + 1)));
+
+        assert_eq!(client_name.len(), MAX_DISPLAY_NAME_CHARS);
     }
 
     #[test]
