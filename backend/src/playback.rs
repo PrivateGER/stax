@@ -1,7 +1,13 @@
-use crate::{
-    library::VideoPlaybackInfo,
-    protocol::{AudioStream, PlaybackMode},
-};
+use crate::protocol::{AudioStream, PlaybackMode};
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct VideoPlaybackInfo<'a> {
+    pub codec: Option<&'a str>,
+    pub profile: Option<&'a str>,
+    pub pix_fmt: Option<&'a str>,
+    pub level: Option<u32>,
+    pub bit_depth: Option<u8>,
+}
 
 pub(crate) fn classify_playback_mode(
     container: Option<&str>,

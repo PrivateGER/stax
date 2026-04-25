@@ -23,7 +23,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::{
-    library::probe_media_metadata,
+    library_probe::probe_media_metadata,
     persistence::{PendingProbe, Persistence},
     scan_gate::ScanGate,
     thumbnails::{ThumbnailJob, ThumbnailWorkerPool},

@@ -23,6 +23,7 @@ use uuid::Uuid;
 pub mod clock;
 pub mod ffmpeg;
 pub mod library;
+pub(crate) mod library_probe;
 pub(crate) mod origin;
 pub mod persistence;
 pub(crate) mod persistence_rows;
