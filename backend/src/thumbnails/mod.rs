@@ -36,8 +36,11 @@ use crate::{
     ffmpeg::FfmpegHardwareAcceleration,
     persistence::{PendingThumbnail, Persistence},
     scan_gate::ScanGate,
-    thumbnail_render::{ThumbnailOutcome, generate},
 };
+
+pub(crate) mod render;
+
+use render::{ThumbnailOutcome, generate};
 
 const DEFAULT_THUMBNAIL_CACHE_DIR: &str = "stax-thumbnails";
 const DEFAULT_WORKERS: usize = 2;
@@ -270,7 +273,7 @@ pub fn default_ffmpeg_command() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::thumbnail_render::{
+    use crate::thumbnails::render::{
         find_sidecar_art, is_missing_attached_pic_error, thumbnail_seek_seconds,
     };
     use tempfile::TempDir;
