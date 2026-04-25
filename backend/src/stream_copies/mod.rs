@@ -21,13 +21,14 @@ use crate::{
     persistence::{PendingStreamCopy, Persistence, StreamCopyRecord, stream_copy_summary_for},
     protocol::{
         MediaItem, StreamCopyStatus, StreamCopySummary, SubtitleMode, SubtitleSourceKind,
-        SubtitleTrack, is_text_subtitle_codec,
+        is_text_subtitle_codec,
     },
     streaming::convert_srt_to_vtt,
 };
 
 mod paths;
 mod progress;
+mod subtitles;
 
 use paths::temp_path_for_final;
 pub use paths::{default_stream_copy_cache_dir, stream_copy_output_dir};
@@ -36,6 +37,7 @@ use progress::{
     new_shared_stream_copy_progress, progress_ratio_from_snapshot, read_ffmpeg_progress,
     read_ffmpeg_stderr,
 };
+use subtitles::{build_burn_subtitle_filter, resolve_sidecar_subtitle_path};
 
 const DEFAULT_WORKERS: usize = 1;
 const QUEUE_CAPACITY: usize = 1024;
@@ -670,62 +672,6 @@ fn default_audio_stream_ordinal(
     }
 }
 
-fn build_burn_subtitle_filter(
-    media_item: &MediaItem,
-    copy: &StreamCopyRecord,
-    media_path: &Path,
-) -> Result<String, String> {
-    let Some((kind, index)) = copy.subtitle_kind.zip(copy.subtitle_index) else {
-        return Err("A subtitle source is required for burned subtitles.".to_string());
-    };
-
-    match kind {
-        SubtitleSourceKind::Sidecar => {
-            let track = media_item
-                .subtitle_tracks
-                .get(index as usize)
-                .ok_or_else(|| "Selected sidecar subtitle track does not exist.".to_string())?;
-            Ok(format!(
-                "subtitles={}",
-                escape_subtitles_path(&resolve_sidecar_subtitle_path(media_item, track))
-            ))
-        }
-        SubtitleSourceKind::Embedded => {
-            let ordinal = media_item
-                .subtitle_streams
-                .iter()
-                .position(|stream| stream.index == index)
-                .ok_or_else(|| "Selected embedded subtitle stream does not exist.".to_string())?;
-            let stream = &media_item.subtitle_streams[ordinal];
-            if !is_text_subtitle_codec(stream.codec.as_deref()) {
-                return Err("Selected embedded subtitle stream cannot be burned in.".to_string());
-            }
-            Ok(format!(
-                "subtitles={}:si={ordinal}",
-                escape_subtitles_path(media_path)
-            ))
-        }
-    }
-}
-
-fn resolve_sidecar_subtitle_path(media_item: &MediaItem, track: &SubtitleTrack) -> PathBuf {
-    let mut path = PathBuf::from(&media_item.root_path);
-    for component in Path::new(&track.relative_path).components() {
-        path.push(component.as_os_str());
-    }
-    path
-}
-
-fn escape_subtitles_path(path: &Path) -> String {
-    path.to_string_lossy()
-        .replace('\\', "\\\\")
-        .replace(':', r"\\:")
-        .replace('\'', r"\\\'")
-        .replace('[', "\\[")
-        .replace(']', "\\]")
-        .replace(',', "\\,")
-}
-
 fn ffmpeg_error(prefix: &str, stderr: &[u8]) -> String {
     let stderr = String::from_utf8_lossy(stderr);
     let message = stderr.trim();
@@ -746,22 +692,7 @@ async fn cleanup_path(path: &Path) {
 
 #[cfg(test)]
 mod tests {
-    use super::{escape_subtitles_path, should_use_input_hwaccel};
-    use std::path::Path;
-
-    #[test]
-    fn subtitles_filter_path_escape_preserves_apostrophes_and_options() {
-        let escaped = escape_subtitles_path(Path::new("/tmp/You're an Akiba Maid: v3, [test].mkv"));
-
-        assert_eq!(
-            escaped,
-            r"/tmp/You\\\'re an Akiba Maid\\: v3\, \[test\].mkv"
-        );
-        assert_eq!(
-            format!("subtitles={escaped}:si=1"),
-            r"subtitles=/tmp/You\\\'re an Akiba Maid\\: v3\, \[test\].mkv:si=1"
-        );
-    }
+    use super::should_use_input_hwaccel;
 
     #[test]
     fn burned_subtitles_do_not_use_input_hwaccel() {
