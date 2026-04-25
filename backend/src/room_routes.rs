@@ -13,7 +13,7 @@ use uuid::Uuid;
 use crate::{
     AppState,
     api_error::ApiError,
-    load_media_item,
+    media_routes::load_media_item,
     origin::origin_allowed,
     protocol::{CreateRoomRequest, Room, RoomSocketQuery, RoomsResponse},
     rooms::{RoomHub, RoomRecord, SharedRoom, handle_room_socket},
