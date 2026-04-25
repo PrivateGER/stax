@@ -1,6 +1,7 @@
 use std::{
     borrow::Cow,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use axum::{
@@ -20,6 +21,7 @@ use tokio_util::io::ReaderStream;
 use crate::protocol::{MediaItem, SubtitleStream, SubtitleTrack};
 
 const OPEN_ENDED_RANGE_CAP: u64 = 8 * 1024 * 1024;
+const EMBEDDED_SUBTITLE_EXTRACTION_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ByteRange {
@@ -186,20 +188,30 @@ pub(crate) async fn stream_embedded_subtitle_response(
         return Err(StreamMediaError::NotFound);
     }
 
-    let output = Command::new(ffmpeg_command)
-        .arg("-loglevel")
-        .arg("error")
-        .arg("-nostdin")
-        .arg("-i")
-        .arg(&media_path)
-        .arg("-map")
-        .arg(format!("0:{}", subtitle_stream.index))
-        .arg("-f")
-        .arg("webvtt")
-        .arg("-")
-        .output()
-        .await
-        .map_err(StreamMediaError::Io)?;
+    let output = tokio::time::timeout(
+        EMBEDDED_SUBTITLE_EXTRACTION_TIMEOUT,
+        Command::new(ffmpeg_command)
+            .arg("-loglevel")
+            .arg("error")
+            .arg("-nostdin")
+            .arg("-i")
+            .arg(&media_path)
+            .arg("-map")
+            .arg(format!("0:{}", subtitle_stream.index))
+            .arg("-f")
+            .arg("webvtt")
+            .arg("-")
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| {
+        StreamMediaError::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "embedded subtitle extraction timed out",
+        ))
+    })?
+    .map_err(StreamMediaError::Io)?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
