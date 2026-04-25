@@ -8,13 +8,13 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::{
-    RoomRecord,
     clock::format_timestamp,
     protocol::{
         AudioStream, LibraryRoot, MediaItem, MediaSummary, PlaybackMode, StreamCopyStatus,
         StreamCopySubtitleSelection, StreamCopySummary, SubtitleMode, SubtitleSourceKind,
         SubtitleStream, SubtitleTrack,
     },
+    rooms::RoomRecord,
 };
 
 mod rows;

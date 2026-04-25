@@ -3,7 +3,6 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
 use crate::{
-    RoomRecord,
     clock::{AuthoritativePlaybackClock, PlaybackClockCheckpoint},
     persistence::{PersistenceError, StreamCopyRecord},
     protocol::{
@@ -11,6 +10,7 @@ use crate::{
         PreparationState, StreamCopyStatus, SubtitleMode, SubtitleSourceKind, SubtitleStream,
         SubtitleTrack,
     },
+    rooms::RoomRecord,
 };
 
 pub(crate) fn map_row_to_room_record(
