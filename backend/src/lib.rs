@@ -29,7 +29,6 @@ pub mod protocol;
 pub(crate) mod rooms;
 pub mod scan_gate;
 pub mod stream_copies;
-pub(crate) mod stream_copy_progress;
 pub mod streaming;
 pub mod thumbnails;
 

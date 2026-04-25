@@ -23,12 +23,15 @@ use crate::{
         MediaItem, StreamCopyStatus, StreamCopySummary, SubtitleMode, SubtitleSourceKind,
         SubtitleTrack, is_text_subtitle_codec,
     },
-    stream_copy_progress::{
-        SharedStreamCopyProgress, StreamCopyProgressSnapshot, clear_progress,
-        new_shared_stream_copy_progress, progress_ratio_from_snapshot, read_ffmpeg_progress,
-        read_ffmpeg_stderr,
-    },
     streaming::convert_srt_to_vtt,
+};
+
+mod progress;
+
+use progress::{
+    SharedStreamCopyProgress, StreamCopyProgressSnapshot, clear_progress,
+    new_shared_stream_copy_progress, progress_ratio_from_snapshot, read_ffmpeg_progress,
+    read_ffmpeg_stderr,
 };
 
 const DEFAULT_STREAM_COPY_CACHE_DIR: &str = "stax-stream-copies";
