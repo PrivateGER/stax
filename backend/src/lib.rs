@@ -15,7 +15,11 @@ use axum::{
         Path, Query, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    http::{HeaderMap, HeaderValue, Method, StatusCode, header::RANGE},
+    http::{
+        HeaderMap, HeaderValue, Method, StatusCode,
+        header::{HOST, ORIGIN, RANGE},
+    },
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -29,7 +33,7 @@ use tower_http::{
         CompressionLayer,
         predicate::{DefaultPredicate, NotForContentType, Predicate},
     },
-    cors::{Any, CorsLayer},
+    cors::CorsLayer,
     trace::TraceLayer,
 };
 use tracing::warn;
@@ -705,7 +709,11 @@ pub fn build_app(state: AppState) -> Router {
 
     add_frontend_fallback(app)
         .layer(compression)
-        .layer(build_cors_with_origin(frontend_origin))
+        .layer(build_cors_with_origin(frontend_origin.clone()))
+        .layer(middleware::from_fn_with_state(
+            frontend_origin,
+            reject_cross_origin_requests,
+        ))
         .layer(TraceLayer::new_for_http())
 }
 
@@ -724,12 +732,40 @@ fn build_cors_with_origin(origin: Option<HeaderValue>) -> CorsLayer {
         Some(origin) => CorsLayer::new()
             .allow_origin(origin)
             .allow_methods([Method::GET, Method::POST])
-            .allow_headers(Any),
-        None => CorsLayer::new()
-            .allow_origin(Any)
-            .allow_methods([Method::GET, Method::POST])
-            .allow_headers(Any),
+            .allow_headers([axum::http::header::CONTENT_TYPE, RANGE]),
+        None => CorsLayer::new().allow_methods([Method::GET, Method::POST]),
     }
+}
+
+async fn reject_cross_origin_requests(
+    State(frontend_origin): State<Option<HeaderValue>>,
+    request: axum::extract::Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    if origin_allowed(request.headers(), frontend_origin.as_ref()) {
+        Ok(next.run(request).await)
+    } else {
+        Err(StatusCode::FORBIDDEN)
+    }
+}
+
+fn origin_allowed(headers: &HeaderMap, configured_origin: Option<&HeaderValue>) -> bool {
+    let Some(origin) = headers.get(ORIGIN) else {
+        return true;
+    };
+
+    if let Some(configured_origin) = configured_origin {
+        return origin == configured_origin;
+    }
+
+    let Ok(origin) = origin.to_str() else {
+        return false;
+    };
+    let Some(host) = headers.get(HOST).and_then(|value| value.to_str().ok()) else {
+        return false;
+    };
+
+    origin == format!("http://{host}") || origin == format!("https://{host}")
 }
 
 pub fn init_tracing(log_filter: &str) {
@@ -1414,8 +1450,16 @@ async fn connect_room_socket(
     State(state): State<AppState>,
     Path(room_id): Path<Uuid>,
     Query(query): Query<RoomSocketQuery>,
+    headers: HeaderMap,
     websocket: WebSocketUpgrade,
 ) -> Result<Response, ApiError> {
+    if !origin_allowed(&headers, state.frontend_origin.as_ref()) {
+        return Err(ApiError::with_status(
+            StatusCode::FORBIDDEN,
+            "WebSocket origin is not allowed.",
+        ));
+    }
+
     let room = find_room(&state, room_id)
         .await
         .ok_or_else(|| ApiError::not_found("Room not found"))?;
@@ -1732,6 +1776,42 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn rejects_cross_origin_http_requests_by_default() {
+        let response = test_app()
+            .await
+            .oneshot(
+                Request::builder()
+                    .uri("/api/health")
+                    .header("host", "stax.local:3001")
+                    .header("origin", "https://evil.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn accepts_same_host_origin_by_default() {
+        let response = test_app()
+            .await
+            .oneshot(
+                Request::builder()
+                    .uri("/api/health")
+                    .header("host", "stax.local:3001")
+                    .header("origin", "http://stax.local:3001")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
