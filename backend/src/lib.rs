@@ -17,21 +17,18 @@ use tower_http::{
 use tracing::warn;
 use uuid::Uuid;
 
-pub(crate) mod api_error;
+pub(crate) mod api;
 pub mod clock;
 pub mod ffmpeg;
 pub mod library;
 pub(crate) mod library_probe;
-pub(crate) mod library_routes;
 pub(crate) mod library_walk;
-pub(crate) mod media_routes;
 pub(crate) mod origin;
 pub mod persistence;
 pub(crate) mod persistence_rows;
 pub(crate) mod playback;
 pub mod probes;
 pub mod protocol;
-pub(crate) mod room_routes;
 pub(crate) mod rooms;
 pub mod scan_gate;
 pub mod stream_copies;
@@ -43,17 +40,17 @@ pub mod thumbnails;
 #[cfg(not(debug_assertions))]
 mod frontend_assets;
 
-use library::{LibraryConfig, LibraryService};
-use library_routes::{library_status, list_library, scan_library};
-use media_routes::{
+use api::library::{library_status, list_library, scan_library};
+use api::media::{
     create_stream_copy, get_media, get_stream_copy, stream_embedded_subtitle, stream_media,
     stream_prepared_subtitle, stream_subtitle, stream_thumbnail,
 };
+use api::rooms::{connect_room_socket, create_room, list_rooms};
+use library::{LibraryConfig, LibraryService};
 use origin::{build_cors_with_origin, reject_cross_origin_requests};
 use persistence::{Persistence, PersistenceError};
 use probes::{ProbeConfig, ProbeWorkerPool};
 use protocol::HealthResponse;
-use room_routes::{connect_room_socket, create_room, list_rooms};
 pub(crate) use rooms::{RoomHub, RoomRecord, SharedRoom, SharedRooms};
 use stream_copies::{StreamCopyConfig, StreamCopyWorkerPool};
 use thumbnails::{ThumbnailConfig, ThumbnailWorkerPool};
@@ -443,12 +440,12 @@ async fn health() -> Json<HealthResponse> {
 mod tests {
     use super::*;
     use crate::{
+        api::rooms::{MAX_DISPLAY_NAME_CHARS, sanitize_client_name},
         clock::{AuthoritativePlaybackClock, format_timestamp},
         protocol::{
             ClientSocketMessage, DriftCorrectionAction, PlaybackAction, PlaybackStatus,
             RoomsResponse, ServerEvent,
         },
-        room_routes::{MAX_DISPLAY_NAME_CHARS, sanitize_client_name},
         rooms::{
             MAX_CLIENT_ONE_WAY_MS, SocketDispatch, back_date_for_client_latency,
             normalize_command_position, normalize_reported_position,

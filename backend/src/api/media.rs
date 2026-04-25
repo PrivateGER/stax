@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use crate::{
     AppState,
-    api_error::ApiError,
+    api::error::ApiError,
     clock::format_timestamp,
     persistence::{StreamCopyRecord, StreamCopyRequestRecord},
     protocol::{

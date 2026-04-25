@@ -3,7 +3,7 @@ use tracing::warn;
 
 use crate::{
     AppState,
-    api_error::ApiError,
+    api::error::ApiError,
     protocol::{LibraryResponse, LibraryScanResponse, LibraryStatusResponse},
 };
 
