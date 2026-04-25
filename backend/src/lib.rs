@@ -2,7 +2,7 @@ use std::{collections::HashMap, net::SocketAddr, path::PathBuf, sync::Arc, time:
 
 use axum::{
     Json, Router,
-    extract::{Path, Query, State, ws::WebSocketUpgrade},
+    extract::{Path, State},
     http::{HeaderMap, HeaderValue, StatusCode, header::RANGE},
     middleware,
     response::Response,
@@ -33,6 +33,7 @@ pub(crate) mod persistence_rows;
 pub(crate) mod playback;
 pub mod probes;
 pub mod protocol;
+pub(crate) mod room_routes;
 pub(crate) mod rooms;
 pub mod scan_gate;
 pub mod stream_copies;
@@ -47,15 +48,14 @@ use api_error::ApiError;
 use clock::format_timestamp;
 use library::{LibraryConfig, LibraryService};
 use library_routes::{library_status, list_library, scan_library};
-use origin::{build_cors_with_origin, origin_allowed, reject_cross_origin_requests};
+use origin::{build_cors_with_origin, reject_cross_origin_requests};
 use persistence::{Persistence, PersistenceError, StreamCopyRecord, StreamCopyRequestRecord};
 use probes::{ProbeConfig, ProbeWorkerPool};
 use protocol::{
-    CreateRoomRequest, CreateStreamCopyRequest, HealthResponse, MediaItem, PlaybackMode, Room,
-    RoomSocketQuery, RoomsResponse, StreamCopyStatus, StreamCopySummary, SubtitleMode,
-    SubtitleSourceKind, is_text_subtitle_codec,
+    CreateStreamCopyRequest, HealthResponse, MediaItem, PlaybackMode, StreamCopyStatus,
+    StreamCopySummary, SubtitleMode, SubtitleSourceKind, is_text_subtitle_codec,
 };
-use rooms::handle_room_socket;
+use room_routes::{connect_room_socket, create_room, list_rooms};
 pub(crate) use rooms::{RoomHub, RoomRecord, SharedRoom, SharedRooms};
 use stream_copies::{StreamCopyConfig, StreamCopyJob, StreamCopyWorkerPool};
 use streaming::{
@@ -66,7 +66,6 @@ use streaming::{
 use thumbnails::{ThumbnailConfig, ThumbnailWorkerPool};
 
 const ROOM_EVENT_BUFFER: usize = 64;
-const MAX_DISPLAY_NAME_CHARS: usize = 120;
 /// Default grace period before a room with no connected clients is
 /// deleted. Tolerates brief reconnects (refresh, network blip) without
 /// destroying a session. Integration tests can shrink this via
@@ -445,23 +444,6 @@ async fn health() -> Json<HealthResponse> {
         service: "stax-backend",
         version: env!("CARGO_PKG_VERSION"),
     })
-}
-
-async fn list_rooms(State(state): State<AppState>) -> Json<RoomsResponse> {
-    let room_hubs = {
-        let rooms = state.rooms.read().await;
-        rooms.values().cloned().collect::<Vec<_>>()
-    };
-
-    let mut snapshots = Vec::with_capacity(room_hubs.len());
-
-    for room_hub in room_hubs {
-        snapshots.push(room_hub.snapshot().await);
-    }
-
-    snapshots.sort_unstable_by(|left, right| left.name.cmp(&right.name));
-
-    Json(RoomsResponse { rooms: snapshots })
 }
 
 async fn get_media(
@@ -952,85 +934,7 @@ async fn stream_embedded_subtitle(
     }
 }
 
-async fn create_room(
-    State(state): State<AppState>,
-    Json(payload): Json<CreateRoomRequest>,
-) -> Result<(StatusCode, Json<Room>), ApiError> {
-    let trimmed_name = payload.name.trim();
-
-    if trimmed_name.is_empty() {
-        return Err(ApiError::bad_request("Room name is required"));
-    }
-    if trimmed_name.chars().count() > MAX_DISPLAY_NAME_CHARS {
-        return Err(ApiError::bad_request("Room name is too long."));
-    }
-
-    let provided_media_title = payload
-        .media_title
-        .map(|value| {
-            let trimmed = value.trim();
-            if trimmed.chars().count() > MAX_DISPLAY_NAME_CHARS {
-                return Err(ApiError::bad_request("Media title is too long."));
-            }
-            Ok(trimmed.to_string())
-        })
-        .transpose()?
-        .filter(|value| !value.is_empty());
-
-    let (media_id, media_title) = match payload.media_id {
-        Some(media_id) => {
-            let media_item = load_media_item(
-                &state,
-                media_id,
-                "create_room",
-                "Failed to resolve media for room.",
-            )
-            .await
-            .map_err(|error| match error.status {
-                StatusCode::NOT_FOUND => {
-                    ApiError::bad_request("Media is not in the library index.")
-                }
-                _ => error,
-            })?;
-
-            let derived_title = provided_media_title
-                .clone()
-                .unwrap_or_else(|| media_item.file_name.clone());
-
-            (Some(media_item.id), Some(derived_title))
-        }
-        None => (None, provided_media_title),
-    };
-
-    let room = RoomRecord::new(
-        trimmed_name.into(),
-        media_id,
-        media_title,
-        OffsetDateTime::now_utc(),
-    );
-    let snapshot = room.snapshot(OffsetDateTime::now_utc());
-
-    state.persistence.save_room(&room).await.map_err(|error| {
-        warn!(%error, room_id = %room.id, "failed to persist created room");
-        ApiError::internal("Failed to persist room.")
-    })?;
-
-    let hub = Arc::new(RoomHub::new(
-        room,
-        state.persistence.clone(),
-        state.library.clone(),
-        state.cleanup_tx.clone(),
-        state.empty_room_grace,
-    ));
-    // No clients yet, so the cleanup timer starts ticking immediately.
-    // A connecting client within 2 minutes cancels it.
-    hub.schedule_cleanup().await;
-    state.rooms.write().await.insert(snapshot.id, hub);
-
-    Ok((StatusCode::CREATED, Json(snapshot)))
-}
-
-async fn load_media_item(
+pub(crate) async fn load_media_item(
     state: &AppState,
     media_id: Uuid,
     action: &'static str,
@@ -1047,63 +951,16 @@ async fn load_media_item(
         .ok_or_else(|| ApiError::not_found("Media not found."))
 }
 
-async fn connect_room_socket(
-    State(state): State<AppState>,
-    Path(room_id): Path<Uuid>,
-    Query(query): Query<RoomSocketQuery>,
-    headers: HeaderMap,
-    websocket: WebSocketUpgrade,
-) -> Result<Response, ApiError> {
-    if !origin_allowed(&headers, state.frontend_origin.as_ref()) {
-        return Err(ApiError::with_status(
-            StatusCode::FORBIDDEN,
-            "WebSocket origin is not allowed.",
-        ));
-    }
-
-    let room = find_room(&state, room_id)
-        .await
-        .ok_or_else(|| ApiError::not_found("Room not found"))?;
-
-    let client_name = sanitize_client_name(query.client_name);
-
-    Ok(websocket.on_upgrade(move |socket| async move {
-        handle_room_socket(socket, room_id, room, client_name).await;
-    }))
-}
-
-async fn find_room(state: &AppState, room_id: Uuid) -> Option<SharedRoom> {
-    let rooms = state.rooms.read().await;
-    rooms.get(&room_id).cloned()
-}
-
-fn sanitize_client_name(client_name: Option<String>) -> String {
-    client_name
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .map(|value| truncate_chars(value, MAX_DISPLAY_NAME_CHARS))
-        .unwrap_or_else(|| {
-            let fallback = Uuid::new_v4();
-            format!("viewer-{}", &fallback.to_string()[..8])
-        })
-}
-
-fn truncate_chars(value: String, max_chars: usize) -> String {
-    if value.chars().count() <= max_chars {
-        return value;
-    }
-
-    value.chars().take(max_chars).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
         clock::AuthoritativePlaybackClock,
         protocol::{
-            ClientSocketMessage, DriftCorrectionAction, PlaybackAction, PlaybackStatus, ServerEvent,
+            ClientSocketMessage, DriftCorrectionAction, PlaybackAction, PlaybackStatus,
+            RoomsResponse, ServerEvent,
         },
+        room_routes::{MAX_DISPLAY_NAME_CHARS, sanitize_client_name},
         rooms::{
             MAX_CLIENT_ONE_WAY_MS, SocketDispatch, back_date_for_client_latency,
             normalize_command_position, normalize_reported_position,
