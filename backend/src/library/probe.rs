@@ -6,8 +6,8 @@ use tokio::process::Command;
 
 use crate::{
     clock::{format_timestamp, round_to},
+    library::playback::{VideoPlaybackInfo, classify_playback_mode},
     persistence::ProbeOutcome,
-    playback::{VideoPlaybackInfo, classify_playback_mode},
     protocol::{AudioStream, PlaybackMode, SubtitleStream},
 };
 

@@ -11,15 +11,17 @@ use uuid::Uuid;
 use crate::{
     clock::format_timestamp,
     ffmpeg::FfmpegHardwareAcceleration,
-    library_walk::walk_root,
     persistence::{LibrarySnapshot, LibraryStatusSnapshot, Persistence, PersistenceError},
     protocol::{LibraryResponse, LibraryScanResponse, LibraryStatusResponse, MediaItem},
     thumbnails::{default_ffmpeg_command, default_thumbnail_cache_dir, thumbnail_path_for},
 };
 
-pub(crate) use crate::playback::{
-    is_browser_safe_audio_codec_for_mp4, is_browser_safe_video_codec,
-};
+pub(crate) mod playback;
+pub(crate) mod probe;
+pub(crate) mod walk;
+
+pub(crate) use playback::{is_browser_safe_audio_codec_for_mp4, is_browser_safe_video_codec};
+use walk::walk_root;
 
 const DEFAULT_PROBE_WORKERS: usize = 4;
 const DEFAULT_WALK_WORKERS: usize = 8;
@@ -348,12 +350,12 @@ fn normalize_root_path(path: PathBuf, current_dir: Option<&Path>) -> Option<Path
 mod tests {
     use super::*;
     use crate::{
-        library_probe::{parse_probe_output, probe_media_metadata},
-        library_walk::{
+        library::playback::{VideoPlaybackInfo, classify_playback_mode},
+        library::probe::{parse_probe_output, probe_media_metadata},
+        library::walk::{
             DirMediaCandidate, classify_directory, content_type_for_extension,
             subtitle_presentation,
         },
-        playback::{VideoPlaybackInfo, classify_playback_mode},
         protocol::{AudioStream, PlaybackMode},
     };
     use std::{fs, path::PathBuf, process::Command as StdCommand};
