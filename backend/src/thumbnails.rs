@@ -28,31 +28,20 @@ use std::{
     time::Instant,
 };
 
-use time::OffsetDateTime;
-use tokio::{
-    process::Command,
-    sync::{Semaphore, mpsc},
-};
+use tokio::sync::{Semaphore, mpsc};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::{
-    clock::format_timestamp,
-    ffmpeg::{FfmpegHardwareAcceleration, apply_input_acceleration},
+    ffmpeg::FfmpegHardwareAcceleration,
     persistence::{PendingThumbnail, Persistence},
     scan_gate::ScanGate,
+    thumbnail_render::{ThumbnailOutcome, generate},
 };
 
 const DEFAULT_THUMBNAIL_CACHE_DIR: &str = "stax-thumbnails";
 const DEFAULT_WORKERS: usize = 2;
 const QUEUE_CAPACITY: usize = 4096;
-const THUMBNAIL_WIDTH: u32 = 480;
-/// Image extensions tried for sidecar art, in order of preference.
-const SIDECAR_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp"];
-/// Per-folder sidecar names tried at the file's directory and every
-/// ancestor up to the library root. Order matters: more specific first.
-const SIDECAR_BASENAMES: &[&str] = &["poster", "cover", "folder"];
-
 #[derive(Clone, Debug)]
 pub struct ThumbnailConfig {
     pub cache_dir: Option<PathBuf>,
@@ -243,320 +232,6 @@ async fn process_job(job: ThumbnailJob, config: &ThumbnailConfig, persistence: &
     }
 }
 
-enum ThumbnailOutcome {
-    Generated {
-        timestamp: String,
-        source: ThumbnailSource,
-    },
-    Skipped,
-    Failed(String),
-}
-
-/// Which generation source produced the cached jpeg. Surfaced via tracing
-/// so operators can see at a glance whether their library is well-curated
-/// (sidecar/embedded dominate) or relying on frame extraction.
-#[derive(Clone, Copy, Debug)]
-enum ThumbnailSource {
-    Cached,
-    Sidecar,
-    AttachedPic,
-    Frame,
-}
-
-impl ThumbnailSource {
-    fn as_str(self) -> &'static str {
-        match self {
-            ThumbnailSource::Cached => "cached",
-            ThumbnailSource::Sidecar => "sidecar",
-            ThumbnailSource::AttachedPic => "attached_pic",
-            ThumbnailSource::Frame => "frame",
-        }
-    }
-}
-
-fn now_timestamp() -> String {
-    format_timestamp(OffsetDateTime::now_utc())
-}
-
-async fn generate(job: &ThumbnailJob, config: &ThumbnailConfig) -> ThumbnailOutcome {
-    let Some(cache_dir) = config.cache_dir.as_deref() else {
-        debug!(media_id = %job.media_id, "no cache_dir configured; skipping");
-        return ThumbnailOutcome::Skipped;
-    };
-
-    let output_path = thumbnail_path_for(cache_dir, job.media_id);
-
-    // Cheap freshness check: if the cached jpeg is newer than the source,
-    // accept it as up-to-date without spawning ffmpeg.
-    if let Ok(metadata) = fs::metadata(&job.media_path) {
-        let modified = metadata.modified().ok();
-        if thumbnail_is_up_to_date(&output_path, modified) {
-            debug!(media_id = %job.media_id, "cached thumbnail is fresh; skipping ffmpeg");
-            return ThumbnailOutcome::Generated {
-                timestamp: now_timestamp(),
-                source: ThumbnailSource::Cached,
-            };
-        }
-    }
-
-    if let Err(error) = fs::create_dir_all(cache_dir) {
-        return ThumbnailOutcome::Failed(format!(
-            "could not create thumbnail directory '{}': {error}",
-            cache_dir.display()
-        ));
-    }
-
-    // Source 1: sidecar art (cheapest — a single file copy/scale).
-    if let Some(sidecar) = find_sidecar_art(&job.media_path)
-        && let Some(ffmpeg) = config.ffmpeg_command.as_deref()
-    {
-        debug!(
-            media_id = %job.media_id,
-            sidecar = %sidecar.display(),
-            "trying sidecar art source"
-        );
-        let started = Instant::now();
-        match render_from_image(ffmpeg, &sidecar, &output_path).await {
-            Ok(()) => {
-                debug!(
-                    media_id = %job.media_id,
-                    elapsed_ms = started.elapsed().as_millis() as u64,
-                    "sidecar art rendered"
-                );
-                return ThumbnailOutcome::Generated {
-                    timestamp: now_timestamp(),
-                    source: ThumbnailSource::Sidecar,
-                };
-            }
-            Err(error) => {
-                warn!(
-                    media_id = %job.media_id,
-                    sidecar = %sidecar.display(),
-                    %error,
-                    "sidecar art conversion failed; falling through to other sources"
-                );
-            }
-        }
-    }
-
-    let Some(ffmpeg) = config.ffmpeg_command.as_deref() else {
-        // No ffmpeg means we have no way to produce a thumbnail; treat as
-        // pending forever (the user disabled generation explicitly).
-        debug!(media_id = %job.media_id, "no ffmpeg configured; skipping");
-        return ThumbnailOutcome::Skipped;
-    };
-
-    // Source 2: embedded cover art via `attached_pic`. Only meaningful for
-    // containers that can carry it; if the container doesn't have one,
-    // ffmpeg exits non-zero and we fall through.
-    debug!(media_id = %job.media_id, "trying embedded attached_pic source");
-    let started = Instant::now();
-    match render_from_attached_pic(ffmpeg, &job.media_path, &output_path).await {
-        Ok(()) => {
-            debug!(
-                media_id = %job.media_id,
-                elapsed_ms = started.elapsed().as_millis() as u64,
-                "embedded attached_pic rendered"
-            );
-            return ThumbnailOutcome::Generated {
-                timestamp: now_timestamp(),
-                source: ThumbnailSource::AttachedPic,
-            };
-        }
-        Err(error) => {
-            if is_missing_attached_pic_error(&error) {
-                debug!(
-                    media_id = %job.media_id,
-                    "no embedded attached_pic; falling through to frame extraction"
-                );
-            } else {
-                debug!(
-                    media_id = %job.media_id,
-                    %error,
-                    "embedded attached_pic extraction failed; falling through to frame extraction"
-                );
-            }
-        }
-    }
-
-    // Source 3: decoded video frame. Only attempt if there's actually a
-    // video stream — saves an ffmpeg startup for audio-only files.
-    if job.video_codec.is_none() {
-        debug!(media_id = %job.media_id, "no video stream; skipping frame extraction");
-        return ThumbnailOutcome::Skipped;
-    }
-
-    debug!(
-        media_id = %job.media_id,
-        duration_seconds = ?job.duration_seconds,
-        "trying frame extraction source"
-    );
-    let started = Instant::now();
-    match render_from_frame(
-        ffmpeg,
-        &job.media_path,
-        &output_path,
-        job.duration_seconds,
-        &config.hw_accel,
-    )
-    .await
-    {
-        Ok(()) => {
-            debug!(
-                media_id = %job.media_id,
-                elapsed_ms = started.elapsed().as_millis() as u64,
-                "frame extraction rendered"
-            );
-            ThumbnailOutcome::Generated {
-                timestamp: now_timestamp(),
-                source: ThumbnailSource::Frame,
-            }
-        }
-        Err(error) => ThumbnailOutcome::Failed(error),
-    }
-}
-
-async fn render_from_image(ffmpeg: &Path, source: &Path, output: &Path) -> Result<(), String> {
-    let result = Command::new(ffmpeg)
-        .arg("-y")
-        .arg("-loglevel")
-        .arg("error")
-        .arg("-i")
-        .arg(source)
-        .arg("-vf")
-        .arg(format!("scale={THUMBNAIL_WIDTH}:-2"))
-        .arg("-frames:v")
-        .arg("1")
-        .arg("-q:v")
-        .arg("4")
-        .arg(output)
-        .output()
-        .await;
-
-    classify_ffmpeg_result(result, output)
-}
-
-async fn render_from_attached_pic(
-    ffmpeg: &Path,
-    media_path: &Path,
-    output: &Path,
-) -> Result<(), String> {
-    let result = Command::new(ffmpeg)
-        .arg("-y")
-        .arg("-loglevel")
-        .arg("error")
-        .arg("-i")
-        .arg(media_path)
-        .arg("-map")
-        .arg("0:v:disp:attached_pic")
-        .arg("-vf")
-        .arg(format!("scale={THUMBNAIL_WIDTH}:-2"))
-        .arg("-frames:v")
-        .arg("1")
-        .arg("-q:v")
-        .arg("4")
-        .arg(output)
-        .output()
-        .await;
-
-    classify_ffmpeg_result(result, output)
-}
-
-async fn render_from_frame(
-    ffmpeg: &Path,
-    media_path: &Path,
-    output: &Path,
-    duration_seconds: Option<f64>,
-    hw_accel: &FfmpegHardwareAcceleration,
-) -> Result<(), String> {
-    let seek = thumbnail_seek_seconds(duration_seconds);
-    // `thumbnail=100` scores the next 100 frames after the seek and picks
-    // the most representative one. We intentionally sample later in the
-    // file so episodic content doesn't collapse onto the same opening
-    // credits frame across a whole season.
-    let mut command = Command::new(ffmpeg);
-    command.arg("-y").arg("-loglevel").arg("error");
-    apply_input_acceleration(&mut command, hw_accel);
-    let result = command
-        .arg("-ss")
-        .arg(format!("{seek:.3}"))
-        .arg("-i")
-        .arg(media_path)
-        .arg("-vf")
-        .arg(format!("thumbnail=100,scale={THUMBNAIL_WIDTH}:-2"))
-        .arg("-frames:v")
-        .arg("1")
-        .arg("-q:v")
-        .arg("4")
-        .arg(output)
-        .output()
-        .await;
-
-    classify_ffmpeg_result(result, output)
-}
-
-fn classify_ffmpeg_result(
-    result: std::io::Result<std::process::Output>,
-    output: &Path,
-) -> Result<(), String> {
-    match result {
-        Ok(output_data) if output_data.status.success() => {
-            if output.exists() && fs::metadata(output).map(|m| m.len() > 0).unwrap_or(false) {
-                Ok(())
-            } else {
-                let _ = fs::remove_file(output);
-                Err("ffmpeg reported success but no thumbnail file was produced".into())
-            }
-        }
-        Ok(output_data) => {
-            let stderr = String::from_utf8_lossy(&output_data.stderr)
-                .trim()
-                .to_string();
-            let _ = fs::remove_file(output);
-            if stderr.is_empty() {
-                Err(format!("ffmpeg exited with status {}", output_data.status))
-            } else {
-                Err(format!("ffmpeg failed: {stderr}"))
-            }
-        }
-        Err(error) => Err(format!("ffmpeg could not start: {error}")),
-    }
-}
-
-fn is_missing_attached_pic_error(error: &str) -> bool {
-    error.contains("matches no streams")
-}
-
-/// Look for sidecar art only in the media file's own directory. This keeps
-/// curated per-movie posters working while avoiding a single ancestor
-/// `poster.jpg` from flattening an entire show to one repeated image.
-fn find_sidecar_art(media_path: &Path) -> Option<PathBuf> {
-    let parent = media_path.parent()?;
-    let stem = media_path.file_stem()?.to_string_lossy().to_string();
-
-    // Per-file art, only at the immediate parent directory.
-    for extension in SIDECAR_EXTENSIONS {
-        for suffix in ["-poster", ""] {
-            let candidate = parent.join(format!("{stem}{suffix}.{extension}"));
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-
-    // Per-folder art, but only for the immediate directory.
-    for basename in SIDECAR_BASENAMES {
-        for extension in SIDECAR_EXTENSIONS {
-            let candidate = parent.join(format!("{basename}.{extension}"));
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-
-    None
-}
-
 pub fn thumbnail_path_for(cache_dir: &Path, media_id: Uuid) -> PathBuf {
     cache_dir.join(format!("{media_id}.jpg"))
 }
@@ -584,16 +259,6 @@ pub fn thumbnail_is_up_to_date(
     thumbnail_modified >= media_modified
 }
 
-/// Sample a later point in the file before letting the `thumbnail` filter
-/// score frames. Using 20% avoids the repeated "30 second mark" thumbnails
-/// that long episodic content used to get from the old hard clamp.
-pub fn thumbnail_seek_seconds(duration_seconds: Option<f64>) -> f64 {
-    match duration_seconds {
-        Some(duration) if duration > 0.0 => duration * 0.20,
-        _ => 0.0,
-    }
-}
-
 pub fn default_thumbnail_cache_dir() -> PathBuf {
     PathBuf::from(DEFAULT_THUMBNAIL_CACHE_DIR)
 }
@@ -605,6 +270,9 @@ pub fn default_ffmpeg_command() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::thumbnail_render::{
+        find_sidecar_art, is_missing_attached_pic_error, thumbnail_seek_seconds,
+    };
     use tempfile::TempDir;
 
     #[test]

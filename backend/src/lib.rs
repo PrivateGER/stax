@@ -37,6 +37,7 @@ pub mod scan_gate;
 pub mod stream_copies;
 pub(crate) mod stream_copy_progress;
 pub mod streaming;
+pub(crate) mod thumbnail_render;
 pub mod thumbnails;
 
 #[cfg(not(debug_assertions))]
