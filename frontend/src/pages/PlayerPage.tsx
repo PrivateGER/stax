@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { api } from "../api";
 import { displayMediaTitle } from "../format";
@@ -44,20 +44,24 @@ export function PlayerPage({
   const [creatingStreamCopy, setCreatingStreamCopy] = useState(false);
   const [streamCopyError, setStreamCopyError] = useState<string | null>(null);
   const [selectedSubtitleIndex, setSelectedSubtitleIndex] = useState<number | null>(null);
-  const [prevItemId, setPrevItemId] = useState<string | null>(item?.id ?? null);
   const subtitleSources = item ? deriveSubtitleSources(item) : [];
 
-  const currentItemId = item?.id ?? null;
-  if (currentItemId !== prevItemId) {
-    setPrevItemId(currentItemId);
+  const prevItemIdRef = useRef<string | null>(item?.id ?? null);
+  useEffect(() => {
+    const currentItemId = item?.id ?? null;
+    if (currentItemId === prevItemIdRef.current) return;
+
+    prevItemIdRef.current = currentItemId;
     setPlayerError(null);
     setStreamCopyError(null);
     setSelectedSubtitleIndex(null);
-  }
+  }, [item?.id]);
 
-  if (selectedSubtitleIndex !== null && !subtitleSources[selectedSubtitleIndex]) {
-    setSelectedSubtitleIndex(null);
-  }
+  useEffect(() => {
+    if (selectedSubtitleIndex !== null && !subtitleSources[selectedSubtitleIndex]) {
+      setSelectedSubtitleIndex(null);
+    }
+  }, [selectedSubtitleIndex, subtitleSources]);
 
   const { summary: liveStreamCopy, seedFromCreate: seedLiveStreamCopy } =
     useStreamCopyProgress({

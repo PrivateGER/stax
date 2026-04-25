@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import shimakazeUrl from "../../asset/shimakaze_sfw.png";
 import { api, thumbnailUrl } from "../api";
@@ -80,13 +80,16 @@ export function TitlePage({ item, rooms, onRoomCreated, onRefresh }: Props) {
   // polls hand us fresh object references even when content is identical, and
   // clobbering in-flight selections every poll would wipe the form the user
   // is still filling in.
-  const [prevItemId, setPrevItemId] = useState<string | null>(item?.id ?? null);
-  if ((item?.id ?? null) !== prevItemId) {
-    setPrevItemId(item?.id ?? null);
+  const prevItemIdRef = useRef<string | null>(item?.id ?? null);
+  useEffect(() => {
+    const currentItemId = item?.id ?? null;
+    if (currentItemId === prevItemIdRef.current) return;
+
+    prevItemIdRef.current = currentItemId;
     setSubtitleMode("off");
     setSubtitleSelection(subtitleOptions[0]?.value ?? "");
     setStreamCopyError(null);
-  }
+  }, [item?.id, subtitleOptions]);
 
   if (!item) {
     return (
