@@ -54,19 +54,30 @@ const IDLE_STATE: RoomSocketState = {
 
 const PING_INTERVAL_MS = 5_000;
 const LATENCY_WINDOW = 5;
+const RECONNECT_BASE_DELAY_MS = 1_000;
+const RECONNECT_MAX_DELAY_MS = 10_000;
+const RECONNECT_MAX_ATTEMPTS = 10;
 
 export function useRoomSocket(roomId: string | null, clientName: string): RoomSocketApi {
   const [state, setState] = useState<RoomSocketState>(IDLE_STATE);
+  const [reconnectKey, setReconnectKey] = useState(0);
   const socketRef = useRef<WebSocket | null>(null);
+  const reconnectAttemptRef = useRef(0);
   // Ref mirror of the live latency estimate so `send` can inject
   // `clientOneWayMs` without re-creating itself on every sample.
   const latencyRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    reconnectAttemptRef.current = 0;
+    setReconnectKey(0);
+  }, [roomId, clientName]);
 
   useEffect(() => {
     if (!roomId) {
       socketRef.current?.close();
       socketRef.current = null;
       latencyRef.current = null;
+      reconnectAttemptRef.current = 0;
       setState(IDLE_STATE);
       return;
     }
@@ -84,6 +95,8 @@ export function useRoomSocket(roomId: string | null, clientName: string): RoomSo
     // GC/jitter spikes don't inflate the projection correction.
     const latencySamples: number[] = [];
     let pingInterval: number | null = null;
+    let reconnectTimer: number | null = null;
+    let closedByCleanup = false;
 
     const sendPing = () => {
       if (socket.readyState !== WebSocket.OPEN) return;
@@ -123,6 +136,7 @@ export function useRoomSocket(roomId: string | null, clientName: string): RoomSo
         }
 
         if (message.type === "snapshot") {
+          reconnectAttemptRef.current = 0;
           setState((current) => ({
             connectionState: "live",
             room: message.room,
@@ -206,21 +220,55 @@ export function useRoomSocket(roomId: string | null, clientName: string): RoomSo
       socketRef.current = null;
       if (pingInterval !== null) window.clearInterval(pingInterval);
       latencyRef.current = null;
+
+      if (closedByCleanup) {
+        setState((current) => ({
+          ...current,
+          connectionState: "offline",
+          activity: "Watch Together session closed.",
+          oneWayLatencyMs: null,
+        }));
+        return;
+      }
+
+      const nextAttempt = reconnectAttemptRef.current + 1;
+      reconnectAttemptRef.current = nextAttempt;
+      if (nextAttempt > RECONNECT_MAX_ATTEMPTS) {
+        setState((current) => ({
+          ...current,
+          connectionState: "offline",
+          error: "Watch Together connection closed. Refresh or rejoin the room.",
+          activity: "Watch Together session closed.",
+          oneWayLatencyMs: null,
+        }));
+        return;
+      }
+
+      const delayMs = Math.min(
+        RECONNECT_BASE_DELAY_MS * 2 ** (nextAttempt - 1),
+        RECONNECT_MAX_DELAY_MS,
+      );
       setState((current) => ({
         ...current,
-        connectionState: "offline",
-        activity: "Watch Together session closed.",
+        connectionState: "connecting",
+        error: null,
+        activity: `Connection lost. Reconnecting in ${Math.ceil(delayMs / 1000)}s…`,
         oneWayLatencyMs: null,
       }));
+      reconnectTimer = window.setTimeout(() => {
+        setReconnectKey((value) => value + 1);
+      }, delayMs);
     };
 
     return () => {
+      closedByCleanup = true;
       if (socketRef.current === socket) socketRef.current = null;
       if (pingInterval !== null) window.clearInterval(pingInterval);
+      if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
       latencyRef.current = null;
       socket.close();
     };
-  }, [roomId, clientName]);
+  }, [roomId, clientName, reconnectKey]);
 
   const send = useCallback((command: RoomSocketCommand) => {
     const socket = socketRef.current;
