@@ -1,8 +1,8 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     process::Stdio,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Instant,
 };
 
@@ -29,6 +29,7 @@ use crate::{
 
 const DEFAULT_STREAM_COPY_CACHE_DIR: &str = "stax-stream-copies";
 const DEFAULT_WORKERS: usize = 1;
+const QUEUE_CAPACITY: usize = 1024;
 
 type SharedStreamCopyProgress = Arc<RwLock<HashMap<Uuid, StreamCopyProgressSnapshot>>>;
 
@@ -78,7 +79,8 @@ impl StreamCopyJob {
 
 #[derive(Clone)]
 pub struct StreamCopyWorkerPool {
-    sender: mpsc::UnboundedSender<StreamCopyJob>,
+    sender: mpsc::Sender<StreamCopyJob>,
+    queued: Arc<Mutex<HashSet<Uuid>>>,
     progress: SharedStreamCopyProgress,
 }
 
@@ -88,11 +90,13 @@ impl StreamCopyWorkerPool {
         persistence: Persistence,
         library: LibraryService,
     ) -> Self {
-        let (sender, mut receiver) = mpsc::unbounded_channel::<StreamCopyJob>();
+        let (sender, mut receiver) = mpsc::channel::<StreamCopyJob>(QUEUE_CAPACITY);
         let semaphore = Arc::new(Semaphore::new(config.max_concurrent.max(1)));
         let config = Arc::new(config);
         let progress = Arc::new(RwLock::new(HashMap::new()));
         let worker_progress = Arc::clone(&progress);
+        let queued = Arc::new(Mutex::new(HashSet::new()));
+        let worker_queued = Arc::clone(&queued);
         info!(
             workers = config.max_concurrent,
             ffmpeg = ?config.ffmpeg_command,
@@ -103,6 +107,7 @@ impl StreamCopyWorkerPool {
 
         tokio::spawn(async move {
             while let Some(job) = receiver.recv().await {
+                unmark_queued(&worker_queued, job.media_id);
                 let permit = match Arc::clone(&semaphore).acquire_owned().await {
                     Ok(permit) => permit,
                     Err(_) => return,
@@ -119,24 +124,43 @@ impl StreamCopyWorkerPool {
             }
         });
 
-        Self { sender, progress }
+        Self {
+            sender,
+            queued,
+            progress,
+        }
     }
 
-    pub fn enqueue(&self, job: StreamCopyJob) {
+    pub fn enqueue(&self, job: StreamCopyJob) -> bool {
         let media_id = job.media_id;
-        if let Err(error) = self.sender.send(job) {
-            warn!(
-                media_id = %error.0.media_id,
-                "stream copy worker pool is closed; dropping job"
-            );
-        } else {
-            debug!(%media_id, "stream copy job enqueued");
+        if !mark_queued(&self.queued, media_id) {
+            debug!(%media_id, "stream copy job already queued; skipping duplicate");
+            return true;
+        }
+
+        match self.sender.try_send(job) {
+            Ok(()) => {
+                debug!(%media_id, "stream copy job enqueued");
+                true
+            }
+            Err(error) => {
+                unmark_queued(&self.queued, media_id);
+                match error {
+                    mpsc::error::TrySendError::Full(job) => {
+                        warn!(media_id = %job.media_id, "stream copy worker queue is full; dropping job");
+                    }
+                    mpsc::error::TrySendError::Closed(job) => {
+                        warn!(media_id = %job.media_id, "stream copy worker pool is closed; dropping job");
+                    }
+                }
+                false
+            }
         }
     }
 
     pub fn enqueue_pending(&self, pending: Vec<PendingStreamCopy>) {
         for entry in pending {
-            self.enqueue(StreamCopyJob::from_pending(entry));
+            let _ = self.enqueue(StreamCopyJob::from_pending(entry));
         }
     }
 
@@ -160,6 +184,19 @@ impl StreamCopyWorkerPool {
     async fn progress_snapshot(&self, media_id: Uuid) -> Option<StreamCopyProgressSnapshot> {
         let progress = self.progress.read().await;
         progress.get(&media_id).cloned()
+    }
+}
+
+fn mark_queued(queued: &Arc<Mutex<HashSet<Uuid>>>, media_id: Uuid) -> bool {
+    queued
+        .lock()
+        .map(|mut queued| queued.insert(media_id))
+        .unwrap_or(false)
+}
+
+fn unmark_queued(queued: &Arc<Mutex<HashSet<Uuid>>>, media_id: Uuid) {
+    if let Ok(mut queued) = queued.lock() {
+        queued.remove(&media_id);
     }
 }
 

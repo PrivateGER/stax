@@ -11,7 +11,12 @@
 //! mpsc channel for incoming jobs, `Semaphore` to bound concurrency,
 //! per-job tokio task that takes the permit and persists the outcome.
 
-use std::{path::PathBuf, sync::Arc, time::Instant};
+use std::{
+    collections::HashSet,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 
 use tokio::sync::{Semaphore, mpsc};
 use tracing::{debug, info, warn};
@@ -25,6 +30,7 @@ use crate::{
 };
 
 const DEFAULT_WORKERS: usize = 4;
+const QUEUE_CAPACITY: usize = 4096;
 
 #[derive(Clone, Debug)]
 pub struct ProbeConfig {
@@ -69,7 +75,8 @@ impl ProbeJob {
 /// in `AppState`.
 #[derive(Clone)]
 pub struct ProbeWorkerPool {
-    sender: mpsc::UnboundedSender<ProbeJob>,
+    sender: mpsc::Sender<ProbeJob>,
+    queued: Arc<Mutex<HashSet<Uuid>>>,
 }
 
 impl ProbeWorkerPool {
@@ -81,7 +88,7 @@ impl ProbeWorkerPool {
         thumbnails: ThumbnailWorkerPool,
         scan_gate: ScanGate,
     ) -> Self {
-        let (sender, mut receiver) = mpsc::unbounded_channel::<ProbeJob>();
+        let (sender, mut receiver) = mpsc::channel::<ProbeJob>(QUEUE_CAPACITY);
         let semaphore = Arc::new(Semaphore::new(config.max_concurrent.max(1)));
         info!(
             workers = config.max_concurrent,
@@ -89,9 +96,12 @@ impl ProbeWorkerPool {
             "probe worker pool starting"
         );
         let config = Arc::new(config);
+        let queued = Arc::new(Mutex::new(HashSet::new()));
+        let worker_queued = Arc::clone(&queued);
 
         tokio::spawn(async move {
             while let Some(job) = receiver.recv().await {
+                unmark_queued(&worker_queued, job.media_id);
                 debug!(
                     media_id = %job.media_id,
                     media_path = %job.media_path.display(),
@@ -115,16 +125,30 @@ impl ProbeWorkerPool {
             }
         });
 
-        Self { sender }
+        Self { sender, queued }
     }
 
     pub fn enqueue(&self, job: ProbeJob) {
         let media_id = job.media_id;
         let media_path = job.media_path.display().to_string();
-        if let Err(error) = self.sender.send(job) {
-            warn!(media_id = %error.0.media_id, "probe worker pool is closed; dropping job");
-        } else {
-            debug!(%media_id, %media_path, "probe job enqueued");
+        if !mark_queued(&self.queued, media_id) {
+            debug!(%media_id, %media_path, "probe job already queued; skipping duplicate");
+            return;
+        }
+
+        match self.sender.try_send(job) {
+            Ok(()) => debug!(%media_id, %media_path, "probe job enqueued"),
+            Err(error) => {
+                unmark_queued(&self.queued, media_id);
+                match error {
+                    mpsc::error::TrySendError::Full(job) => {
+                        warn!(media_id = %job.media_id, "probe worker queue is full; dropping job");
+                    }
+                    mpsc::error::TrySendError::Closed(job) => {
+                        warn!(media_id = %job.media_id, "probe worker pool is closed; dropping job");
+                    }
+                }
+            }
         }
     }
 
@@ -132,6 +156,19 @@ impl ProbeWorkerPool {
         for entry in pending {
             self.enqueue(ProbeJob::from_pending(entry));
         }
+    }
+}
+
+fn mark_queued(queued: &Arc<Mutex<HashSet<Uuid>>>, media_id: Uuid) -> bool {
+    queued
+        .lock()
+        .map(|mut queued| queued.insert(media_id))
+        .unwrap_or(false)
+}
+
+fn unmark_queued(queued: &Arc<Mutex<HashSet<Uuid>>>, media_id: Uuid) {
+    if let Ok(mut queued) = queued.lock() {
+        queued.remove(&media_id);
     }
 }
 

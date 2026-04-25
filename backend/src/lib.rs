@@ -92,6 +92,7 @@ pub struct AppState {
     stream_copies: StreamCopyWorkerPool,
     thumbnails: ThumbnailWorkerPool,
     probes: ProbeWorkerPool,
+    scan_lock: Arc<TokioMutex<()>>,
     cleanup_tx: mpsc::UnboundedSender<Uuid>,
     empty_room_grace: Duration,
     frontend_origin: Option<HeaderValue>,
@@ -616,6 +617,7 @@ pub async fn load_state_with_runtime_and_grace(
         stream_copies,
         thumbnails,
         probes,
+        scan_lock: Arc::new(TokioMutex::new(())),
         cleanup_tx,
         empty_room_grace,
         frontend_origin,
@@ -846,6 +848,13 @@ async fn library_status(
 async fn scan_library(
     State(state): State<AppState>,
 ) -> Result<Json<LibraryScanResponse>, ApiError> {
+    let Ok(_scan_guard) = state.scan_lock.try_lock() else {
+        return Err(ApiError::with_status(
+            StatusCode::CONFLICT,
+            "A library scan is already running.",
+        ));
+    };
+
     let response = state.library.scan().await.map_err(|error| {
         warn!(%error, "failed to scan library");
         ApiError::internal("Failed to scan library.")
@@ -1096,7 +1105,20 @@ async fn create_stream_copy(
             warn!(%error, %media_id, "failed to persist stream copy request");
             ApiError::internal("Failed to create stream copy.")
         })?;
-    state.stream_copies.enqueue(StreamCopyJob { media_id });
+    if !state.stream_copies.enqueue(StreamCopyJob { media_id }) {
+        let failed_at = format_timestamp(OffsetDateTime::now_utc());
+        if let Err(error) = state
+            .persistence
+            .mark_stream_copy_failed(media_id, "Stream copy worker queue is full.", &failed_at)
+            .await
+        {
+            warn!(%error, %media_id, "failed to mark stream copy queue admission failure");
+        }
+        return Err(ApiError::with_status(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Stream copy worker queue is full.",
+        ));
+    }
 
     let refreshed = state
         .persistence

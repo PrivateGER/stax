@@ -21,9 +21,10 @@
 //!      the same 30-second cold-open frame" problem.
 
 use std::{
+    collections::HashSet,
     fs,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Instant,
 };
 
@@ -44,6 +45,7 @@ use crate::{
 
 const DEFAULT_THUMBNAIL_CACHE_DIR: &str = "stax-thumbnails";
 const DEFAULT_WORKERS: usize = 2;
+const QUEUE_CAPACITY: usize = 4096;
 const THUMBNAIL_WIDTH: u32 = 480;
 /// Image extensions tried for sidecar art, in order of preference.
 const SIDECAR_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp"];
@@ -97,7 +99,8 @@ impl ThumbnailJob {
 /// across the request handlers that need to enqueue work.
 #[derive(Clone)]
 pub struct ThumbnailWorkerPool {
-    sender: mpsc::UnboundedSender<ThumbnailJob>,
+    sender: mpsc::Sender<ThumbnailJob>,
+    queued: Arc<Mutex<HashSet<Uuid>>>,
 }
 
 impl ThumbnailWorkerPool {
@@ -106,7 +109,7 @@ impl ThumbnailWorkerPool {
     /// are short-lived ffmpeg invocations and the process exits when all
     /// other tasks do).
     pub fn spawn(config: ThumbnailConfig, persistence: Persistence, scan_gate: ScanGate) -> Self {
-        let (sender, mut receiver) = mpsc::unbounded_channel::<ThumbnailJob>();
+        let (sender, mut receiver) = mpsc::channel::<ThumbnailJob>(QUEUE_CAPACITY);
         let semaphore = Arc::new(Semaphore::new(config.max_concurrent.max(1)));
         info!(
             workers = config.max_concurrent,
@@ -116,9 +119,12 @@ impl ThumbnailWorkerPool {
             "thumbnail worker pool starting"
         );
         let config = Arc::new(config);
+        let queued = Arc::new(Mutex::new(HashSet::new()));
+        let worker_queued = Arc::clone(&queued);
 
         tokio::spawn(async move {
             while let Some(job) = receiver.recv().await {
+                unmark_queued(&worker_queued, job.media_id);
                 debug!(
                     media_id = %job.media_id,
                     media_path = %job.media_path.display(),
@@ -143,7 +149,7 @@ impl ThumbnailWorkerPool {
             }
         });
 
-        Self { sender }
+        Self { sender, queued }
     }
 
     /// Enqueue a single job. Failures here mean the dispatcher task has
@@ -151,10 +157,24 @@ impl ThumbnailWorkerPool {
     pub fn enqueue(&self, job: ThumbnailJob) {
         let media_id = job.media_id;
         let media_path = job.media_path.display().to_string();
-        if let Err(error) = self.sender.send(job) {
-            warn!(media_id = %error.0.media_id, "thumbnail worker pool is closed; dropping job");
-        } else {
-            debug!(%media_id, %media_path, "thumbnail job enqueued");
+        if !mark_queued(&self.queued, media_id) {
+            debug!(%media_id, %media_path, "thumbnail job already queued; skipping duplicate");
+            return;
+        }
+
+        match self.sender.try_send(job) {
+            Ok(()) => debug!(%media_id, %media_path, "thumbnail job enqueued"),
+            Err(error) => {
+                unmark_queued(&self.queued, media_id);
+                match error {
+                    mpsc::error::TrySendError::Full(job) => {
+                        warn!(media_id = %job.media_id, "thumbnail worker queue is full; dropping job");
+                    }
+                    mpsc::error::TrySendError::Closed(job) => {
+                        warn!(media_id = %job.media_id, "thumbnail worker pool is closed; dropping job");
+                    }
+                }
+            }
         }
     }
 
@@ -162,6 +182,19 @@ impl ThumbnailWorkerPool {
         for entry in pending {
             self.enqueue(ThumbnailJob::from_pending(entry));
         }
+    }
+}
+
+fn mark_queued(queued: &Arc<Mutex<HashSet<Uuid>>>, media_id: Uuid) -> bool {
+    queued
+        .lock()
+        .map(|mut queued| queued.insert(media_id))
+        .unwrap_or(false)
+}
+
+fn unmark_queued(queued: &Arc<Mutex<HashSet<Uuid>>>, media_id: Uuid) {
+    if let Ok(mut queued) = queued.lock() {
+        queued.remove(&media_id);
     }
 }
 
