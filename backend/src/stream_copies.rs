@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, Mutex},
@@ -8,9 +8,8 @@ use std::{
 
 use tokio::{
     fs,
-    io::{AsyncBufReadExt, AsyncReadExt, BufReader},
     process::Command,
-    sync::{RwLock, Semaphore, mpsc},
+    sync::{Semaphore, mpsc},
 };
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -24,26 +23,17 @@ use crate::{
         MediaItem, StreamCopyStatus, StreamCopySummary, SubtitleMode, SubtitleSourceKind,
         SubtitleTrack, is_text_subtitle_codec,
     },
+    stream_copy_progress::{
+        SharedStreamCopyProgress, StreamCopyProgressSnapshot, clear_progress,
+        new_shared_stream_copy_progress, progress_ratio_from_snapshot, read_ffmpeg_progress,
+        read_ffmpeg_stderr,
+    },
     streaming::convert_srt_to_vtt,
 };
 
 const DEFAULT_STREAM_COPY_CACHE_DIR: &str = "stax-stream-copies";
 const DEFAULT_WORKERS: usize = 1;
 const QUEUE_CAPACITY: usize = 1024;
-
-type SharedStreamCopyProgress = Arc<RwLock<HashMap<Uuid, StreamCopyProgressSnapshot>>>;
-
-#[derive(Clone, Debug, Default)]
-struct StreamCopyProgressSnapshot {
-    out_time_micros: Option<u64>,
-    speed: Option<f32>,
-}
-
-#[derive(Debug, Default)]
-struct FfmpegProgressBlock {
-    out_time_micros: Option<u64>,
-    speed: Option<f32>,
-}
 
 #[derive(Clone, Debug)]
 pub struct StreamCopyConfig {
@@ -93,7 +83,7 @@ impl StreamCopyWorkerPool {
         let (sender, mut receiver) = mpsc::channel::<StreamCopyJob>(QUEUE_CAPACITY);
         let semaphore = Arc::new(Semaphore::new(config.max_concurrent.max(1)));
         let config = Arc::new(config);
-        let progress = Arc::new(RwLock::new(HashMap::new()));
+        let progress = new_shared_stream_copy_progress();
         let worker_progress = Arc::clone(&progress);
         let queued = Arc::new(Mutex::new(HashSet::new()));
         let worker_queued = Arc::clone(&queued);
@@ -645,100 +635,6 @@ async fn run_ffmpeg_stream_copy(
 
 fn should_use_input_hwaccel(transcodes_video: bool, burned_filter: Option<&str>) -> bool {
     transcodes_video && burned_filter.is_none()
-}
-
-async fn read_ffmpeg_progress(
-    media_id: Uuid,
-    progress: SharedStreamCopyProgress,
-    stdout: tokio::process::ChildStdout,
-) {
-    let mut lines = BufReader::new(stdout).lines();
-    let mut block = FfmpegProgressBlock::default();
-
-    loop {
-        match lines.next_line().await {
-            Ok(Some(line)) => {
-                update_progress_block(&mut block, &line);
-                if let Some(marker) = line.strip_prefix("progress=") {
-                    write_progress_snapshot(&progress, media_id, &block).await;
-                    if marker == "end" {
-                        break;
-                    }
-                    block = FfmpegProgressBlock::default();
-                }
-            }
-            Ok(None) => break,
-            Err(error) => {
-                warn!(%media_id, %error, "failed to read ffmpeg progress output");
-                break;
-            }
-        }
-    }
-}
-
-async fn read_ffmpeg_stderr(
-    mut stderr: tokio::process::ChildStderr,
-) -> Result<Vec<u8>, std::io::Error> {
-    let mut bytes = Vec::new();
-    stderr.read_to_end(&mut bytes).await?;
-    Ok(bytes)
-}
-
-fn update_progress_block(block: &mut FfmpegProgressBlock, line: &str) {
-    let Some((key, value)) = line.split_once('=') else {
-        return;
-    };
-
-    match key {
-        // Despite the key name, ffmpeg emits this value in microseconds.
-        "out_time_ms" => {
-            block.out_time_micros = value.parse::<u64>().ok();
-        }
-        "speed" => {
-            block.speed = parse_ffmpeg_speed(value);
-        }
-        _ => {}
-    }
-}
-
-fn parse_ffmpeg_speed(value: &str) -> Option<f32> {
-    value
-        .trim()
-        .strip_suffix('x')
-        .and_then(|value| value.parse::<f32>().ok())
-}
-
-async fn write_progress_snapshot(
-    progress: &SharedStreamCopyProgress,
-    media_id: Uuid,
-    block: &FfmpegProgressBlock,
-) {
-    if block.out_time_micros.is_none() && block.speed.is_none() {
-        return;
-    }
-
-    let mut progress_map = progress.write().await;
-    progress_map.insert(
-        media_id,
-        StreamCopyProgressSnapshot {
-            out_time_micros: block.out_time_micros,
-            speed: block.speed,
-        },
-    );
-}
-
-async fn clear_progress(progress: &SharedStreamCopyProgress, media_id: Uuid) {
-    let mut progress_map = progress.write().await;
-    progress_map.remove(&media_id);
-}
-
-fn progress_ratio_from_snapshot(
-    duration_seconds: Option<f64>,
-    out_time_micros: Option<u64>,
-) -> Option<f32> {
-    let duration_seconds = duration_seconds.filter(|value| *value > 0.0)?;
-    let out_time_seconds = out_time_micros? as f64 / 1_000_000.0;
-    Some((out_time_seconds / duration_seconds).clamp(0.0, 1.0) as f32)
 }
 
 /// Returns the position within `media_item.audio_streams` of the track that
