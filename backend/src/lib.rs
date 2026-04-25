@@ -5,7 +5,7 @@ use axum::{
     extract::{Path, Query, State, ws::WebSocketUpgrade},
     http::{HeaderMap, HeaderValue, StatusCode, header::RANGE},
     middleware,
-    response::{IntoResponse, Response},
+    response::Response,
     routing::{get, post},
 };
 use time::OffsetDateTime;
@@ -20,6 +20,7 @@ use tower_http::{
 use tracing::warn;
 use uuid::Uuid;
 
+pub(crate) mod api_error;
 pub mod clock;
 pub mod ffmpeg;
 pub mod library;
@@ -41,6 +42,7 @@ pub mod thumbnails;
 #[cfg(not(debug_assertions))]
 mod frontend_assets;
 
+use api_error::ApiError;
 use clock::format_timestamp;
 use library::{LibraryConfig, LibraryService};
 use origin::{build_cors_with_origin, origin_allowed, reject_cross_origin_requests};
@@ -1157,52 +1159,6 @@ fn truncate_chars(value: String, max_chars: usize) -> String {
     }
 
     value.chars().take(max_chars).collect()
-}
-
-#[derive(Debug)]
-struct ApiError {
-    status: StatusCode,
-    message: String,
-}
-
-impl ApiError {
-    fn bad_request(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::BAD_REQUEST,
-            message: message.into(),
-        }
-    }
-
-    fn not_found(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::NOT_FOUND,
-            message: message.into(),
-        }
-    }
-
-    fn internal(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: message.into(),
-        }
-    }
-
-    fn with_status(status: StatusCode, message: impl Into<String>) -> Self {
-        Self {
-            status,
-            message: message.into(),
-        }
-    }
-}
-
-impl IntoResponse for ApiError {
-    fn into_response(self) -> Response {
-        let body = Json(serde_json::json!({
-            "error": self.message,
-        }));
-
-        (self.status, body).into_response()
-    }
 }
 
 #[cfg(test)]
